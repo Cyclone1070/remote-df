@@ -1,0 +1,226 @@
+basePath: /
+definitions:
+  domain.ErrorResponse:
+    properties:
+      error:
+        example: resource not found
+        type: string
+    type: object
+  domain.GameManifest:
+    properties:
+      description:
+        example: The deepest, most intricate simulation of a world that's ever been
+          created.
+        type: string
+      engine:
+        example: sdl2-opengl
+        type: string
+      env:
+        additionalProperties:
+          type: string
+        type: object
+      executable:
+        example: /game/dwarfort
+        type: string
+      id:
+        example: dwarf-fortress
+        type: string
+      name:
+        example: Dwarf Fortress
+        type: string
+      requiresXvfb:
+        example: true
+        type: boolean
+      saveDirs:
+        example:
+        - data/save
+        items:
+          type: string
+        type: array
+      tags:
+        items:
+          $ref: '#/definitions/domain.Tag'
+        type: array
+      workingDir:
+        example: /game
+        type: string
+    type: object
+  domain.Tag:
+    properties:
+      level:
+        enum:
+        - genre
+        - subgenre
+        example: genre
+        type: string
+      name:
+        example: Simulation
+        type: string
+    type: object
+  dto.ConfigResponseDto:
+    properties:
+      authRequired:
+        example: false
+        type: boolean
+      mode:
+        example: self-hosted
+        type: string
+    type: object
+  dto.StartSessionRequest:
+    properties:
+      args:
+        example:
+        - '[]'
+        items:
+          type: string
+        type: array
+      gameId:
+        example: dwarf-fortress
+        type: string
+    required:
+    - gameId
+    type: object
+  session.SessionState:
+    enum:
+    - idle
+    - starting
+    - running
+    - stopping
+    type: string
+    x-enum-varnames:
+    - StateIdle
+    - StateStarting
+    - StateRunning
+    - StateStopping
+  session.SessionStatus:
+    properties:
+      gameId:
+        example: dwarf-fortress
+        type: string
+      gameName:
+        example: Dwarf Fortress
+        type: string
+      pid:
+        example: 104
+        type: integer
+      startedAt:
+        example: "2026-09-25T02:00:00Z"
+        type: string
+      state:
+        allOf:
+        - $ref: '#/definitions/session.SessionState'
+        enum:
+        - idle
+        - starting
+        - running
+        - stopping
+        example: running
+      uptimeSec:
+        example: 42
+        type: integer
+    type: object
+host: localhost:8484
+info:
+  contact: {}
+  description: Enterprise-grade self-hosted game streaming hub and process supervisor.
+  title: Remote-DF Hub Server API
+  version: 0.1.0
+paths:
+  /api/config:
+    get:
+      description: Returns deployment mode and authentication requirements.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/dto.ConfigResponseDto'
+      summary: Get server configuration
+      tags:
+      - config
+  /api/games:
+    get:
+      description: Scans the games directory and returns manifests with metadata and
+        tags.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/domain.GameManifest'
+            type: array
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/domain.ErrorResponse'
+      summary: List discovered games
+      tags:
+      - games
+  /api/session:
+    get:
+      description: Returns live status snapshot of the current streaming session.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/session.SessionStatus'
+      summary: Get current game session status
+      tags:
+      - session
+  /api/session/start:
+    post:
+      consumes:
+      - application/json
+      description: Starts a new game instance and its virtual display framebuffer.
+      parameters:
+      - description: Game launch configuration
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/dto.StartSessionRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/session.SessionStatus'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/domain.ErrorResponse'
+        "404":
+          description: Not Found
+          schema:
+            $ref: '#/definitions/domain.ErrorResponse'
+        "409":
+          description: Conflict
+          schema:
+            $ref: '#/definitions/domain.ErrorResponse'
+      summary: Launch a game session
+      tags:
+      - session
+  /api/session/stop:
+    post:
+      description: Safely stops the active game session and tears down virtual framebuffers.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/session.SessionStatus'
+        "500":
+          description: Internal Server Error
+          schema:
+            $ref: '#/definitions/domain.ErrorResponse'
+      summary: Terminate the active game session
+      tags:
+      - session
+swagger: "2.0"

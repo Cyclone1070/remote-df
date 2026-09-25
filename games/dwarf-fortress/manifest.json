@@ -1,0 +1,20 @@
+{
+  "id": "dwarf-fortress",
+  "name": "Dwarf Fortress",
+  "description": "The deepest, most intricate simulation of a world that's ever been created.",
+  "executable": "/game/dwarfort",
+  "workingDir": "/game",
+  "requiresXvfb": true,
+  "engine": "sdl2-opengl",
+  "tags": [
+    { "name": "Simulation", "level": "genre" },
+    { "name": "Colony Sim", "level": "subgenre" }
+  ],
+  "saveDirs": [
+    "data/save"
+  ],
+  "env": {
+    "LD_PRELOAD": "/app/libdf_streamer.so",
+    "LD_LIBRARY_PATH": "/game:."
+  }
+}

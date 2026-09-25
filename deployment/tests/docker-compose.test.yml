@@ -1,0 +1,14 @@
+services:
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    entrypoint: ["/bin/sh"]
+    command: ["/scripts/docker-test.sh"]
+    environment:
+      - TARGET_URL=${TARGET_URL:-http://localhost:8484}
+      - TEST_SUITE=${TEST_SUITE:-all}
+    volumes:
+      - ./docker-test.sh:/scripts/docker-test.sh
+      - ./lib:/scripts/lib
+      - ./suites:/scripts/suites

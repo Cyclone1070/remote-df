@@ -1,0 +1,11 @@
+services:
+  remote-df:
+    image: remote-df-runner:latest
+    container_name: remote-df
+    ports:
+      - "${PORT:-8484}:8484/tcp"
+      - "${PORT:-8484}:8484/udp"
+    volumes:
+      # Mount your Dwarf Fortress installation. Reads and writes saves directly in place.
+      - "${DF_DIR}:/game:z"
+    restart: unless-stopped

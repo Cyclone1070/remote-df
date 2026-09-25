@@ -1,0 +1,1227 @@
+{
+  "A": {
+    "scancode": 4,
+    "sym": 97,
+    "key_name": "A"
+  },
+  "B": {
+    "scancode": 5,
+    "sym": 98,
+    "key_name": "B"
+  },
+  "C": {
+    "scancode": 6,
+    "sym": 99,
+    "key_name": "C"
+  },
+  "D": {
+    "scancode": 7,
+    "sym": 100,
+    "key_name": "D"
+  },
+  "E": {
+    "scancode": 8,
+    "sym": 101,
+    "key_name": "E"
+  },
+  "F": {
+    "scancode": 9,
+    "sym": 102,
+    "key_name": "F"
+  },
+  "G": {
+    "scancode": 10,
+    "sym": 103,
+    "key_name": "G"
+  },
+  "H": {
+    "scancode": 11,
+    "sym": 104,
+    "key_name": "H"
+  },
+  "I": {
+    "scancode": 12,
+    "sym": 105,
+    "key_name": "I"
+  },
+  "J": {
+    "scancode": 13,
+    "sym": 106,
+    "key_name": "J"
+  },
+  "K": {
+    "scancode": 14,
+    "sym": 107,
+    "key_name": "K"
+  },
+  "L": {
+    "scancode": 15,
+    "sym": 108,
+    "key_name": "L"
+  },
+  "M": {
+    "scancode": 16,
+    "sym": 109,
+    "key_name": "M"
+  },
+  "N": {
+    "scancode": 17,
+    "sym": 110,
+    "key_name": "N"
+  },
+  "O": {
+    "scancode": 18,
+    "sym": 111,
+    "key_name": "O"
+  },
+  "P": {
+    "scancode": 19,
+    "sym": 112,
+    "key_name": "P"
+  },
+  "Q": {
+    "scancode": 20,
+    "sym": 113,
+    "key_name": "Q"
+  },
+  "R": {
+    "scancode": 21,
+    "sym": 114,
+    "key_name": "R"
+  },
+  "S": {
+    "scancode": 22,
+    "sym": 115,
+    "key_name": "S"
+  },
+  "T": {
+    "scancode": 23,
+    "sym": 116,
+    "key_name": "T"
+  },
+  "U": {
+    "scancode": 24,
+    "sym": 117,
+    "key_name": "U"
+  },
+  "V": {
+    "scancode": 25,
+    "sym": 118,
+    "key_name": "V"
+  },
+  "W": {
+    "scancode": 26,
+    "sym": 119,
+    "key_name": "W"
+  },
+  "X": {
+    "scancode": 27,
+    "sym": 120,
+    "key_name": "X"
+  },
+  "Y": {
+    "scancode": 28,
+    "sym": 121,
+    "key_name": "Y"
+  },
+  "Z": {
+    "scancode": 29,
+    "sym": 122,
+    "key_name": "Z"
+  },
+  "1": {
+    "scancode": 30,
+    "sym": 49,
+    "key_name": "1"
+  },
+  "2": {
+    "scancode": 31,
+    "sym": 50,
+    "key_name": "2"
+  },
+  "3": {
+    "scancode": 32,
+    "sym": 51,
+    "key_name": "3"
+  },
+  "4": {
+    "scancode": 33,
+    "sym": 52,
+    "key_name": "4"
+  },
+  "5": {
+    "scancode": 34,
+    "sym": 53,
+    "key_name": "5"
+  },
+  "6": {
+    "scancode": 35,
+    "sym": 54,
+    "key_name": "6"
+  },
+  "7": {
+    "scancode": 36,
+    "sym": 55,
+    "key_name": "7"
+  },
+  "8": {
+    "scancode": 37,
+    "sym": 56,
+    "key_name": "8"
+  },
+  "9": {
+    "scancode": 38,
+    "sym": 57,
+    "key_name": "9"
+  },
+  "0": {
+    "scancode": 39,
+    "sym": 48,
+    "key_name": "0"
+  },
+  "Return": {
+    "scancode": 158,
+    "sym": 1073741982,
+    "key_name": "Return"
+  },
+  "Escape": {
+    "scancode": 41,
+    "sym": 27,
+    "key_name": "Escape"
+  },
+  "Backspace": {
+    "scancode": 42,
+    "sym": 8,
+    "key_name": "Backspace"
+  },
+  "Tab": {
+    "scancode": 43,
+    "sym": 9,
+    "key_name": "Tab"
+  },
+  "Space": {
+    "scancode": 44,
+    "sym": 32,
+    "key_name": "Space"
+  },
+  "-": {
+    "scancode": 45,
+    "sym": 45,
+    "key_name": "-"
+  },
+  "=": {
+    "scancode": 46,
+    "sym": 61,
+    "key_name": "="
+  },
+  "[": {
+    "scancode": 47,
+    "sym": 91,
+    "key_name": "["
+  },
+  "]": {
+    "scancode": 48,
+    "sym": 93,
+    "key_name": "]"
+  },
+  "\\": {
+    "scancode": 49,
+    "sym": 92,
+    "key_name": "\\"
+  },
+  "#": {
+    "scancode": 50,
+    "sym": 35,
+    "key_name": "#"
+  },
+  ";": {
+    "scancode": 51,
+    "sym": 59,
+    "key_name": ";"
+  },
+  "'": {
+    "scancode": 52,
+    "sym": 39,
+    "key_name": "'"
+  },
+  "`": {
+    "scancode": 53,
+    "sym": 96,
+    "key_name": "`"
+  },
+  ",": {
+    "scancode": 54,
+    "sym": 44,
+    "key_name": ","
+  },
+  ".": {
+    "scancode": 55,
+    "sym": 46,
+    "key_name": "."
+  },
+  "/": {
+    "scancode": 56,
+    "sym": 47,
+    "key_name": "/"
+  },
+  "CapsLock": {
+    "scancode": 57,
+    "sym": 1073741881,
+    "key_name": "CapsLock"
+  },
+  "F1": {
+    "scancode": 58,
+    "sym": 1073741882,
+    "key_name": "F1"
+  },
+  "F2": {
+    "scancode": 59,
+    "sym": 1073741883,
+    "key_name": "F2"
+  },
+  "F3": {
+    "scancode": 60,
+    "sym": 1073741884,
+    "key_name": "F3"
+  },
+  "F4": {
+    "scancode": 61,
+    "sym": 1073741885,
+    "key_name": "F4"
+  },
+  "F5": {
+    "scancode": 62,
+    "sym": 1073741886,
+    "key_name": "F5"
+  },
+  "F6": {
+    "scancode": 63,
+    "sym": 1073741887,
+    "key_name": "F6"
+  },
+  "F7": {
+    "scancode": 64,
+    "sym": 1073741888,
+    "key_name": "F7"
+  },
+  "F8": {
+    "scancode": 65,
+    "sym": 1073741889,
+    "key_name": "F8"
+  },
+  "F9": {
+    "scancode": 66,
+    "sym": 1073741890,
+    "key_name": "F9"
+  },
+  "F10": {
+    "scancode": 67,
+    "sym": 1073741891,
+    "key_name": "F10"
+  },
+  "F11": {
+    "scancode": 68,
+    "sym": 1073741892,
+    "key_name": "F11"
+  },
+  "F12": {
+    "scancode": 69,
+    "sym": 1073741893,
+    "key_name": "F12"
+  },
+  "PrintScreen": {
+    "scancode": 70,
+    "sym": 1073741894,
+    "key_name": "PrintScreen"
+  },
+  "ScrollLock": {
+    "scancode": 71,
+    "sym": 1073741895,
+    "key_name": "ScrollLock"
+  },
+  "Pause": {
+    "scancode": 72,
+    "sym": 1073741896,
+    "key_name": "Pause"
+  },
+  "Insert": {
+    "scancode": 73,
+    "sym": 1073741897,
+    "key_name": "Insert"
+  },
+  "Home": {
+    "scancode": 74,
+    "sym": 1073741898,
+    "key_name": "Home"
+  },
+  "PageUp": {
+    "scancode": 75,
+    "sym": 1073741899,
+    "key_name": "PageUp"
+  },
+  "Delete": {
+    "scancode": 76,
+    "sym": 127,
+    "key_name": "Delete"
+  },
+  "End": {
+    "scancode": 77,
+    "sym": 1073741901,
+    "key_name": "End"
+  },
+  "PageDown": {
+    "scancode": 78,
+    "sym": 1073741902,
+    "key_name": "PageDown"
+  },
+  "Right": {
+    "scancode": 79,
+    "sym": 1073741903,
+    "key_name": "Right"
+  },
+  "Left": {
+    "scancode": 80,
+    "sym": 1073741904,
+    "key_name": "Left"
+  },
+  "Down": {
+    "scancode": 81,
+    "sym": 1073741905,
+    "key_name": "Down"
+  },
+  "Up": {
+    "scancode": 82,
+    "sym": 1073741906,
+    "key_name": "Up"
+  },
+  "Numlock": {
+    "scancode": 83,
+    "sym": 1073741907,
+    "key_name": "Numlock"
+  },
+  "Keypad /": {
+    "scancode": 84,
+    "sym": 1073741908,
+    "key_name": "Keypad /"
+  },
+  "Keypad *": {
+    "scancode": 85,
+    "sym": 1073741909,
+    "key_name": "Keypad *"
+  },
+  "Keypad -": {
+    "scancode": 86,
+    "sym": 1073741910,
+    "key_name": "Keypad -"
+  },
+  "Keypad +": {
+    "scancode": 87,
+    "sym": 1073741911,
+    "key_name": "Keypad +"
+  },
+  "Keypad Enter": {
+    "scancode": 88,
+    "sym": 1073741912,
+    "key_name": "Keypad Enter"
+  },
+  "Keypad 1": {
+    "scancode": 89,
+    "sym": 1073741913,
+    "key_name": "Keypad 1"
+  },
+  "Keypad 2": {
+    "scancode": 90,
+    "sym": 1073741914,
+    "key_name": "Keypad 2"
+  },
+  "Keypad 3": {
+    "scancode": 91,
+    "sym": 1073741915,
+    "key_name": "Keypad 3"
+  },
+  "Keypad 4": {
+    "scancode": 92,
+    "sym": 1073741916,
+    "key_name": "Keypad 4"
+  },
+  "Keypad 5": {
+    "scancode": 93,
+    "sym": 1073741917,
+    "key_name": "Keypad 5"
+  },
+  "Keypad 6": {
+    "scancode": 94,
+    "sym": 1073741918,
+    "key_name": "Keypad 6"
+  },
+  "Keypad 7": {
+    "scancode": 95,
+    "sym": 1073741919,
+    "key_name": "Keypad 7"
+  },
+  "Keypad 8": {
+    "scancode": 96,
+    "sym": 1073741920,
+    "key_name": "Keypad 8"
+  },
+  "Keypad 9": {
+    "scancode": 97,
+    "sym": 1073741921,
+    "key_name": "Keypad 9"
+  },
+  "Keypad 0": {
+    "scancode": 98,
+    "sym": 1073741922,
+    "key_name": "Keypad 0"
+  },
+  "Keypad .": {
+    "scancode": 99,
+    "sym": 1073741923,
+    "key_name": "Keypad ."
+  },
+  "NonUSBackslash": {
+    "scancode": 100,
+    "sym": 0,
+    "key_name": ""
+  },
+  "Application": {
+    "scancode": 101,
+    "sym": 1073741925,
+    "key_name": "Application"
+  },
+  "Power": {
+    "scancode": 102,
+    "sym": 1073741926,
+    "key_name": "Power"
+  },
+  "Keypad =": {
+    "scancode": 103,
+    "sym": 1073741927,
+    "key_name": "Keypad ="
+  },
+  "F13": {
+    "scancode": 104,
+    "sym": 1073741928,
+    "key_name": "F13"
+  },
+  "F14": {
+    "scancode": 105,
+    "sym": 1073741929,
+    "key_name": "F14"
+  },
+  "F15": {
+    "scancode": 106,
+    "sym": 1073741930,
+    "key_name": "F15"
+  },
+  "F16": {
+    "scancode": 107,
+    "sym": 1073741931,
+    "key_name": "F16"
+  },
+  "F17": {
+    "scancode": 108,
+    "sym": 1073741932,
+    "key_name": "F17"
+  },
+  "F18": {
+    "scancode": 109,
+    "sym": 1073741933,
+    "key_name": "F18"
+  },
+  "F19": {
+    "scancode": 110,
+    "sym": 1073741934,
+    "key_name": "F19"
+  },
+  "F20": {
+    "scancode": 111,
+    "sym": 1073741935,
+    "key_name": "F20"
+  },
+  "F21": {
+    "scancode": 112,
+    "sym": 1073741936,
+    "key_name": "F21"
+  },
+  "F22": {
+    "scancode": 113,
+    "sym": 1073741937,
+    "key_name": "F22"
+  },
+  "F23": {
+    "scancode": 114,
+    "sym": 1073741938,
+    "key_name": "F23"
+  },
+  "F24": {
+    "scancode": 115,
+    "sym": 1073741939,
+    "key_name": "F24"
+  },
+  "Execute": {
+    "scancode": 116,
+    "sym": 1073741940,
+    "key_name": "Execute"
+  },
+  "Help": {
+    "scancode": 117,
+    "sym": 1073741941,
+    "key_name": "Help"
+  },
+  "Menu": {
+    "scancode": 118,
+    "sym": 1073741942,
+    "key_name": "Menu"
+  },
+  "Select": {
+    "scancode": 119,
+    "sym": 1073741943,
+    "key_name": "Select"
+  },
+  "Stop": {
+    "scancode": 120,
+    "sym": 1073741944,
+    "key_name": "Stop"
+  },
+  "Again": {
+    "scancode": 121,
+    "sym": 1073741945,
+    "key_name": "Again"
+  },
+  "Undo": {
+    "scancode": 122,
+    "sym": 1073741946,
+    "key_name": "Undo"
+  },
+  "Cut": {
+    "scancode": 123,
+    "sym": 1073741947,
+    "key_name": "Cut"
+  },
+  "Copy": {
+    "scancode": 124,
+    "sym": 1073741948,
+    "key_name": "Copy"
+  },
+  "Paste": {
+    "scancode": 125,
+    "sym": 1073741949,
+    "key_name": "Paste"
+  },
+  "Find": {
+    "scancode": 126,
+    "sym": 1073741950,
+    "key_name": "Find"
+  },
+  "Mute": {
+    "scancode": 127,
+    "sym": 1073741951,
+    "key_name": "Mute"
+  },
+  "VolumeUp": {
+    "scancode": 128,
+    "sym": 1073741952,
+    "key_name": "VolumeUp"
+  },
+  "VolumeDown": {
+    "scancode": 129,
+    "sym": 1073741953,
+    "key_name": "VolumeDown"
+  },
+  "Keypad ,": {
+    "scancode": 133,
+    "sym": 1073741957,
+    "key_name": "Keypad ,"
+  },
+  "Keypad = (AS400)": {
+    "scancode": 134,
+    "sym": 1073741958,
+    "key_name": "Keypad = (AS400)"
+  },
+  "International 1": {
+    "scancode": 135,
+    "sym": 0,
+    "key_name": ""
+  },
+  "International 2": {
+    "scancode": 136,
+    "sym": 0,
+    "key_name": ""
+  },
+  "International 3": {
+    "scancode": 137,
+    "sym": 0,
+    "key_name": ""
+  },
+  "International 4": {
+    "scancode": 138,
+    "sym": 0,
+    "key_name": ""
+  },
+  "International 5": {
+    "scancode": 139,
+    "sym": 0,
+    "key_name": ""
+  },
+  "International 6": {
+    "scancode": 140,
+    "sym": 0,
+    "key_name": ""
+  },
+  "International 7": {
+    "scancode": 141,
+    "sym": 0,
+    "key_name": ""
+  },
+  "International 8": {
+    "scancode": 142,
+    "sym": 0,
+    "key_name": ""
+  },
+  "International 9": {
+    "scancode": 143,
+    "sym": 0,
+    "key_name": ""
+  },
+  "Language 1": {
+    "scancode": 144,
+    "sym": 0,
+    "key_name": ""
+  },
+  "Language 2": {
+    "scancode": 145,
+    "sym": 0,
+    "key_name": ""
+  },
+  "Language 3": {
+    "scancode": 146,
+    "sym": 0,
+    "key_name": ""
+  },
+  "Language 4": {
+    "scancode": 147,
+    "sym": 0,
+    "key_name": ""
+  },
+  "Language 5": {
+    "scancode": 148,
+    "sym": 0,
+    "key_name": ""
+  },
+  "Language 6": {
+    "scancode": 149,
+    "sym": 0,
+    "key_name": ""
+  },
+  "Language 7": {
+    "scancode": 150,
+    "sym": 0,
+    "key_name": ""
+  },
+  "Language 8": {
+    "scancode": 151,
+    "sym": 0,
+    "key_name": ""
+  },
+  "Language 9": {
+    "scancode": 152,
+    "sym": 0,
+    "key_name": ""
+  },
+  "AltErase": {
+    "scancode": 153,
+    "sym": 1073741977,
+    "key_name": "AltErase"
+  },
+  "SysReq": {
+    "scancode": 154,
+    "sym": 1073741978,
+    "key_name": "SysReq"
+  },
+  "Cancel": {
+    "scancode": 155,
+    "sym": 1073741979,
+    "key_name": "Cancel"
+  },
+  "Clear": {
+    "scancode": 156,
+    "sym": 1073741980,
+    "key_name": "Clear"
+  },
+  "Prior": {
+    "scancode": 157,
+    "sym": 1073741981,
+    "key_name": "Prior"
+  },
+  "Separator": {
+    "scancode": 159,
+    "sym": 1073741983,
+    "key_name": "Separator"
+  },
+  "Out": {
+    "scancode": 160,
+    "sym": 1073741984,
+    "key_name": "Out"
+  },
+  "Oper": {
+    "scancode": 161,
+    "sym": 1073741985,
+    "key_name": "Oper"
+  },
+  "Clear / Again": {
+    "scancode": 162,
+    "sym": 1073741986,
+    "key_name": "Clear / Again"
+  },
+  "CrSel": {
+    "scancode": 163,
+    "sym": 1073741987,
+    "key_name": "CrSel"
+  },
+  "ExSel": {
+    "scancode": 164,
+    "sym": 1073741988,
+    "key_name": "ExSel"
+  },
+  "Keypad 00": {
+    "scancode": 176,
+    "sym": 1073742000,
+    "key_name": "Keypad 00"
+  },
+  "Keypad 000": {
+    "scancode": 177,
+    "sym": 1073742001,
+    "key_name": "Keypad 000"
+  },
+  "ThousandsSeparator": {
+    "scancode": 178,
+    "sym": 1073742002,
+    "key_name": "ThousandsSeparator"
+  },
+  "DecimalSeparator": {
+    "scancode": 179,
+    "sym": 1073742003,
+    "key_name": "DecimalSeparator"
+  },
+  "CurrencyUnit": {
+    "scancode": 180,
+    "sym": 1073742004,
+    "key_name": "CurrencyUnit"
+  },
+  "CurrencySubUnit": {
+    "scancode": 181,
+    "sym": 1073742005,
+    "key_name": "CurrencySubUnit"
+  },
+  "Keypad (": {
+    "scancode": 182,
+    "sym": 1073742006,
+    "key_name": "Keypad ("
+  },
+  "Keypad )": {
+    "scancode": 183,
+    "sym": 1073742007,
+    "key_name": "Keypad )"
+  },
+  "Keypad {": {
+    "scancode": 184,
+    "sym": 1073742008,
+    "key_name": "Keypad {"
+  },
+  "Keypad }": {
+    "scancode": 185,
+    "sym": 1073742009,
+    "key_name": "Keypad }"
+  },
+  "Keypad Tab": {
+    "scancode": 186,
+    "sym": 1073742010,
+    "key_name": "Keypad Tab"
+  },
+  "Keypad Backspace": {
+    "scancode": 187,
+    "sym": 1073742011,
+    "key_name": "Keypad Backspace"
+  },
+  "Keypad A": {
+    "scancode": 188,
+    "sym": 1073742012,
+    "key_name": "Keypad A"
+  },
+  "Keypad B": {
+    "scancode": 189,
+    "sym": 1073742013,
+    "key_name": "Keypad B"
+  },
+  "Keypad C": {
+    "scancode": 190,
+    "sym": 1073742014,
+    "key_name": "Keypad C"
+  },
+  "Keypad D": {
+    "scancode": 191,
+    "sym": 1073742015,
+    "key_name": "Keypad D"
+  },
+  "Keypad E": {
+    "scancode": 192,
+    "sym": 1073742016,
+    "key_name": "Keypad E"
+  },
+  "Keypad F": {
+    "scancode": 193,
+    "sym": 1073742017,
+    "key_name": "Keypad F"
+  },
+  "Keypad XOR": {
+    "scancode": 194,
+    "sym": 1073742018,
+    "key_name": "Keypad XOR"
+  },
+  "Keypad ^": {
+    "scancode": 195,
+    "sym": 1073742019,
+    "key_name": "Keypad ^"
+  },
+  "Keypad %": {
+    "scancode": 196,
+    "sym": 1073742020,
+    "key_name": "Keypad %"
+  },
+  "Keypad <": {
+    "scancode": 197,
+    "sym": 1073742021,
+    "key_name": "Keypad <"
+  },
+  "Keypad >": {
+    "scancode": 198,
+    "sym": 1073742022,
+    "key_name": "Keypad >"
+  },
+  "Keypad &": {
+    "scancode": 199,
+    "sym": 1073742023,
+    "key_name": "Keypad &"
+  },
+  "Keypad &&": {
+    "scancode": 200,
+    "sym": 1073742024,
+    "key_name": "Keypad &&"
+  },
+  "Keypad |": {
+    "scancode": 201,
+    "sym": 1073742025,
+    "key_name": "Keypad |"
+  },
+  "Keypad ||": {
+    "scancode": 202,
+    "sym": 1073742026,
+    "key_name": "Keypad ||"
+  },
+  "Keypad :": {
+    "scancode": 203,
+    "sym": 1073742027,
+    "key_name": "Keypad :"
+  },
+  "Keypad #": {
+    "scancode": 204,
+    "sym": 1073742028,
+    "key_name": "Keypad #"
+  },
+  "Keypad Space": {
+    "scancode": 205,
+    "sym": 1073742029,
+    "key_name": "Keypad Space"
+  },
+  "Keypad @": {
+    "scancode": 206,
+    "sym": 1073742030,
+    "key_name": "Keypad @"
+  },
+  "Keypad !": {
+    "scancode": 207,
+    "sym": 1073742031,
+    "key_name": "Keypad !"
+  },
+  "Keypad MemStore": {
+    "scancode": 208,
+    "sym": 1073742032,
+    "key_name": "Keypad MemStore"
+  },
+  "Keypad MemRecall": {
+    "scancode": 209,
+    "sym": 1073742033,
+    "key_name": "Keypad MemRecall"
+  },
+  "Keypad MemClear": {
+    "scancode": 210,
+    "sym": 1073742034,
+    "key_name": "Keypad MemClear"
+  },
+  "Keypad MemAdd": {
+    "scancode": 211,
+    "sym": 1073742035,
+    "key_name": "Keypad MemAdd"
+  },
+  "Keypad MemSubtract": {
+    "scancode": 212,
+    "sym": 1073742036,
+    "key_name": "Keypad MemSubtract"
+  },
+  "Keypad MemMultiply": {
+    "scancode": 213,
+    "sym": 1073742037,
+    "key_name": "Keypad MemMultiply"
+  },
+  "Keypad MemDivide": {
+    "scancode": 214,
+    "sym": 1073742038,
+    "key_name": "Keypad MemDivide"
+  },
+  "Keypad +/-": {
+    "scancode": 215,
+    "sym": 1073742039,
+    "key_name": "Keypad +/-"
+  },
+  "Keypad Clear": {
+    "scancode": 216,
+    "sym": 1073742040,
+    "key_name": "Keypad Clear"
+  },
+  "Keypad ClearEntry": {
+    "scancode": 217,
+    "sym": 1073742041,
+    "key_name": "Keypad ClearEntry"
+  },
+  "Keypad Binary": {
+    "scancode": 218,
+    "sym": 1073742042,
+    "key_name": "Keypad Binary"
+  },
+  "Keypad Octal": {
+    "scancode": 219,
+    "sym": 1073742043,
+    "key_name": "Keypad Octal"
+  },
+  "Keypad Decimal": {
+    "scancode": 220,
+    "sym": 1073742044,
+    "key_name": "Keypad Decimal"
+  },
+  "Keypad Hexadecimal": {
+    "scancode": 221,
+    "sym": 1073742045,
+    "key_name": "Keypad Hexadecimal"
+  },
+  "Left Ctrl": {
+    "scancode": 224,
+    "sym": 1073742048,
+    "key_name": "Left Ctrl"
+  },
+  "Left Shift": {
+    "scancode": 225,
+    "sym": 1073742049,
+    "key_name": "Left Shift"
+  },
+  "Left Alt": {
+    "scancode": 226,
+    "sym": 1073742050,
+    "key_name": "Left Alt"
+  },
+  "Left GUI": {
+    "scancode": 227,
+    "sym": 1073742051,
+    "key_name": "Left GUI"
+  },
+  "Right Ctrl": {
+    "scancode": 228,
+    "sym": 1073742052,
+    "key_name": "Right Ctrl"
+  },
+  "Right Shift": {
+    "scancode": 229,
+    "sym": 1073742053,
+    "key_name": "Right Shift"
+  },
+  "Right Alt": {
+    "scancode": 230,
+    "sym": 1073742054,
+    "key_name": "Right Alt"
+  },
+  "Right GUI": {
+    "scancode": 231,
+    "sym": 1073742055,
+    "key_name": "Right GUI"
+  },
+  "ModeSwitch": {
+    "scancode": 257,
+    "sym": 1073742081,
+    "key_name": "ModeSwitch"
+  },
+  "AudioNext": {
+    "scancode": 258,
+    "sym": 1073742082,
+    "key_name": "AudioNext"
+  },
+  "AudioPrev": {
+    "scancode": 259,
+    "sym": 1073742083,
+    "key_name": "AudioPrev"
+  },
+  "AudioStop": {
+    "scancode": 260,
+    "sym": 1073742084,
+    "key_name": "AudioStop"
+  },
+  "AudioPlay": {
+    "scancode": 261,
+    "sym": 1073742085,
+    "key_name": "AudioPlay"
+  },
+  "AudioMute": {
+    "scancode": 262,
+    "sym": 1073742086,
+    "key_name": "AudioMute"
+  },
+  "MediaSelect": {
+    "scancode": 263,
+    "sym": 1073742087,
+    "key_name": "MediaSelect"
+  },
+  "WWW": {
+    "scancode": 264,
+    "sym": 1073742088,
+    "key_name": "WWW"
+  },
+  "Mail": {
+    "scancode": 265,
+    "sym": 1073742089,
+    "key_name": "Mail"
+  },
+  "Calculator": {
+    "scancode": 266,
+    "sym": 1073742090,
+    "key_name": "Calculator"
+  },
+  "Computer": {
+    "scancode": 267,
+    "sym": 1073742091,
+    "key_name": "Computer"
+  },
+  "AC Search": {
+    "scancode": 268,
+    "sym": 1073742092,
+    "key_name": "AC Search"
+  },
+  "AC Home": {
+    "scancode": 269,
+    "sym": 1073742093,
+    "key_name": "AC Home"
+  },
+  "AC Back": {
+    "scancode": 270,
+    "sym": 1073742094,
+    "key_name": "AC Back"
+  },
+  "AC Forward": {
+    "scancode": 271,
+    "sym": 1073742095,
+    "key_name": "AC Forward"
+  },
+  "AC Stop": {
+    "scancode": 272,
+    "sym": 1073742096,
+    "key_name": "AC Stop"
+  },
+  "AC Refresh": {
+    "scancode": 273,
+    "sym": 1073742097,
+    "key_name": "AC Refresh"
+  },
+  "AC Bookmarks": {
+    "scancode": 274,
+    "sym": 1073742098,
+    "key_name": "AC Bookmarks"
+  },
+  "BrightnessDown": {
+    "scancode": 275,
+    "sym": 1073742099,
+    "key_name": "BrightnessDown"
+  },
+  "BrightnessUp": {
+    "scancode": 276,
+    "sym": 1073742100,
+    "key_name": "BrightnessUp"
+  },
+  "DisplaySwitch": {
+    "scancode": 277,
+    "sym": 1073742101,
+    "key_name": "DisplaySwitch"
+  },
+  "KBDIllumToggle": {
+    "scancode": 278,
+    "sym": 1073742102,
+    "key_name": "KBDIllumToggle"
+  },
+  "KBDIllumDown": {
+    "scancode": 279,
+    "sym": 1073742103,
+    "key_name": "KBDIllumDown"
+  },
+  "KBDIllumUp": {
+    "scancode": 280,
+    "sym": 1073742104,
+    "key_name": "KBDIllumUp"
+  },
+  "Eject": {
+    "scancode": 281,
+    "sym": 1073742105,
+    "key_name": "Eject"
+  },
+  "Sleep": {
+    "scancode": 282,
+    "sym": 1073742106,
+    "key_name": "Sleep"
+  },
+  "App1": {
+    "scancode": 283,
+    "sym": 1073742107,
+    "key_name": "App1"
+  },
+  "App2": {
+    "scancode": 284,
+    "sym": 1073742108,
+    "key_name": "App2"
+  },
+  "AudioRewind": {
+    "scancode": 285,
+    "sym": 1073742109,
+    "key_name": "AudioRewind"
+  },
+  "AudioFastForward": {
+    "scancode": 286,
+    "sym": 1073742110,
+    "key_name": "AudioFastForward"
+  },
+  "SoftLeft": {
+    "scancode": 287,
+    "sym": 1073742111,
+    "key_name": "SoftLeft"
+  },
+  "SoftRight": {
+    "scancode": 288,
+    "sym": 1073742112,
+    "key_name": "SoftRight"
+  },
+  "Call": {
+    "scancode": 289,
+    "sym": 1073742113,
+    "key_name": "Call"
+  },
+  "EndCall": {
+    "scancode": 290,
+    "sym": 1073742114,
+    "key_name": "EndCall"
+  }
+}

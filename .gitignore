@@ -1,0 +1,13 @@
+target/
+**/target/
+__pycache__/
+*.pyc
+*.log
+.DS_Store
+plan.md
+node_modules/
+**/node_modules/
+client/dist/
+server/bin/
+*.so
+.env
