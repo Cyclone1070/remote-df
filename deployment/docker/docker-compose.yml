@@ -1,19 +1,12 @@
 services:
-  app:
+  remote-df:
     build:
       context: ../..
       dockerfile: deployment/docker/Dockerfile
+    container_name: remote-df
     ports:
-      - "8484:8484"
-      - "8485:8485"
-    environment:
-      - PORT=8484
-      - STREAM_PORT=8485
-      - GAMES_DIR=/app/games
-      - WEB_ROOT=/app/client
-      - MODE=self-hosted
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8484/api/config"]
-      interval: 3s
-      timeout: 3s
-      retries: 5
+      - "${PORT:-8484}:8484/tcp"
+      - "${PORT:-8484}:8484/udp"
+    volumes:
+      - "${DF_DIR:-/tmp/df_install}:/game:z"
+    restart: unless-stopped

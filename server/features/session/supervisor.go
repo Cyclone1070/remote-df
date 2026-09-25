@@ -21,6 +21,7 @@ type ProcessSupervisor struct {
 	startedAt time.Time
 	gameCmd   *exec.Cmd
 	xvfbCmd   *exec.Cmd
+	gameDone  chan struct{}
 }
 
 // NewProcessSupervisor creates a new idle process supervisor.
@@ -110,18 +111,25 @@ func (s *ProcessSupervisor) Start(m domain.GameManifest, args []string, streamPo
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Start(); err != nil {
-		s.cleanupProcesses()
+		if s.xvfbCmd != nil && s.xvfbCmd.Process != nil {
+			_ = s.xvfbCmd.Process.Kill()
+			_ = s.xvfbCmd.Wait()
+			s.xvfbCmd = nil
+		}
 		s.state = StateIdle
 		return fmt.Errorf("failed to start game executable: %w", err)
 	}
 
+	done := make(chan struct{})
 	s.gameCmd = cmd
+	s.gameDone = done
 	s.startedAt = time.Now()
 	s.state = StateRunning
 
-	// 3. Monitor process exit asynchronously
+	// 3. Monitor process exit asynchronously (sole caller of cmd.Wait)
 	go func() {
 		_ = cmd.Wait()
+		close(done)
 
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -132,11 +140,14 @@ func (s *ProcessSupervisor) Start(m domain.GameManifest, args []string, streamPo
 			s.xvfbCmd = nil
 		}
 
-		s.state = StateIdle
-		s.gameID = ""
-		s.gameName = ""
-		s.gameCmd = nil
-		s.startedAt = time.Time{}
+		if s.state != StateStopping {
+			s.state = StateIdle
+			s.gameID = ""
+			s.gameName = ""
+			s.gameCmd = nil
+			s.gameDone = nil
+			s.startedAt = time.Time{}
+		}
 	}()
 
 	return nil
@@ -145,35 +156,29 @@ func (s *ProcessSupervisor) Start(m domain.GameManifest, args []string, streamPo
 // Stop safely terminates the active game session and reaps child processes.
 func (s *ProcessSupervisor) Stop() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.state == StateIdle {
+		s.mu.Unlock()
 		return nil
 	}
 
 	s.state = StateStopping
-	s.cleanupProcesses()
-	s.state = StateIdle
-	s.gameID = ""
-	s.gameName = ""
-	s.startedAt = time.Time{}
-	return nil
-}
+	cmd := s.gameCmd
+	done := s.gameDone
+	s.mu.Unlock()
 
-func (s *ProcessSupervisor) cleanupProcesses() {
-	if s.gameCmd != nil && s.gameCmd.Process != nil {
-		_ = s.gameCmd.Process.Signal(syscall.SIGTERM)
-
-		done := make(chan error, 1)
-		go func() { done <- s.gameCmd.Wait() }()
+	if cmd != nil && cmd.Process != nil && done != nil {
+		_ = cmd.Process.Signal(syscall.SIGTERM)
 
 		select {
 		case <-done:
 		case <-time.After(500 * time.Millisecond):
-			_ = s.gameCmd.Process.Kill()
+			_ = cmd.Process.Kill()
+			<-done
 		}
-		s.gameCmd = nil
 	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if s.xvfbCmd != nil && s.xvfbCmd.Process != nil {
 		_ = s.xvfbCmd.Process.Signal(syscall.SIGTERM)
@@ -181,4 +186,12 @@ func (s *ProcessSupervisor) cleanupProcesses() {
 		_ = s.xvfbCmd.Wait()
 		s.xvfbCmd = nil
 	}
+
+	s.state = StateIdle
+	s.gameID = ""
+	s.gameName = ""
+	s.gameCmd = nil
+	s.gameDone = nil
+	s.startedAt = time.Time{}
+	return nil
 }
