@@ -1,10 +1,11 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { DFRenderer } from '../core/renderer.js';
 import { DFProtocol } from '../core/protocol.js';
 import { DFInput } from '../core/input.js';
 
-export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange, isDebug }) {
+export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange, isDebug, streamPort, onTerminate }) {
     const canvasRef = useRef(null);
+    const [isWebRTCReady, setIsWebRTCReady] = useState(false);
 
     useEffect(() => {
         const canvas = canvasRef.current;
@@ -21,10 +22,16 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
         let ws = null;
         let pc = null;
         let dc = null;
+        let inputDc = null;
         let input = null;
         let isDestroyed = false;
         let lastRenderedSeq = 0;
-        let waitingForKeyframe = false;
+        let waitingForKeyframe = true;
+        let hasReceivedKeyframe = false;
+        let lastKeyframeReqTime = 0;
+        let waitingForCombinedDelta = false;
+        let lastGapReqTime = 0;
+        const pendingFrames = new Map();
 
         // Rotating 1-byte debug stamp (1..255) for physical M2P latency
         let currentDebugStamp = 0;
@@ -151,8 +158,10 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
         window.addEventListener('resize', onWindowResize);
 
         function sendInputBuffer(buf) {
-            if (dc && dc.readyState === 'open') {
-                dc.send(buf); // True UDP datagram!
+            if (inputDc && inputDc.readyState === 'open') {
+                inputDc.send(buf); // True Reliable Ordered WebRTC DataChannel!
+            } else if (dc && dc.readyState === 'open') {
+                dc.send(buf); // Fallback to stream DC
             } else if (ws && ws.readyState === WebSocket.OPEN) {
                 ws.send(buf); // TCP fallback
             }
@@ -171,14 +180,6 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
             if (isDebug) streamFrameCount++;
             const frame = DFProtocol.decodeFrame(buffer);
             if (frame) {
-                // Drop stale out-of-order UDP frames
-                if (frame.seq && frame.seq < lastRenderedSeq) {
-                    return;
-                }
-
-                const packetLossDetected = (lastRenderedSeq > 0 && frame.seq > lastRenderedSeq + 1);
-                lastRenderedSeq = frame.seq;
-
                 if (isDebug && frame.stamp && pendingStamps.has(frame.stamp)) {
                     pendingRenderStamps.push(frame.stamp);
                 }
@@ -191,24 +192,99 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
                 }
 
                 if (frame.type === 'full') {
-                    if (isDebug && waitingForKeyframe) {
+                    if (isDebug && (waitingForKeyframe || waitingForCombinedDelta)) {
                         console.log('[WebRTC Recovery] Full keyframe received! Stream recovered successfully.');
                     }
+                    hasReceivedKeyframe = true;
                     waitingForKeyframe = false;
+                    waitingForCombinedDelta = false;
+                    lastRenderedSeq = frame.seq;
+                    pendingFrames.clear();
                     renderer.applyFullFrame(frame.cmds);
+                    window.__dfFrameCount = (window.__dfFrameCount || 0) + 1;
                 } else if (frame.type === 'delta') {
-                    if (packetLossDetected && !waitingForKeyframe) {
-                        if (isDebug) {
-                            console.log(`[WebRTC Recovery] Packet loss detected! Current seq: ${frame.seq}. Requesting keyframe (opcode 0x06)...`);
+                    if (!hasReceivedKeyframe) {
+                        const now = Date.now();
+                        if (!waitingForKeyframe || now - lastKeyframeReqTime > 300) {
+                            if (isDebug) {
+                                console.log('[WebRTC Recovery] No baseline keyframe. Requesting initial keyframe (opcode 0x06)...');
+                            }
+                            waitingForKeyframe = true;
+                            lastKeyframeReqTime = now;
+                            sendInputBuffer(DFProtocol.encodeKeyframeRequest());
                         }
+                        return;
+                    }
+
+                    // Check if this delta is a combined delta bridging across our gap
+                    const isBridgeDelta = (frame.baseSeq !== undefined && frame.baseSeq <= lastRenderedSeq && frame.seq > lastRenderedSeq);
+
+                    if (isBridgeDelta) {
+                        waitingForCombinedDelta = false;
+                        waitingForKeyframe = false;
+                        lastRenderedSeq = frame.seq;
+                        renderer.applyDelta(frame.totalCmdCount, frame.updates);
+                        window.__dfFrameCount = (window.__dfFrameCount || 0) + 1;
+
+                        // Drain any subsequent buffered frames sequentially
+                        while (pendingFrames.has(lastRenderedSeq + 1)) {
+                            const next = pendingFrames.get(lastRenderedSeq + 1);
+                            pendingFrames.delete(lastRenderedSeq + 1);
+                            lastRenderedSeq = next.seq;
+                            renderer.applyDelta(next.totalCmdCount, next.updates);
+                            window.__dfFrameCount = (window.__dfFrameCount || 0) + 1;
+                        }
+                        return;
+                    }
+
+                    // Drop stale frames
+                    if (frame.seq <= lastRenderedSeq) {
+                        return;
+                    }
+
+                    // Normal sequential frame
+                    if (frame.seq === lastRenderedSeq + 1 && !waitingForCombinedDelta && !waitingForKeyframe) {
+                        lastRenderedSeq = frame.seq;
+                        renderer.applyDelta(frame.totalCmdCount, frame.updates);
+                        window.__dfFrameCount = (window.__dfFrameCount || 0) + 1;
+
+                        while (pendingFrames.has(lastRenderedSeq + 1)) {
+                            const next = pendingFrames.get(lastRenderedSeq + 1);
+                            pendingFrames.delete(lastRenderedSeq + 1);
+                            lastRenderedSeq = next.seq;
+                            renderer.applyDelta(next.totalCmdCount, next.updates);
+                            window.__dfFrameCount = (window.__dfFrameCount || 0) + 1;
+                        }
+                        return;
+                    }
+
+                    // Gap detected! E.g. frame.seq > lastRenderedSeq + 1
+                    pendingFrames.set(frame.seq, frame);
+                    if (pendingFrames.size > 30) {
+                        const oldest = Math.min(...pendingFrames.keys());
+                        pendingFrames.delete(oldest);
+                    }
+
+                    const now = Date.now();
+                    if (!waitingForCombinedDelta || now - lastGapReqTime > 80) {
+                        waitingForCombinedDelta = true;
+                        lastGapReqTime = now;
+                        if (isDebug) {
+                            console.log(`[WebRTC Recovery] Frame gap detected (seq: ${frame.seq}, lastRendered: ${lastRenderedSeq}). Requesting combined delta (opcode 0x07)...`);
+                        }
+                        sendInputBuffer(DFProtocol.encodeGapAck(lastRenderedSeq));
+                    }
+
+                    // Disaster fallback: if gap persists > 400ms without resolution, fallback to keyframe
+                    if (now - lastGapReqTime > 400 && (!waitingForKeyframe || now - lastKeyframeReqTime > 400)) {
                         waitingForKeyframe = true;
+                        lastKeyframeReqTime = now;
+                        if (isDebug) {
+                            console.log('[WebRTC Recovery] Combined delta timeout (>400ms). Requesting fallback keyframe (opcode 0x06)...');
+                        }
                         sendInputBuffer(DFProtocol.encodeKeyframeRequest());
                     }
-                    if (!waitingForKeyframe) {
-                        renderer.applyDelta(frame.totalCmdCount, frame.updates);
-                    }
                 }
-                window.__dfFrameCount = (window.__dfFrameCount || 0) + 1;
             }
         }
 
@@ -242,25 +318,47 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
                 };
                 pc.onconnectionstatechange = () => {
                     console.log('[WebRTC] connectionState:', pc.connectionState);
+                    if (pc.connectionState === 'closed' || pc.connectionState === 'failed') {
+                        if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+                            if (onTerminate) onTerminate();
+                        }
+                    }
                 };
 
-                // Create True UDP DataChannel: unordered, 0 retransmissions
-                console.log('[WebRTC] Creating df-stream DataChannel...');
+                // Create stream DataChannel (UDP deltas) and reliable input DataChannel
+                console.log('[WebRTC] Creating df-stream and df-input DataChannels...');
                 dc = pc.createDataChannel('df-stream', {
                     ordered: false,
                     maxRetransmits: 0
                 });
                 dc.binaryType = 'arraybuffer';
 
+                inputDc = pc.createDataChannel('df-input', {
+                    ordered: true
+                });
+                inputDc.binaryType = 'arraybuffer';
+
+                inputDc.onopen = () => {
+                    console.log('[WebRTC] Reliable Ordered Input DataChannel OPENED!');
+                };
+                inputDc.onclose = () => {
+                    console.log('[WebRTC] Input DataChannel closed');
+                };
+
                 dc.onopen = () => {
                     console.log('[WebRTC] True UDP DataChannel OPENED!');
+                    setIsWebRTCReady(true);
                     if (onTransportChange) onTransportChange('UDP (WebRTC)');
                     handleResize(true);
                 };
 
                 dc.onclose = () => {
                     console.log('[WebRTC] DataChannel closed, using WebSocket');
+                    setIsWebRTCReady(false);
                     if (onTransportChange) onTransportChange('TCP (WebSocket)');
+                    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+                        if (onTerminate) onTerminate();
+                    }
                 };
 
                 dc.onerror = (err) => {
@@ -386,6 +484,14 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
                         console.error('[WS] Error handling message:', e);
                     }
                 } else if (event.data instanceof ArrayBuffer) {
+                    if (event.data.byteLength >= 2) {
+                        const v = new DataView(event.data);
+                        const isStreamFrame = (v.getUint8(0) === 0x44 && v.getUint8(1) === 0x46);
+                        // If WebRTC is active or connecting, suppress leaking video frames over WebSocket
+                        if (isStreamFrame && (pc || (dc && dc.readyState === 'open'))) {
+                            return;
+                        }
+                    }
                     handleFrameBinary(event.data);
                 }
             };
@@ -393,9 +499,13 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
             ws.onclose = () => {
                 if (isDestroyed) return;
                 if (onStatusChange) onStatusChange('disconnected');
+                if (inputDc) { inputDc.close(); inputDc = null; }
                 if (dc) { dc.close(); dc = null; }
                 if (pc) { pc.close(); pc = null; }
-                reconnectTimer = setTimeout(connect, 2000);
+                setIsWebRTCReady(false);
+                if (onTerminate) {
+                    onTerminate();
+                }
             };
 
             ws.onerror = (err) => {
@@ -416,15 +526,28 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
                 input.destroy();
                 window.input = null;
             }
+            if (inputDc) inputDc.close();
+            if (dc) dc.close();
+            if (pc) pc.close();
             if (ws) ws.close();
         };
-    }, [isDebug, onStatusChange, onMetricsUpdate]);
+    }, [isDebug, onStatusChange, onMetricsUpdate, onTerminate]);
 
     return (
-        <canvas
-            id="gameCanvas"
-            ref={canvasRef}
-            className="block w-full h-full cursor-default [image-rendering:pixelated] [image-rendering:crisp-edges]"
-        />
+        <div className="relative w-full h-full">
+            <canvas
+                id="gameCanvas"
+                ref={canvasRef}
+                className="block w-full h-full cursor-default [image-rendering:pixelated] [image-rendering:crisp-edges]"
+            />
+            {!isWebRTCReady && (
+                <div className="absolute inset-0 flex items-center justify-center bg-black/60 z-10 backdrop-blur-sm pointer-events-none transition-opacity duration-300">
+                    <div className="flex flex-col items-center gap-3 text-slate-200">
+                        <div className="w-8 h-8 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin"></div>
+                        <span className="text-xs font-mono uppercase tracking-widest text-slate-400">Connecting WebRTC P2P...</span>
+                    </div>
+                </div>
+            )}
+        </div>
     );
 }

@@ -39,17 +39,27 @@ export function App() {
         drawCalls: 0
     });
 
+    const navigateToHome = useCallback(() => {
+        if (window.location.pathname !== '/') {
+            window.history.pushState(null, '', '/');
+        }
+        setView('menu');
+    }, []);
+
     const fetchSession = useCallback(async () => {
         try {
             const res = await fetch('/api/session');
             if (res.ok) {
                 const data = await res.json();
                 setSession(data);
+                if (data.state === 'idle' && isStreamPath()) {
+                    navigateToHome();
+                }
             }
         } catch {
             // Ignore offline errors
         }
-    }, []);
+    }, [navigateToHome]);
 
     const fetchGames = useCallback(async () => {
         try {
@@ -112,10 +122,7 @@ export function App() {
             if (res.ok) {
                 const data = await res.json();
                 setSession(data);
-                if (window.location.pathname !== '/') {
-                    window.history.pushState(null, '', '/');
-                }
-                setView('menu');
+                navigateToHome();
             }
         } catch (err) {
             alert(`Error stopping game: ${err.message}`);
@@ -152,9 +159,11 @@ export function App() {
 
             <GameCanvas
                 isDebug={isDebug}
+                streamPort={session?.streamPort}
                 onStatusChange={handleStatusChange}
                 onMetricsUpdate={handleMetricsUpdate}
                 onTransportChange={setTransport}
+                onTerminate={navigateToHome}
             />
             <HUD
                 visible={isDebug}
