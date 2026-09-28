@@ -15,6 +15,7 @@ export class DFProtocol {
             seq: view.getUint32(2, true),
             flags: flags,
             hasStamp: (flags & 0x04) !== 0,
+            hasBaseSeq: (flags & 0x08) !== 0,
             count: view.getUint16(8, true)
         };
     }
@@ -42,8 +43,14 @@ export class DFProtocol {
         let payloadOffset = 10;
         let stamp = 0;
         if (hdr.hasStamp) {
-            stamp = view.getUint8(10);
-            payloadOffset = 11;
+            stamp = view.getUint8(payloadOffset);
+            payloadOffset += 1;
+        }
+
+        let baseSeq = hdr.seq - 1;
+        if (hdr.hasBaseSeq) {
+            baseSeq = view.getUint32(payloadOffset, true);
+            payloadOffset += 4;
         }
 
         const compressedPayload = new Uint8Array(buffer, payloadOffset);
@@ -94,7 +101,7 @@ export class DFProtocol {
                     }
                 });
             }
-            return { type: 'delta', seq: hdr.seq, stamp, totalCmdCount: hdr.count, updates };
+            return { type: 'delta', seq: hdr.seq, baseSeq, stamp, totalCmdCount: hdr.count, updates };
         }
         return null;
     }
@@ -122,5 +129,13 @@ export class DFProtocol {
 
     static encodeKeyframeRequest() {
         return this.encodeInput(6, 0, 0, 0, 0, 0, 0);
+    }
+
+    static encodeGapAck(lastAckedSeq) {
+        const buf = new ArrayBuffer(5);
+        const view = new DataView(buf);
+        view.setUint8(0, 7); // Opcode 0x07: GAP_ACK / COMBINED_DELTA_REQ
+        view.setUint32(1, (lastAckedSeq || 0) >>> 0, true);
+        return buf;
     }
 }

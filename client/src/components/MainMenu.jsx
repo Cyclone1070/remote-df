@@ -120,6 +120,23 @@ export function MainMenu({ games = [], session, onLaunch, onStop, onResume, isSt
                                         )}
                                     </button>
                                 </>
+                            ) : currentGame.available === false ? (
+                                <div className="flex flex-col gap-2">
+                                    <button
+                                        disabled
+                                        className="px-8 py-3.5 text-sm font-bold rounded-xl bg-zinc-800/80 text-zinc-500 cursor-not-allowed border border-zinc-700/50 flex items-center gap-2.5 shadow-none"
+                                    >
+                                        <svg className="w-4 h-4 text-amber-400/80" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                            <circle cx="12" cy="12" r="10" />
+                                            <line x1="12" y1="8" x2="12" y2="12" />
+                                            <line x1="12" y1="16" x2="12.01" y2="16" />
+                                        </svg>
+                                        Install Required
+                                    </button>
+                                    <span className="text-xs text-zinc-500">
+                                        Mount game directory to <code className="text-zinc-400 bg-zinc-900 px-1 py-0.5 rounded">{currentGame.installDir || '/game'}</code>
+                                    </span>
+                                </div>
                             ) : (
                                 <button
                                     disabled={isStarting || isRunning}

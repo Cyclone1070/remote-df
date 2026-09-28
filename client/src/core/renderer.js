@@ -215,6 +215,7 @@ export class DFRenderer {
             h: h,
             offscreen: imageOrData
         });
+        this.dirty = true;
     }
 
     applyFullFrame(cmds) {
