@@ -6,7 +6,22 @@ services:
     container_name: remote-df
     ports:
       - "${PORT:-8484}:8484/tcp"
-      - "${PORT:-8484}:8484/udp"
+      - "${STREAM_PORT:-8485}:8485/tcp"
+      - "${STREAM_PORT:-8485}:8485/udp"
+    environment:
+      - STUN_SERVER=${STUN_SERVER:-}
     volumes:
       - "${DF_DIR:-/tmp/df_install}:/game:z"
+    restart: unless-stopped
+
+  tunnel:
+    build:
+      context: ../..
+      dockerfile: deployment/docker/Dockerfile.tunnel
+    container_name: remote-df-tunnel
+    environment:
+      - CF_TUNNEL_TOKEN=${CF_TUNNEL_TOKEN:-}
+      - ORIGIN_URL=http://remote-df:8484
+    depends_on:
+      - remote-df
     restart: unless-stopped

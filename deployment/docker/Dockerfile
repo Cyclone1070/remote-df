@@ -40,13 +40,14 @@ RUN npm ci
 COPY client/ ./
 RUN npm run build
 
-# Stage 3: Build Go Hub Server
+# Stage 3: Build Go Hub Server with Embedded UI
 FROM golang:1.24-alpine AS server-builder
 
 WORKDIR /build
 COPY server/go.mod server/go.sum ./
 COPY server/ ./
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /bin/server main.go
+COPY --from=frontend-builder /frontend/dist ./infrastructure/web/dist/
+RUN CGO_ENABLED=0 GOOS=linux go build -tags embed_ui -ldflags="-s -w" -o /bin/server main.go
 
 # Stage 4: Minimal runtime image
 FROM ubuntu:24.04
@@ -70,18 +71,12 @@ RUN ldconfig
 # Copy built interposer hook
 COPY --from=interposer-builder /build/libdf_streamer.so /app/libdf_streamer.so
 
-# Copy built React client assets
-COPY --from=frontend-builder /frontend/dist /app/client
-
-# Copy built Go Hub server
+# Copy built standalone Go server (with React embedded inside)
 COPY --from=server-builder /bin/server /app/server
 RUN chmod +x /app/server
 
-# Copy default game manifests
-COPY games/ /app/games/
-
 ENV PORT=8484
-EXPOSE 8484/tcp 8484/udp
+EXPOSE 8484/tcp 8484/udp 8485/tcp 8485/udp
 
 VOLUME ["/game"]
 

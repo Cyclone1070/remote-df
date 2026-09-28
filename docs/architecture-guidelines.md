@@ -1,13 +1,13 @@
 # Architecture Guidelines
 
-This document provides decision rules for file placement, code organization, streaming mechanics, and architecture guardrails when adding or modifying features in Remote-DF.
+This document provides decision rules for file placement, code organization, streaming mechanics, and architecture guardrails when adding or modifying features in Remote-DF. For full tier boundaries and deployment flexibility, see [System Design & Layer Contracts](system-design.md).
 
 ---
 
 ## Core Architectural Rules
 
 1. **Feature Slices (`server/features/<slice>/`)**
-   - Modules are organized strictly by **Domain**, not technical layers (e.g. `config/` manages deployment modes; `games/` manages manifests and tags; `session/` manages game process lifecycle).
+   - Modules are organized strictly by **Domain**, not technical layers (e.g. `config/` manages server configuration; `games/` manages game catalog and tags; `session/` manages game process lifecycle).
    - Each domain feature is an isolated, independent vertical slice.
    - Slices MUST NOT import concrete files directly from peer feature slices.
    - Cross-slice communication occurs via domain contracts (`server/domain/`) or composition root wiring in `main.go`.
@@ -28,7 +28,7 @@ This document provides decision rules for file placement, code organization, str
    - **Rule 7: Route Domain Ownership**: Controllers only declare routes belonging to their owning domain slice.
 
 4. **Infrastructure (`server/infrastructure/`)**
-   - Reusable technical adapters (logging, streamer reverse proxy, SPA router) reside in `server/infrastructure/`.
+   - Reusable technical adapters (logging, web UI router) reside in `server/infrastructure/`.
    - Infrastructure must remain independent of domain business logic.
 
 5. **Deployment & Blackbox Testing (`deployment/`)**

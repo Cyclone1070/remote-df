@@ -1,0 +1,8 @@
+FROM cloudflare/cloudflared:latest AS bin
+
+FROM alpine:latest
+RUN apk add --no-cache ca-certificates
+COPY --from=bin /usr/local/bin/cloudflared /usr/local/bin/cloudflared
+COPY deployment/docker/tunnel-entrypoint.sh /tunnel-entrypoint.sh
+RUN chmod +x /tunnel-entrypoint.sh
+ENTRYPOINT ["/tunnel-entrypoint.sh"]

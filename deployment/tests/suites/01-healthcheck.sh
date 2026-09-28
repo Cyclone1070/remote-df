@@ -7,7 +7,7 @@ echo "ℹ INFO: Suite 01: Healthcheck & SPA Routing ($BASE_URL)"
 
 # 1. /api/config
 assert_status GET "$BASE_URL/api/config" 200
-assert_jq '.mode == "self-hosted"' "JSON field 'mode' == 'self-hosted'"
+assert_jq '.authRequired == false' "JSON field 'authRequired' == false"
 
 # 2. Web root
 assert_status GET "$BASE_URL/" 200
