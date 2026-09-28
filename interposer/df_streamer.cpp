@@ -227,21 +227,49 @@ static std::mutex g_tex_lock;
 
 static DrawCommand g_frame_cmds[MAX_DRAW_COMMANDS];
 static uint16_t g_frame_cmd_count = 0;
+struct FrameSnapshot {
+    uint32_t seq = 0;
+    uint16_t cmd_count = 0;
+    DrawCommand cmds[MAX_DRAW_COMMANDS];
+};
+
 class DeltaEncoder {
 public:
     DrawCommand prev_cmds[MAX_DRAW_COMMANDS];
     uint16_t prev_count = 0;
     DeltaUpdate delta_updates[MAX_DRAW_COMMANDS];
+    FrameSnapshot history[60];
 
     bool encode_frame(uint32_t seq, const DrawCommand* curr_cmds, uint16_t curr_count,
-                      bool force_keyframe, uint8_t stamp, std::vector<uint8_t>& out_packet) {
-        bool send_full = force_keyframe || (prev_count == 0) || (curr_count != prev_count);
+                      bool force_keyframe, uint32_t combined_base_seq, uint8_t stamp,
+                      std::vector<uint8_t>& out_packet) {
+        bool is_combined = false;
+        const DrawCommand* base_cmds = prev_cmds;
+        uint16_t base_count = prev_count;
+
+        if (!force_keyframe && combined_base_seq > 0) {
+            uint32_t slot = combined_base_seq % 60;
+            if (history[slot].seq == combined_base_seq && history[slot].cmd_count > 0) {
+                base_cmds = history[slot].cmds;
+                base_count = history[slot].cmd_count;
+                is_combined = true;
+                fprintf(stderr, "[COMBINED_DELTA] Diffing frame %u against history base %u (cmd_count: %u)\n",
+                        seq, combined_base_seq, base_count);
+                fflush(stderr);
+            } else {
+                fprintf(stderr, "[COMBINED_DELTA] Base seq %u expired from history -> forcing keyframe\n", combined_base_seq);
+                fflush(stderr);
+                force_keyframe = true;
+            }
+        }
+
+        bool send_full = force_keyframe || (base_count == 0) || (curr_count != base_count);
 
         uint16_t num_updates = 0;
         if (!send_full) {
-            uint16_t min_count = std::min(curr_count, prev_count);
+            uint16_t min_count = std::min(curr_count, base_count);
             for (uint16_t i = 0; i < min_count; ++i) {
-                if (memcmp(&curr_cmds[i], &prev_cmds[i], sizeof(DrawCommand)) != 0) {
+                if (memcmp(&curr_cmds[i], &base_cmds[i], sizeof(DrawCommand)) != 0) {
                     delta_updates[num_updates].index = i;
                     delta_updates[num_updates].cmd = curr_cmds[i];
                     num_updates++;
@@ -251,6 +279,7 @@ public:
             // If more than 50% changed, send full frame
             if (num_updates > (curr_count / 2)) {
                 send_full = true;
+                is_combined = false;
             }
         }
 
@@ -261,6 +290,7 @@ public:
         hdr.cmd_count = curr_count;
 
         bool include_stamp = (stamp != 0);
+        bool include_base = (!send_full && is_combined);
 
         if (send_full) {
             hdr.flags = 0x01; // Full frame
@@ -282,6 +312,7 @@ public:
         } else {
             hdr.flags = 0x02; // Delta frame
             if (include_stamp) hdr.flags |= 0x04;
+            if (include_base) hdr.flags |= 0x08; // Combined delta flag
 
             size_t payload_len = 2 + num_updates * sizeof(DeltaUpdate);
             std::vector<uint8_t> raw_payload(payload_len);
@@ -291,18 +322,30 @@ public:
             }
 
             size_t max_comp = ZSTD_compressBound(payload_len);
-            size_t header_size = sizeof(hdr) + (include_stamp ? 1 : 0);
+            size_t header_size = sizeof(hdr) + (include_stamp ? 1 : 0) + (include_base ? sizeof(uint32_t) : 0);
 
             out_packet.resize(header_size + max_comp);
             memcpy(out_packet.data(), &hdr, sizeof(hdr));
+            size_t offset = sizeof(hdr);
             if (include_stamp) {
-                out_packet[sizeof(hdr)] = stamp;
+                out_packet[offset] = stamp;
+                offset += 1;
+            }
+            if (include_base) {
+                memcpy(out_packet.data() + offset, &combined_base_seq, sizeof(uint32_t));
+                offset += sizeof(uint32_t);
             }
 
             size_t c_size = ZSTD_compress(out_packet.data() + header_size, max_comp, raw_payload.data(), payload_len, 1);
             if (ZSTD_isError(c_size)) return false;
             out_packet.resize(header_size + c_size);
         }
+
+        // Store snapshot in history ring buffer
+        uint32_t hist_slot = seq % 60;
+        history[hist_slot].seq = seq;
+        history[hist_slot].cmd_count = curr_count;
+        memcpy(history[hist_slot].cmds, curr_cmds, curr_count * sizeof(DrawCommand));
 
         memcpy(prev_cmds, curr_cmds, curr_count * sizeof(DrawCommand));
         prev_count = curr_count;
@@ -313,6 +356,7 @@ public:
 static DeltaEncoder g_delta_encoder;
 static uint32_t g_frame_seq = 0;
 static std::atomic<bool> g_need_keyframe{true};
+static std::atomic<uint32_t> g_pending_combined_base{0};
 
 static void resolve_symbols() {
     if (!real_SDL_RenderCopy) real_SDL_RenderCopy = (int(*)(void*,void*,const SDL_Rect*,const SDL_Rect*))dlsym(RTLD_NEXT, "SDL_RenderCopy");
@@ -588,6 +632,14 @@ extern "C" int SDL_PollEvent(void* event) {
 
 // Handle client input directly in memory
 void handle_client_input_event(const uint8_t* data, size_t len) {
+    if (len >= 5 && data[0] == 7) { // GAP_ACK / COMBINED_DELTA_REQ
+        uint32_t acked_seq = 0;
+        memcpy(&acked_seq, data + 1, sizeof(uint32_t));
+        g_pending_combined_base.store(acked_seq);
+        fprintf(stderr, "[COMBINED_DELTA] Received GAP_ACK for seq %u from client\n", acked_seq);
+        fflush(stderr);
+        return;
+    }
     if (len < sizeof(InputEvent)) return;
     const InputEvent* ev = (const InputEvent*)data;
     if (len >= 17 && data[16] != 0) {
@@ -788,6 +840,28 @@ static std::mutex g_rtc_lock;
 static std::unordered_map<int, ClientRtcSession> g_rtc_sessions;
 static std::vector<std::shared_ptr<rtc::DataChannel>> g_active_dcs;
 
+static void send_texture_packet_dc(std::shared_ptr<rtc::DataChannel> dc, const CachedTexture& ct) {
+    if (!dc || !dc->isOpen() || ct.rgba.empty()) return;
+    TextureHeader hdr;
+    hdr.magic[0] = 'D';
+    hdr.magic[1] = 'T';
+    hdr.tex_id = ct.id;
+    hdr.w = ct.w;
+    hdr.h = ct.h;
+    hdr.payload_len = (uint32_t)ct.rgba.size();
+
+    std::vector<uint8_t> packet(sizeof(hdr) + ct.rgba.size());
+    memcpy(packet.data(), &hdr, sizeof(hdr));
+    memcpy(packet.data() + sizeof(hdr), ct.rgba.data(), ct.rgba.size());
+
+    try {
+        dc->send((const std::byte*)packet.data(), packet.size());
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[TEXTURE_DC_ERROR] %s\n", e.what());
+        fflush(stderr);
+    }
+}
+
 static std::string extract_json_str(const std::string& json, const std::string& key) {
     std::string needle = "\"" + key + "\":\"";
     size_t pos = json.find(needle);
@@ -870,6 +944,14 @@ void handle_client_text_message(int fd, const std::string& msg) {
             config.portRangeBegin = 8484;
             config.portRangeEnd = 8520;
 
+            const char* env_stun = getenv("STUN_SERVER");
+            if (env_stun && strlen(env_stun) > 0) {
+                config.iceServers.emplace_back(env_stun);
+            } else {
+                config.iceServers.emplace_back("stun:stun.l.google.com:19302");
+                config.iceServers.emplace_back("stun:stun1.l.google.com:19302");
+            }
+
             auto pc = std::make_shared<rtc::PeerConnection>(config);
 
             pc->onStateChange([fd](rtc::PeerConnection::State state) {
@@ -899,22 +981,39 @@ void handle_client_text_message(int fd, const std::string& msg) {
             });
 
             pc->onDataChannel([fd](std::shared_ptr<rtc::DataChannel> dc) {
-                fprintf(stderr, "[WebRTC] onDataChannel callback triggered for label='%s' fd=%d\n", dc->label().c_str(), fd);
+                std::string label = dc->label();
+                fprintf(stderr, "[WebRTC] onDataChannel callback triggered for label='%s' fd=%d\n", label.c_str(), fd);
                 fflush(stderr);
 
-                dc->onOpen([fd, dc]() {
-                    fprintf(stderr, "[WebRTC] True UDP DataChannel '%s' OPEN for fd=%d\n", dc->label().c_str(), fd);
+                dc->onOpen([fd, dc, label]() {
+                    fprintf(stderr, "[WebRTC] DataChannel '%s' OPEN for fd=%d\n", label.c_str(), fd);
                     fflush(stderr);
-                    g_need_keyframe.store(true);
-                    std::lock_guard<std::mutex> lock(g_rtc_lock);
-                    g_active_dcs.push_back(dc);
+
+                    if (label == "df-stream") {
+                        g_need_keyframe.store(true);
+                        {
+                            std::lock_guard<std::mutex> lock(g_rtc_lock);
+                            g_active_dcs.push_back(dc);
+                        }
+                        // Send all cached textures directly over df-stream DataChannel!
+                        {
+                            std::lock_guard<std::mutex> lock(g_tex_lock);
+                            for (uint16_t i = 0; i < g_texture_count; i++) {
+                                if (!g_cached_textures[i].rgba.empty()) {
+                                    send_texture_packet_dc(dc, g_cached_textures[i]);
+                                }
+                            }
+                        }
+                    }
                 });
 
-                dc->onClosed([fd, dc]() {
-                    fprintf(stderr, "[WebRTC] DataChannel '%s' CLOSED for fd=%d\n", dc->label().c_str(), fd);
+                dc->onClosed([fd, dc, label]() {
+                    fprintf(stderr, "[WebRTC] DataChannel '%s' CLOSED for fd=%d\n", label.c_str(), fd);
                     fflush(stderr);
-                    std::lock_guard<std::mutex> lock(g_rtc_lock);
-                    g_active_dcs.erase(std::remove(g_active_dcs.begin(), g_active_dcs.end(), dc), g_active_dcs.end());
+                    if (label == "df-stream") {
+                        std::lock_guard<std::mutex> lock(g_rtc_lock);
+                        g_active_dcs.erase(std::remove(g_active_dcs.begin(), g_active_dcs.end(), dc), g_active_dcs.end());
+                    }
                 });
 
                 dc->onMessage([](auto data) {
@@ -925,7 +1024,9 @@ void handle_client_text_message(int fd, const std::string& msg) {
                 });
 
                 std::lock_guard<std::mutex> lock(g_rtc_lock);
-                g_rtc_sessions[fd].dc = dc;
+                if (label == "df-stream") {
+                    g_rtc_sessions[fd].dc = dc;
+                }
             });
 
             pc->setRemoteDescription(rtc::Description(sdp, "offer"));
@@ -1051,7 +1152,14 @@ void* SDL_CreateTextureFromSurface(void* renderer, void* surface) {
                 memcpy(ct.rgba.data() + y * ct.w * 4, src + y * s->pitch, std::min((int)(ct.w * 4), s->pitch));
             }
         }
-        send_texture_packet(-1, ct);
+        {
+            std::lock_guard<std::mutex> lock(g_rtc_lock);
+            for (auto& dc : g_active_dcs) {
+                if (dc && dc->isOpen()) {
+                    send_texture_packet_dc(dc, ct);
+                }
+            }
+        }
     }
     return tex;
 }
@@ -1149,28 +1257,25 @@ void SDL_RenderPresent(void* renderer) {
         }
 
         std::vector<uint8_t> frame_packet;
-        bool is_full = g_delta_encoder.encode_frame(g_frame_seq, g_frame_cmds, g_frame_cmd_count, g_need_keyframe.load(), stamp, frame_packet);
+        uint32_t combined_base = g_pending_combined_base.exchange(0);
+        bool is_full = g_delta_encoder.encode_frame(g_frame_seq, g_frame_cmds, g_frame_cmd_count, g_need_keyframe.load(), combined_base, stamp, frame_packet);
         if (is_full) {
             g_need_keyframe.store(false);
         }
 
         if (!frame_packet.empty()) {
-            bool sent_webrtc = false;
+            bool has_open_dc = false;
             {
                 std::lock_guard<std::mutex> lock(g_rtc_lock);
                 for (auto& dc : g_active_dcs) {
                     if (dc && dc->isOpen()) {
-                        // Drop frame if UDP buffer is backed up (>64KB) to eliminate bufferbloat
-                        if (dc->bufferedAmount() < 65536) {
+                        has_open_dc = true;
+                        // Drop frame if UDP buffer is backed up (>128KB) to eliminate bufferbloat
+                        if (dc->bufferedAmount() < 131072) {
                             dc->send((const std::byte*)frame_packet.data(), frame_packet.size());
-                            sent_webrtc = true;
                         }
                     }
                 }
-            }
-
-            if (!sent_webrtc && g_server && g_server->active_ws_clients() > 0) {
-                g_server->broadcast_ws_binary(frame_packet.data(), frame_packet.size());
             }
         }
     }

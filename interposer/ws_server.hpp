@@ -112,8 +112,6 @@ private:
 
             std::string init_json = "{\"type\":\"init\",\"grid_w\":160,\"grid_h\":60,\"font_w\":8,\"font_h\":12}";
             send_ws_text(client.fd, init_json);
-
-            sync_client_textures(client.fd);
             return;
         }
 
