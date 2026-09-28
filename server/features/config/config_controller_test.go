@@ -12,8 +12,8 @@ import (
 func TestConfigController_GetConfig(t *testing.T) {
 	provider := &mockConfigProvider{
 		cfg: ServerConfig{
-			Mode:         "self-hosted",
 			AuthRequired: false,
+			StreamPort:   8485,
 		},
 	}
 	service := NewConfigService(provider)
@@ -33,10 +33,10 @@ func TestConfigController_GetConfig(t *testing.T) {
 		t.Fatalf("failed to decode response: %v", err)
 	}
 
-	if res.Mode != "self-hosted" {
-		t.Fatalf("expected mode self-hosted, got %s", res.Mode)
-	}
 	if res.AuthRequired != false {
 		t.Fatalf("expected authRequired false, got %v", res.AuthRequired)
+	}
+	if res.StreamPort != 8485 {
+		t.Fatalf("expected streamPort 8485, got %d", res.StreamPort)
 	}
 }

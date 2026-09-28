@@ -20,6 +20,8 @@ type GameManifest struct {
 	Tags         []Tag             `json:"tags,omitempty"`
 	SaveDirs     []string          `json:"saveDirs,omitempty" example:"data/save"`
 	Env          map[string]string `json:"env,omitempty"`
+	Available    bool              `json:"available" example:"true"`
+	InstallDir   string            `json:"installDir,omitempty" example:"/game"`
 }
 
 // GameRegistry defines the interface for discovering and retrieving game manifests.

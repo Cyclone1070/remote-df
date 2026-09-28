@@ -11,7 +11,7 @@
     "paths": {
         "/api/config": {
             "get": {
-                "description": "Returns deployment mode and authentication requirements.",
+                "description": "Returns authentication requirements for the server.",
                 "produces": [
                     "application/json"
                 ],
@@ -170,6 +170,10 @@
         "domain.GameManifest": {
             "type": "object",
             "properties": {
+                "available": {
+                    "type": "boolean",
+                    "example": true
+                },
                 "description": {
                     "type": "string",
                     "example": "The deepest, most intricate simulation of a world that's ever been created."
@@ -191,6 +195,10 @@
                 "id": {
                     "type": "string",
                     "example": "dwarf-fortress"
+                },
+                "installDir": {
+                    "type": "string",
+                    "example": "/game"
                 },
                 "name": {
                     "type": "string",
@@ -245,9 +253,9 @@
                     "type": "boolean",
                     "example": false
                 },
-                "mode": {
-                    "type": "string",
-                    "example": "self-hosted"
+                "streamPort": {
+                    "type": "integer",
+                    "example": 8485
                 }
             }
         },
@@ -319,6 +327,10 @@
                         }
                     ],
                     "example": "running"
+                },
+                "streamPort": {
+                    "type": "integer",
+                    "example": 8485
                 },
                 "uptimeSec": {
                     "type": "integer",

@@ -40,6 +40,9 @@ func TestProcessSupervisor_Lifecycle(t *testing.T) {
 	if status.GameID != "test-sleep" {
 		t.Errorf("expected gameID test-sleep, got %s", status.GameID)
 	}
+	if status.StreamPort != 8485 {
+		t.Errorf("expected streamPort 8485, got %d", status.StreamPort)
+	}
 
 	// Conflict test
 	err = sup.Start(manifest, []string{"2"}, 8485)

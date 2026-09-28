@@ -8,6 +8,9 @@ definitions:
     type: object
   domain.GameManifest:
     properties:
+      available:
+        example: true
+        type: boolean
       description:
         example: The deepest, most intricate simulation of a world that's ever been
           created.
@@ -24,6 +27,9 @@ definitions:
         type: string
       id:
         example: dwarf-fortress
+        type: string
+      installDir:
+        example: /game
         type: string
       name:
         example: Dwarf Fortress
@@ -62,9 +68,9 @@ definitions:
       authRequired:
         example: false
         type: boolean
-      mode:
-        example: self-hosted
-        type: string
+      streamPort:
+        example: 8485
+        type: integer
     type: object
   dto.StartSessionRequest:
     properties:
@@ -115,6 +121,9 @@ definitions:
         - running
         - stopping
         example: running
+      streamPort:
+        example: 8485
+        type: integer
       uptimeSec:
         example: 42
         type: integer
@@ -128,7 +137,7 @@ info:
 paths:
   /api/config:
     get:
-      description: Returns deployment mode and authentication requirements.
+      description: Returns authentication requirements for the server.
       produces:
       - application/json
       responses:

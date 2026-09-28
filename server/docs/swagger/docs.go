@@ -17,7 +17,7 @@ const docTemplate = `{
     "paths": {
         "/api/config": {
             "get": {
-                "description": "Returns deployment mode and authentication requirements.",
+                "description": "Returns authentication requirements for the server.",
                 "produces": [
                     "application/json"
                 ],
@@ -176,6 +176,10 @@ const docTemplate = `{
         "domain.GameManifest": {
             "type": "object",
             "properties": {
+                "available": {
+                    "type": "boolean",
+                    "example": true
+                },
                 "description": {
                     "type": "string",
                     "example": "The deepest, most intricate simulation of a world that's ever been created."
@@ -197,6 +201,10 @@ const docTemplate = `{
                 "id": {
                     "type": "string",
                     "example": "dwarf-fortress"
+                },
+                "installDir": {
+                    "type": "string",
+                    "example": "/game"
                 },
                 "name": {
                     "type": "string",
@@ -251,9 +259,9 @@ const docTemplate = `{
                     "type": "boolean",
                     "example": false
                 },
-                "mode": {
-                    "type": "string",
-                    "example": "self-hosted"
+                "streamPort": {
+                    "type": "integer",
+                    "example": 8485
                 }
             }
         },
@@ -325,6 +333,10 @@ const docTemplate = `{
                         }
                     ],
                     "example": "running"
+                },
+                "streamPort": {
+                    "type": "integer",
+                    "example": 8485
                 },
                 "uptimeSec": {
                     "type": "integer",

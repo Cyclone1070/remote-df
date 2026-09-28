@@ -21,7 +21,8 @@ type ProcessSupervisor struct {
 	startedAt time.Time
 	gameCmd   *exec.Cmd
 	xvfbCmd   *exec.Cmd
-	gameDone  chan struct{}
+	gameDone   chan struct{}
+	streamPort int
 }
 
 // NewProcessSupervisor creates a new idle process supervisor.
@@ -47,12 +48,13 @@ func (s *ProcessSupervisor) Status() SessionStatus {
 	}
 
 	return SessionStatus{
-		State:     s.state,
-		GameID:    s.gameID,
-		GameName:  s.gameName,
-		PID:       pid,
-		UptimeSec: uptime,
-		StartedAt: s.startedAt,
+		State:      s.state,
+		GameID:     s.gameID,
+		GameName:   s.gameName,
+		PID:        pid,
+		UptimeSec:  uptime,
+		StartedAt:  s.startedAt,
+		StreamPort: s.streamPort,
 	}
 }
 
@@ -124,6 +126,7 @@ func (s *ProcessSupervisor) Start(m domain.GameManifest, args []string, streamPo
 	s.gameCmd = cmd
 	s.gameDone = done
 	s.startedAt = time.Now()
+	s.streamPort = streamPort
 	s.state = StateRunning
 
 	// 3. Monitor process exit asynchronously (sole caller of cmd.Wait)
@@ -147,6 +150,7 @@ func (s *ProcessSupervisor) Start(m domain.GameManifest, args []string, streamPo
 			s.gameCmd = nil
 			s.gameDone = nil
 			s.startedAt = time.Time{}
+			s.streamPort = 0
 		}
 	}()
 
@@ -193,5 +197,6 @@ func (s *ProcessSupervisor) Stop() error {
 	s.gameCmd = nil
 	s.gameDone = nil
 	s.startedAt = time.Time{}
+	s.streamPort = 0
 	return nil
 }

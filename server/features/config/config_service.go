@@ -21,7 +21,7 @@ func NewConfigService(provider ConfigProvider) *ConfigService {
 func (s *ConfigService) GetServerConfig() dto.ConfigResponseDto {
 	cfg := s.provider.GetConfig()
 	return dto.ConfigResponseDto{
-		Mode:         cfg.Mode,
 		AuthRequired: cfg.AuthRequired,
+		StreamPort:   cfg.StreamPort,
 	}
 }

@@ -15,7 +15,6 @@ import (
 	"github.com/cyclone1070/remote-df/server/features/config"
 	"github.com/cyclone1070/remote-df/server/features/games"
 	"github.com/cyclone1070/remote-df/server/features/session"
-	"github.com/cyclone1070/remote-df/server/infrastructure/streamer"
 	"github.com/cyclone1070/remote-df/server/infrastructure/web"
 )
 
@@ -49,24 +48,31 @@ func getEnvInt(key string, fallback int) int {
 	return fallback
 }
 
+func getEnvBool(key string, fallback bool) bool {
+	if v := os.Getenv(key); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
+	}
+	return fallback
+}
+
 func main() {
 	port := flag.Int("port", getEnvInt("PORT", 8484), "Public HTTP/WS server port")
 	streamPort := flag.Int("stream-port", getEnvInt("STREAM_PORT", 8485), "Internal game stream port")
-	gamesDir := flag.String("games-dir", getEnv("GAMES_DIR", "/app/games"), "Directory containing game manifests")
-	clientDir := flag.String("client-dir", getEnv("WEB_ROOT", "/app/client"), "Directory containing static frontend assets")
-	mode := flag.String("mode", getEnv("MODE", "self-hosted"), "Deployment mode: self-hosted, native, saas")
+	headless := flag.Bool("headless", getEnvBool("HEADLESS", false), "Run as pure headless API server (no UI routes)")
 	flag.Parse()
 
-	log.Printf("Starting Remote-DF Server on :%d (mode: %s)...", *port, *mode)
+	log.Printf("Starting Remote-DF Server on :%d (headless: %v)...", *port, *headless)
 
 	// Composition Root: Wire up Dependency Injection
 	configProvider := &appConfigProvider{
 		cfg: config.ServerConfig{
-			Mode:         *mode,
 			AuthRequired: false,
+			StreamPort:   *streamPort,
 		},
 	}
-	gameRegistry := games.NewFileSystemRegistry(*gamesDir)
+	gameRegistry := games.NewCatalogRegistry()
 	supervisor := session.NewProcessSupervisor()
 
 	// Services (Domain Logic with Injected Dependencies)
@@ -79,17 +85,17 @@ func main() {
 	gamesCtrl := games.NewGamesController(gamesService)
 	sessionCtrl := session.NewSessionController(sessionService)
 
-	// Infrastructure Adapters
-	streamerProxy := streamer.NewStreamerProxy(*streamPort)
-	spaRouter := web.NewSPARouter(*clientDir)
-
 	// Root Router
 	mux := http.NewServeMux()
 	configCtrl.RegisterRoutes(mux)
 	gamesCtrl.RegisterRoutes(mux)
 	sessionCtrl.RegisterRoutes(mux)
-	streamerProxy.RegisterRoutes(mux)
-	spaRouter.RegisterRoutes(mux) // Fallback for static assets & SPA routes
+
+	// Stream Proxy: reverse-proxy WebSocket /ws to internal game streamer
+	web.RegisterStreamProxy(mux, *streamPort)
+
+	// UI Router: No-op in headless builds/flags; serves embedded React assets when built with -tags embed_ui
+	web.RegisterUIRoutes(mux, *headless)
 
 	server := &http.Server{
 		Addr:    fmt.Sprintf(":%d", *port),

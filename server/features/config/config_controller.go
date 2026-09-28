@@ -9,8 +9,8 @@ import (
 
 // ServerConfig represents the server deployment settings and capabilities.
 type ServerConfig struct {
-	Mode         string `json:"mode" example:"self-hosted"`
-	AuthRequired bool   `json:"authRequired" example:"false"`
+	AuthRequired bool `json:"authRequired" example:"false"`
+	StreamPort   int  `json:"streamPort" example:"8485"`
 }
 
 // ConfigController handles server configuration HTTP endpoints.
@@ -30,7 +30,7 @@ func (c *ConfigController) RegisterRoutes(mux *http.ServeMux) {
 
 // GetConfig godoc
 // @Summary      Get server configuration
-// @Description  Returns deployment mode and authentication requirements.
+// @Description  Returns authentication requirements for the server.
 // @Tags         config
 // @Produce      json
 // @Success      200  {object}  dto.ConfigResponseDto

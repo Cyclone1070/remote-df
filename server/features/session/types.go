@@ -22,8 +22,9 @@ type SessionStatus struct {
 	GameID    string       `json:"gameId,omitempty" example:"dwarf-fortress"`
 	GameName  string       `json:"gameName,omitempty" example:"Dwarf Fortress"`
 	PID       int          `json:"pid,omitempty" example:"104"`
-	UptimeSec int64        `json:"uptimeSec,omitempty" example:"42"`
-	StartedAt time.Time    `json:"startedAt" example:"2026-09-25T02:00:00Z"`
+	UptimeSec  int64        `json:"uptimeSec,omitempty" example:"42"`
+	StartedAt  time.Time    `json:"startedAt" example:"2026-09-25T02:00:00Z"`
+	StreamPort int          `json:"streamPort,omitempty" example:"8485"`
 }
 
 // SessionSupervisor defines the interface for controlling the game process lifecycle.
