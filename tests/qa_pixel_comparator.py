@@ -29,6 +29,14 @@ def compare(host_path, client_path, diff_out_path, tolerance=2):
     exact_match_pct = (1.0 - exact_mismatch_count / total_pixels) * 100.0
     tol_match_pct = (1.0 - tol_mismatch_count / total_pixels) * 100.0
 
+    # Foreground-specific match: pixels where host reference is non-black
+    fg_mask = np.any(h_arr > 15, axis=2)
+    fg_total = int(np.sum(fg_mask))
+    fg_mismatches = int(np.sum(tol_mismatches & fg_mask))
+    fg_match_pct = (1.0 - fg_mismatches / fg_total) * 100.0 if fg_total > 0 else 0.0
+
+    client_nonzero = int(np.sum(np.any(c_arr > 15, axis=2)))
+
     # Generate visual diff image: client image dimmed + neon magenta (#FF00FF) on mismatches
     diff_vis = (c_arr // 3).astype(np.uint8)
     diff_vis[tol_mismatches] = [255, 0, 255]
@@ -42,6 +50,9 @@ def compare(host_path, client_path, diff_out_path, tolerance=2):
         "tol_match_pct": round(tol_match_pct, 3),
         "exact_mismatch_count": exact_mismatch_count,
         "tol_mismatch_count": tol_mismatch_count,
+        "fg_total": fg_total,
+        "fg_match_pct": round(fg_match_pct, 3),
+        "client_nonzero": client_nonzero,
         "max_delta": max_delta,
         "mean_delta": round(mean_delta, 4),
         "diff_path": diff_out_path
