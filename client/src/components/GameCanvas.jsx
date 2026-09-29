@@ -38,9 +38,10 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
         const pendingStamps = new Map();
         const pendingRenderStamps = [];
         const m2pSamples = [];
+        window.__m2pSamples = m2pSamples;
 
         function getNextDebugStamp() {
-            if (!isDebug) return 0;
+            if (!isDebug && !window.__enableM2P) return 0;
             currentDebugStamp = (currentDebugStamp % 255) + 1;
             pendingStamps.set(currentDebugStamp, performance.now());
             if (pendingStamps.size > 100) {
@@ -103,7 +104,7 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
             const didRender = renderer.render();
 
             if (didRender) {
-                if (isDebug && pendingRenderStamps.length > 0) {
+                if ((isDebug || window.__enableM2P) && pendingRenderStamps.length > 0) {
                     const now = performance.now();
                     for (let i = 0; i < pendingRenderStamps.length; i++) {
                         const stamp = pendingRenderStamps[i];
@@ -111,6 +112,8 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
                         if (sentTime !== undefined) {
                             const m2p = now - sentTime;
                             m2pSamples.push(m2p);
+                            if (!window.__m2pHistory) window.__m2pHistory = [];
+                            window.__m2pHistory.push(m2p);
                             if (m2pSamples.length > 30) m2pSamples.shift();
                             for (const [s, t] of pendingStamps.entries()) {
                                 if (t <= sentTime) pendingStamps.delete(s);
@@ -180,7 +183,7 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
             if (isDebug) streamFrameCount++;
             const frame = DFProtocol.decodeFrame(buffer);
             if (frame) {
-                if (isDebug && frame.stamp && pendingStamps.has(frame.stamp)) {
+                if ((isDebug || window.__enableM2P) && frame.stamp && pendingStamps.has(frame.stamp)) {
                     pendingRenderStamps.push(frame.stamp);
                 }
 
