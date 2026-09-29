@@ -76,7 +76,7 @@ COPY --from=server-builder /bin/server /app/server
 RUN chmod +x /app/server
 
 ENV PORT=8484
-EXPOSE 8484/tcp 8484/udp 8485/tcp 8485/udp
+EXPOSE 8484/tcp 8484/udp 8485/tcp 8485-8520/udp
 
 VOLUME ["/game"]
 

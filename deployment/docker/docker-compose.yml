@@ -7,7 +7,7 @@ services:
     ports:
       - "${PORT:-8484}:8484/tcp"
       - "${STREAM_PORT:-8485}:8485/tcp"
-      - "${STREAM_PORT:-8485}:8485/udp"
+      - "8485-8520:8485-8520/udp"
     environment:
       - STUN_SERVER=${STUN_SERVER:-}
     volumes:
