@@ -5,6 +5,7 @@
 #include <mutex>
 #include <thread>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -227,11 +228,19 @@ static std::mutex g_tex_lock;
 
 static DrawCommand g_frame_cmds[MAX_DRAW_COMMANDS];
 static uint16_t g_frame_cmd_count = 0;
+
+// Set by the present handler; read inside the encoder so a keepalive can
+// bypass the silence rule. Declared here because the encoder is defined above
+// the present handler.
+static bool g_keepalive_due = false;
+
 struct FrameSnapshot {
     uint32_t seq = 0;
     uint16_t cmd_count = 0;
     DrawCommand cmds[MAX_DRAW_COMMANDS];
 };
+
+enum class EncodeResult { Nothing, Delta, Full };
 
 class DeltaEncoder {
 public:
@@ -240,9 +249,50 @@ public:
     DeltaUpdate delta_updates[MAX_DRAW_COMMANDS];
     FrameSnapshot history[60];
 
-    bool encode_frame(uint32_t seq, const DrawCommand* curr_cmds, uint16_t curr_count,
-                      bool force_keyframe, uint32_t combined_base_seq, uint8_t stamp,
-                      std::vector<uint8_t>& out_packet) {
+    // Cumulative counters, surfaced in the stats dump so silent frames and
+    // encoding choices are observable rather than invisible.
+    uint64_t stat_nothing = 0;
+    uint64_t stat_full = 0;
+    uint64_t stat_delta = 0;
+    uint64_t stat_bytes_full = 0;
+    uint64_t stat_bytes_delta = 0;
+    uint64_t stat_full_wins = 0;
+    uint64_t stat_delta_wins = 0;
+
+    // Encode cost in microseconds. Measured so the price of building two
+    // candidate packets per frame is a number, not an assumption.
+    std::vector<double> enc_us;
+    uint64_t stat_enc_calls = 0;
+
+    EncodeResult encode_frame(uint32_t seq, const DrawCommand* curr_cmds, uint16_t curr_count,
+                              bool force_keyframe, uint32_t combined_base_seq, uint8_t stamp,
+                              std::vector<uint8_t>& out_packet) {
+        out_packet.clear();
+
+        // Times every exit path of this function, including the early returns.
+        {
+            auto t0 = std::chrono::steady_clock::now();
+            struct EncScopeTimer {
+                std::chrono::steady_clock::time_point t0;
+                std::vector<double>* v;
+                uint64_t* calls;
+                ~EncScopeTimer() {
+                    double us = std::chrono::duration<double, std::micro>(
+                        std::chrono::steady_clock::now() - t0).count();
+                    v->push_back(us);
+                    (*calls)++;
+                    if (v->size() > 900) v->erase(v->begin(), v->begin() + 300);
+                }
+            } _est{t0, &enc_us, &stat_enc_calls};
+            return encode_frame_inner(seq, curr_cmds, curr_count, force_keyframe,
+                                      combined_base_seq, stamp, out_packet);
+        }
+    }
+
+    EncodeResult encode_frame_inner(uint32_t seq, const DrawCommand* curr_cmds, uint16_t curr_count,
+                              bool force_keyframe, uint32_t combined_base_seq, uint8_t stamp,
+                              std::vector<uint8_t>& out_packet) {
+
         bool is_combined = false;
         const DrawCommand* base_cmds = prev_cmds;
         uint16_t base_count = prev_count;
@@ -263,10 +313,10 @@ public:
             }
         }
 
-        bool send_full = force_keyframe || (base_count == 0) || (curr_count != base_count);
-
+        // Diff against the base. Indices the base never had are emitted too, so a
+        // delta stays applicable when the command count grew or shrank.
         uint16_t num_updates = 0;
-        if (!send_full) {
+        if (!force_keyframe && base_count > 0) {
             uint16_t min_count = std::min(curr_count, base_count);
             for (uint16_t i = 0; i < min_count; ++i) {
                 if (memcmp(&curr_cmds[i], &base_cmds[i], sizeof(DrawCommand)) != 0) {
@@ -275,12 +325,22 @@ public:
                     num_updates++;
                 }
             }
-
-            // If more than 50% changed, send full frame
-            if (num_updates > (curr_count / 2)) {
-                send_full = true;
-                is_combined = false;
+            for (uint16_t i = min_count; i < curr_count; ++i) {
+                delta_updates[num_updates].index = i;
+                delta_updates[num_updates].cmd = curr_cmds[i];
+                num_updates++;
             }
+        }
+
+        // Nothing changed and no bridge is outstanding: stay silent. The caller
+        // must not consume a sequence number, otherwise the client reads the hole
+        // as packet loss and starts a recovery round trip over a no-op frame.
+        // A requested bridge is never suppressed - that packet is what advances
+        // a client that is parked on an older sequence.
+        if (!force_keyframe && !is_combined && base_count > 0 &&
+            curr_count == base_count && num_updates == 0 && !g_keepalive_due) {
+            stat_nothing++;
+            return EncodeResult::Nothing;
         }
 
         FrameHeader hdr;
@@ -290,30 +350,40 @@ public:
         hdr.cmd_count = curr_count;
 
         bool include_stamp = (stamp != 0);
-        bool include_base = (!send_full && is_combined);
 
-        if (send_full) {
-            hdr.flags = 0x01; // Full frame
-            if (include_stamp) hdr.flags |= 0x04;
-
+        // Candidate 1: standalone whole frame.
+        std::vector<uint8_t> full_packet;
+        {
             size_t raw_len = curr_count * sizeof(DrawCommand);
             size_t max_comp = ZSTD_compressBound(raw_len);
             size_t header_size = sizeof(hdr) + (include_stamp ? 1 : 0);
 
-            out_packet.resize(header_size + max_comp);
-            memcpy(out_packet.data(), &hdr, sizeof(hdr));
-            if (include_stamp) {
-                out_packet[sizeof(hdr)] = stamp;
-            }
-
-            size_t c_size = ZSTD_compress(out_packet.data() + header_size, max_comp, curr_cmds, raw_len, 1);
-            if (ZSTD_isError(c_size)) return false;
-            out_packet.resize(header_size + c_size);
-        } else {
-            hdr.flags = 0x02; // Delta frame
+            hdr.flags = 0x01; // Full frame
             if (include_stamp) hdr.flags |= 0x04;
-            if (include_base) hdr.flags |= 0x08; // Combined delta flag
 
+            full_packet.resize(header_size + max_comp);
+            memcpy(full_packet.data(), &hdr, sizeof(hdr));
+            if (include_stamp) full_packet[sizeof(hdr)] = stamp;
+
+            size_t c_size = ZSTD_compress(full_packet.data() + header_size, max_comp, curr_cmds, raw_len, 1);
+            if (ZSTD_isError(c_size)) return EncodeResult::Nothing;
+            full_packet.resize(header_size + c_size);
+        }
+
+        // A forced keyframe is the only case where the encoding is not a choice:
+        // the client has no baseline to patch, so a delta would be unusable.
+        if (force_keyframe) {
+            stat_full++;
+            stat_bytes_full += full_packet.size();
+            out_packet = std::move(full_packet);
+            record(curr_cmds, curr_count, seq);
+            return EncodeResult::Full;
+        }
+
+        // Candidate 2: delta against whichever base we resolved.
+        bool include_base = is_combined;
+        std::vector<uint8_t> delta_packet;
+        {
             size_t payload_len = 2 + num_updates * sizeof(DeltaUpdate);
             std::vector<uint8_t> raw_payload(payload_len);
             memcpy(raw_payload.data(), &num_updates, 2);
@@ -321,27 +391,59 @@ public:
                 memcpy(raw_payload.data() + 2, delta_updates, num_updates * sizeof(DeltaUpdate));
             }
 
+            hdr.flags = 0x02; // Delta frame
+            if (include_stamp) hdr.flags |= 0x04;
+            if (include_base) hdr.flags |= 0x08; // Combined delta flag
+
             size_t max_comp = ZSTD_compressBound(payload_len);
             size_t header_size = sizeof(hdr) + (include_stamp ? 1 : 0) + (include_base ? sizeof(uint32_t) : 0);
 
-            out_packet.resize(header_size + max_comp);
-            memcpy(out_packet.data(), &hdr, sizeof(hdr));
+            delta_packet.resize(header_size + max_comp);
+            memcpy(delta_packet.data(), &hdr, sizeof(hdr));
             size_t offset = sizeof(hdr);
             if (include_stamp) {
-                out_packet[offset] = stamp;
+                delta_packet[offset] = stamp;
                 offset += 1;
             }
             if (include_base) {
-                memcpy(out_packet.data() + offset, &combined_base_seq, sizeof(uint32_t));
+                memcpy(delta_packet.data() + offset, &combined_base_seq, sizeof(uint32_t));
                 offset += sizeof(uint32_t);
             }
 
-            size_t c_size = ZSTD_compress(out_packet.data() + header_size, max_comp, raw_payload.data(), payload_len, 1);
-            if (ZSTD_isError(c_size)) return false;
-            out_packet.resize(header_size + c_size);
+            size_t c_size = ZSTD_compress(delta_packet.data() + header_size, max_comp, raw_payload.data(), payload_len, 1);
+            if (ZSTD_isError(c_size)) {
+                out_packet = std::move(full_packet);
+                stat_full++;
+                stat_bytes_full += out_packet.size();
+                record(curr_cmds, curr_count, seq);
+                return EncodeResult::Full;
+            }
+            delta_packet.resize(header_size + c_size);
         }
 
-        // Store snapshot in history ring buffer
+        // Both encodings are built and measured, so the smaller one always wins.
+        // The old rule switched on a command-count ratio, which is only a proxy
+        // for size and got it wrong in the band around the break-even point.
+        EncodeResult result;
+        if (delta_packet.size() < full_packet.size()) {
+            stat_delta_wins++;
+            stat_delta++;
+            stat_bytes_delta += delta_packet.size();
+            out_packet = std::move(delta_packet);
+            result = EncodeResult::Delta;
+        } else {
+            stat_full_wins++;
+            stat_full++;
+            stat_bytes_full += full_packet.size();
+            out_packet = std::move(full_packet);
+            result = EncodeResult::Full;
+        }
+
+        record(curr_cmds, curr_count, seq);
+        return result;
+    }
+
+    void record(const DrawCommand* curr_cmds, uint16_t curr_count, uint32_t seq) {
         uint32_t hist_slot = seq % 60;
         history[hist_slot].seq = seq;
         history[hist_slot].cmd_count = curr_count;
@@ -349,12 +451,15 @@ public:
 
         memcpy(prev_cmds, curr_cmds, curr_count * sizeof(DrawCommand));
         prev_count = curr_count;
-        return send_full;
     }
 };
 
 static DeltaEncoder g_delta_encoder;
+// Render-tick counter: advances on every present, used to name recorded frames.
 static uint32_t g_frame_seq = 0;
+// Wire sequence: advances only when a frame packet is actually sent, so silent
+// frames leave no gap in the numbering the client sees.
+static uint32_t g_sent_seq = 0;
 static std::atomic<bool> g_need_keyframe{true};
 static std::atomic<uint32_t> g_pending_combined_base{0};
 
@@ -493,6 +598,39 @@ extern "C" void _ZN15enabler_inputst9add_inputER9SDL_Eventj(void* self, void* ev
 
 static uint8_t g_current_client_stamp = 0;
 static bool g_has_client_stamp = false;
+static std::chrono::steady_clock::time_point g_client_stamp_time;
+
+// A stamp only describes latency while the input that produced it is still
+// recent. Frames are now emitted only when the scene actually changes, so a
+// stamp from an input that changed nothing would otherwise ride along on some
+// unrelated later frame and report seconds of latency that never happened.
+static const int64_t g_stamp_max_age_ms = 200;
+// Age of an input stamp when the frame carrying it actually went out. This is
+// the server-side share of felt latency: input received -> changed frame sent.
+static std::vector<int64_t> g_stamp_ages_ms;
+static uint64_t g_stamp_seen = 0;
+static bool g_stamp_pending = false;
+// Bytes still queued in the SCTP send buffer at the moment a frame is handed to
+// it. Distinguishes "our queue is backed up" from "we handed it over instantly
+// and the network took the time" -- different root causes, different fixes.
+static std::vector<int64_t> g_queue_at_send;
+static uint64_t g_tex_count = 0;
+static uint64_t g_tex_bytes = 0;
+// Cold-path keepalive. Suppressing silent frames cut traffic to ~1-3 packets/s,
+// and a packet sent onto an idle path pays a delay penalty (measured: transport
+// p95 150ms vs the baseline's 86ms with an EMPTY send queue, so the cost is not
+// local buffering). The baseline's continuous 50/s stream was quietly keeping
+// the path warm. Emitting a content-free delta when the link has been idle
+// tests that directly: if the tail closes, the cause is idleness, not volume.
+static uint64_t g_keepalive_sent = 0;
+static std::chrono::steady_clock::time_point g_last_send_time;
+static bool g_sent_any = false;
+static std::chrono::steady_clock::time_point g_stamp_pending_time;
+
+static int64_t steady_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 static std::mutex g_btn_sync_lock;
 static bool g_in_poll_pass = false;
 static bool g_btn_down_in_pass[8] = {false};
@@ -645,6 +783,7 @@ void handle_client_input_event(const uint8_t* data, size_t len) {
     if (len >= 17 && data[16] != 0) {
         g_current_client_stamp = data[16];
         g_has_client_stamp = true;
+        g_client_stamp_time = std::chrono::steady_clock::now();
     }
 
     ensure_mouse_focus();
@@ -854,6 +993,8 @@ static void send_texture_packet_dc(std::shared_ptr<rtc::DataChannel> dc, const C
     memcpy(packet.data(), &hdr, sizeof(hdr));
     memcpy(packet.data() + sizeof(hdr), ct.rgba.data(), ct.rgba.size());
 
+    g_tex_count++;
+    g_tex_bytes += packet.size();
     try {
         dc->send((const std::byte*)packet.data(), packet.size());
     } catch (const std::exception& e) {
@@ -1248,34 +1389,136 @@ void SDL_RenderPresent(void* renderer) {
         has_receivers = !g_active_dcs.empty();
     }
 
-    if (g_frame_cmd_count > 0 && has_receivers) {
+    // Backpressure: if the SCTP send queue is already deep, skip this frame
+    // rather than queueing behind it. Queueing does not lose data, it makes it
+    // late -- and every later frame then queues behind it too, which is how a
+    // bursty link turns into multi-hundred-millisecond lag. Removing this check
+    // measured transport p95 at 259ms against the baseline's 86ms, with zero
+    // packet loss, which is the signature of a queue rather than a drop.
+    // Skipping is safe because nothing is consumed here: prev_cmds, the sequence
+    // number and the client's stamp are all left untouched, so the next present
+    // recomputes the same delta with more changes folded in and sends once the
+    // queue has drained.
+    bool link_backed_up = false;
+    {
+        std::lock_guard<std::mutex> lock(g_rtc_lock);
+        for (auto& dc : g_active_dcs) {
+            if (dc && dc->isOpen() && dc->bufferedAmount() >= 131072) { link_backed_up = true; break; }
+        }
+    }
+
+    if (g_frame_cmd_count > 0 && has_receivers && !link_backed_up) {
         uint8_t stamp = 0;
         if (g_has_client_stamp && g_current_client_stamp != 0) {
+            // NOTE: the age is NOT measured here. Presents happen whether or
+            // not anything is transmitted, so measuring here reports the time to
+            // the next vsync rather than the time to the client's answer. Carry
+            // the arrival time forward and measure it when a frame really goes
+            // out, which is the number that matters.
             stamp = g_current_client_stamp;
+            g_stamp_pending = true;
+            g_stamp_pending_time = g_client_stamp_time;
             g_has_client_stamp = false;
             g_current_client_stamp = 0;
         }
 
         std::vector<uint8_t> frame_packet;
         uint32_t combined_base = g_pending_combined_base.exchange(0);
-        bool is_full = g_delta_encoder.encode_frame(g_frame_seq, g_frame_cmds, g_frame_cmd_count, g_need_keyframe.load(), combined_base, stamp, frame_packet);
-        if (is_full) {
+        {
+            int64_t since = g_sent_any ? (steady_now_ms() - std::chrono::duration_cast<std::chrono::milliseconds>(
+                g_last_send_time.time_since_epoch()).count()) : 999999;
+            g_keepalive_due = (since >= 100);
+        }
+        bool was_keepalive = g_keepalive_due;
+        EncodeResult enc = g_delta_encoder.encode_frame(g_sent_seq, g_frame_cmds, g_frame_cmd_count,
+                                                        g_need_keyframe.load(), combined_base, stamp, frame_packet);
+        if (enc == EncodeResult::Full) {
             g_need_keyframe.store(false);
         }
+        if (enc != EncodeResult::Nothing) {
+            g_last_send_time = std::chrono::steady_clock::now();
+            g_sent_any = true;
+            if (was_keepalive) g_keepalive_sent++;
+        }
 
-        if (!frame_packet.empty()) {
-            bool has_open_dc = false;
+        bool report_due = false;
+        if (enc != EncodeResult::Nothing && !frame_packet.empty()) {
+            // Input arrival -> the frame that actually answers it leaving here.
+            if (g_stamp_pending) {
+                int64_t age = steady_now_ms() - std::chrono::duration_cast<std::chrono::milliseconds>(
+                    g_stamp_pending_time.time_since_epoch()).count();
+                g_stamp_ages_ms.push_back(age);
+                g_stamp_seen++;
+                if (g_stamp_ages_ms.size() > 900) g_stamp_ages_ms.erase(g_stamp_ages_ms.begin(), g_stamp_ages_ms.begin() + 300);
+                g_stamp_pending = false;
+            }
             {
                 std::lock_guard<std::mutex> lock(g_rtc_lock);
                 for (auto& dc : g_active_dcs) {
                     if (dc && dc->isOpen()) {
-                        has_open_dc = true;
-                        // Drop frame if UDP buffer is backed up (>128KB) to eliminate bufferbloat
-                        if (dc->bufferedAmount() < 131072) {
-                            dc->send((const std::byte*)frame_packet.data(), frame_packet.size());
-                        }
+                        // No backpressure guard here: it only ever measured bytes
+                        // queued locally, which on a healthy link stays near zero,
+                        // and dropping a delta breaks the chain for every later
+                        // frame. Bulk traffic is the texture path, not this one.
+                        g_queue_at_send.push_back((int64_t)dc->bufferedAmount());
+                        if (g_queue_at_send.size() > 900) g_queue_at_send.erase(g_queue_at_send.begin(), g_queue_at_send.begin() + 300);
+                        dc->send((const std::byte*)frame_packet.data(), frame_packet.size());
                     }
                 }
+                // Sequence numbers are consumed only by frames that were actually
+                // sent, so a silent frame leaves no hole for the client to treat
+                // as packet loss.
+                g_sent_seq++;
+
+                static uint64_t last_report_seq = 0;
+                if (g_sent_seq - last_report_seq >= 25) {
+                    last_report_seq = g_sent_seq;
+                    report_due = true;
+                }
+            }
+
+            // Reported after the lock is released: never do blocking I/O while
+            // holding g_rtc_lock, which the signalling path also needs.
+            if (report_due) {
+                const DeltaEncoder& s = g_delta_encoder;
+                double e50 = 0, e95 = 0, emax = 0;
+                if (!s.enc_us.empty()) {
+                    std::vector<double> v = s.enc_us;
+                    std::sort(v.begin(), v.end());
+                    e50 = v[v.size() / 2];
+                    e95 = v[(size_t)std::min(v.size() - 1, (size_t)(v.size() * 0.95))];
+                    emax = v.back();
+                }
+                int64_t q50 = -1, q95 = -1, qmax = -1;
+                if (!g_queue_at_send.empty()) {
+                    std::vector<int64_t> q = g_queue_at_send;
+                    std::sort(q.begin(), q.end());
+                    q50 = q[q.size() / 2];
+                    q95 = q[(size_t)std::min(q.size() - 1, (size_t)(q.size() * 0.95))];
+                    qmax = q.back();
+                }
+                double s50 = -1, s95 = -1, smax = -1;
+                if (!g_stamp_ages_ms.empty()) {
+                    std::vector<int64_t> v = g_stamp_ages_ms;
+                    std::sort(v.begin(), v.end());
+                    s50 = (double)v[v.size() / 2];
+                    s95 = (double)v[(size_t)std::min(v.size() - 1, (size_t)(v.size() * 0.95))];
+                    smax = (double)v.back();
+                }
+                fprintf(stderr, "[FRAME_STATS] sent=%llu silent=%llu full=%llu delta=%llu avg_full=%lluB avg_delta=%lluB enc_calls=%llu enc_p50=%.0fus enc_p95=%.0fus enc_max=%.0fus STAMP_n=%llu STAMP_p50=%.0fms STAMP_p95=%.0fms STAMP_max=%.0fms QUEUE_p50=%lld QUEUE_p95=%lld QUEUE_max=%lld TEX_n=%llu TEX_kb=%llu KA=%llu\n",
+                        (unsigned long long)g_sent_seq,
+                        (unsigned long long)s.stat_nothing,
+                        (unsigned long long)s.stat_full,
+                        (unsigned long long)s.stat_delta,
+                        (unsigned long long)(s.stat_full ? s.stat_bytes_full / s.stat_full : 0),
+                        (unsigned long long)(s.stat_delta ? s.stat_bytes_delta / s.stat_delta : 0),
+                        (unsigned long long)s.stat_enc_calls,
+                        e50, e95, emax,
+                        (unsigned long long)g_stamp_seen, s50, s95, smax,
+                        (long long)q50, (long long)q95, (long long)qmax,
+                        (unsigned long long)g_tex_count, (unsigned long long)(g_tex_bytes / 1024),
+                        (unsigned long long)g_keepalive_sent);
+                fflush(stderr);
             }
         }
     }

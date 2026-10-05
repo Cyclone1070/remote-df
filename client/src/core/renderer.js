@@ -224,18 +224,26 @@ export class DFRenderer {
     }
 
     applyDelta(totalCmdCount, updates) {
-        if (totalCmdCount !== undefined && totalCmdCount >= 0) {
+        // A frame that carries no updates and leaves the command count alone is
+        // a no-op: scheduling a redraw for it burns a full re-upload of every
+        // sprite for nothing. Idle streams are almost entirely these.
+        let changed = false;
+
+        if (totalCmdCount !== undefined && totalCmdCount >= 0 && totalCmdCount !== this.commands.length) {
             this.commands.length = totalCmdCount;
+            changed = true;
         }
         if (updates && updates.length > 0) {
             for (let i = 0; i < updates.length; i++) {
                 const up = updates[i];
                 if (up.index < this.commands.length) {
                     this.commands[up.index] = up.cmd;
+                    changed = true;
                 }
             }
         }
-        this.dirty = true;
+
+        if (changed) this.dirty = true;
     }
 
     resize(width, height) {

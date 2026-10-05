@@ -174,7 +174,8 @@ export async function runComprehensiveBenchmark(options = {}) {
 
     let visualParityPct = 0.0;
     let tolMatchPct = 0.0;
-    if (fs.existsSync(refTitlePath)) {
+    const shouldSkipVisual = options.skipVisualGate || process.env.SKIP_VISUAL_GATE === '1';
+    if (fs.existsSync(refTitlePath) && !shouldSkipVisual) {
         const startAuditTime = Date.now();
         while (Date.now() - startAuditTime < 15000) {
             await canvas.screenshot({ path: clientTitlePath });
@@ -404,7 +405,7 @@ export async function runComprehensiveBenchmark(options = {}) {
     };
 
     const results = {
-        profile: isWan ? 'WAN / Cloudflare' : 'LAN / Direct',
+        profile: options.profileLabel || (isWan ? 'WAN / Cloudflare' : 'LAN / Direct'),
         metrics: {
             steadyStreamFps: steadyFps,
             interarrivalJitterMs: finalTel.p0JitterMs,

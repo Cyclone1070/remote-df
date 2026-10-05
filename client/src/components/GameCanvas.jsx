@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { DFRenderer } from '../core/renderer.js';
 import { DFProtocol } from '../core/protocol.js';
 import { DFInput } from '../core/input.js';
+import { FrameSequencer } from '../core/frameSequencer.js';
 
 export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange, isDebug, streamPort, onTerminate }) {
     const canvasRef = useRef(null);
@@ -25,13 +26,38 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
         let inputDc = null;
         let input = null;
         let isDestroyed = false;
-        let lastRenderedSeq = 0;
-        let waitingForKeyframe = true;
-        let hasReceivedKeyframe = false;
-        let lastKeyframeReqTime = 0;
-        let waitingForCombinedDelta = false;
-        let lastGapReqTime = 0;
-        const pendingFrames = new Map();
+
+        // Frame sequencing + loss recovery. Retries are driven by arriving
+        // frames rather than a wall clock, so the cadence follows the stream
+        // rate instead of a fixed interval. See core/frameSequencer.js.
+        const sequencer = new FrameSequencer({
+            applyFullFrame: cmds => {
+                renderer.applyFullFrame(cmds);
+                window.__dfFrameCount = (window.__dfFrameCount || 0) + 1;
+            },
+            applyDelta: (totalCmdCount, updates) => {
+                renderer.applyDelta(totalCmdCount, updates);
+                window.__dfFrameCount = (window.__dfFrameCount || 0) + 1;
+            },
+            requestBridgingDelta: lastSeq => sendInputBuffer(DFProtocol.encodeGapAck(lastSeq)),
+            requestFullFrame: () => sendInputBuffer(DFProtocol.encodeKeyframeRequest()),
+            onGapRequest: (lastSeq, frame) => {
+                if (isDebug) {
+                    console.log(`[WebRTC Recovery] Frame gap detected (seq: ${frame.seq}, lastRendered: ${lastSeq}). Requesting combined delta (opcode 0x07)...`);
+                }
+            },
+            onKeyframeRequest: () => {
+                if (isDebug) {
+                    console.log('[WebRTC Recovery] No baseline keyframe. Requesting initial keyframe (opcode 0x06)...');
+                }
+            },
+            onRecovered: () => {
+                if (isDebug) {
+                    console.log('[WebRTC Recovery] Full keyframe received! Stream recovered successfully.');
+                }
+            }
+        });
+        window.__dfSequencer = sequencer;
 
         // Rotating 1-byte debug stamp (1..255) for physical M2P latency
         let currentDebugStamp = 0;
@@ -189,105 +215,12 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
 
                 if (isDebug) {
                     window.__simulatePacketLoss = () => {
-                        console.log('[WebRTC Test] Simulating packet drop by rewinding lastRenderedSeq');
-                        lastRenderedSeq = Math.max(1, lastRenderedSeq - 10);
+                        console.log('[WebRTC Test] Simulating packet drop by rewinding the sequencer');
+                        sequencer.rewind(10);
                     };
                 }
 
-                if (frame.type === 'full') {
-                    if (isDebug && (waitingForKeyframe || waitingForCombinedDelta)) {
-                        console.log('[WebRTC Recovery] Full keyframe received! Stream recovered successfully.');
-                    }
-                    hasReceivedKeyframe = true;
-                    waitingForKeyframe = false;
-                    waitingForCombinedDelta = false;
-                    lastRenderedSeq = frame.seq;
-                    pendingFrames.clear();
-                    renderer.applyFullFrame(frame.cmds);
-                    window.__dfFrameCount = (window.__dfFrameCount || 0) + 1;
-                } else if (frame.type === 'delta') {
-                    if (!hasReceivedKeyframe) {
-                        const now = Date.now();
-                        if (!waitingForKeyframe || now - lastKeyframeReqTime > 300) {
-                            if (isDebug) {
-                                console.log('[WebRTC Recovery] No baseline keyframe. Requesting initial keyframe (opcode 0x06)...');
-                            }
-                            waitingForKeyframe = true;
-                            lastKeyframeReqTime = now;
-                            sendInputBuffer(DFProtocol.encodeKeyframeRequest());
-                        }
-                        return;
-                    }
-
-                    // Check if this delta is a combined delta bridging across our gap
-                    const isBridgeDelta = (frame.baseSeq !== undefined && frame.baseSeq <= lastRenderedSeq && frame.seq > lastRenderedSeq);
-
-                    if (isBridgeDelta) {
-                        waitingForCombinedDelta = false;
-                        waitingForKeyframe = false;
-                        lastRenderedSeq = frame.seq;
-                        renderer.applyDelta(frame.totalCmdCount, frame.updates);
-                        window.__dfFrameCount = (window.__dfFrameCount || 0) + 1;
-
-                        // Drain any subsequent buffered frames sequentially
-                        while (pendingFrames.has(lastRenderedSeq + 1)) {
-                            const next = pendingFrames.get(lastRenderedSeq + 1);
-                            pendingFrames.delete(lastRenderedSeq + 1);
-                            lastRenderedSeq = next.seq;
-                            renderer.applyDelta(next.totalCmdCount, next.updates);
-                            window.__dfFrameCount = (window.__dfFrameCount || 0) + 1;
-                        }
-                        return;
-                    }
-
-                    // Drop stale frames
-                    if (frame.seq <= lastRenderedSeq) {
-                        return;
-                    }
-
-                    // Normal sequential frame
-                    if (frame.seq === lastRenderedSeq + 1 && !waitingForCombinedDelta && !waitingForKeyframe) {
-                        lastRenderedSeq = frame.seq;
-                        renderer.applyDelta(frame.totalCmdCount, frame.updates);
-                        window.__dfFrameCount = (window.__dfFrameCount || 0) + 1;
-
-                        while (pendingFrames.has(lastRenderedSeq + 1)) {
-                            const next = pendingFrames.get(lastRenderedSeq + 1);
-                            pendingFrames.delete(lastRenderedSeq + 1);
-                            lastRenderedSeq = next.seq;
-                            renderer.applyDelta(next.totalCmdCount, next.updates);
-                            window.__dfFrameCount = (window.__dfFrameCount || 0) + 1;
-                        }
-                        return;
-                    }
-
-                    // Gap detected! E.g. frame.seq > lastRenderedSeq + 1
-                    pendingFrames.set(frame.seq, frame);
-                    if (pendingFrames.size > 30) {
-                        const oldest = Math.min(...pendingFrames.keys());
-                        pendingFrames.delete(oldest);
-                    }
-
-                    const now = Date.now();
-                    if (!waitingForCombinedDelta || now - lastGapReqTime > 80) {
-                        waitingForCombinedDelta = true;
-                        lastGapReqTime = now;
-                        if (isDebug) {
-                            console.log(`[WebRTC Recovery] Frame gap detected (seq: ${frame.seq}, lastRendered: ${lastRenderedSeq}). Requesting combined delta (opcode 0x07)...`);
-                        }
-                        sendInputBuffer(DFProtocol.encodeGapAck(lastRenderedSeq));
-                    }
-
-                    // Disaster fallback: if gap persists > 400ms without resolution, fallback to keyframe
-                    if (now - lastGapReqTime > 400 && (!waitingForKeyframe || now - lastKeyframeReqTime > 400)) {
-                        waitingForKeyframe = true;
-                        lastKeyframeReqTime = now;
-                        if (isDebug) {
-                            console.log('[WebRTC Recovery] Combined delta timeout (>400ms). Requesting fallback keyframe (opcode 0x06)...');
-                        }
-                        sendInputBuffer(DFProtocol.encodeKeyframeRequest());
-                    }
-                }
+                sequencer.onFrame(frame);
             }
         }
 

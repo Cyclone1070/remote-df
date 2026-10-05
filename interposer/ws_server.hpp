@@ -58,6 +58,14 @@ private:
     std::thread server_thread;
     std::mutex clients_lock;
     std::vector<WsClient> clients;
+    // Serializes complete WebSocket frames onto a socket. A frame write is not
+    // atomic: send_raw loops over several send() calls and retries on EAGAIN, so
+    // two threads writing the same socket can splice one message into the middle
+    // of another. The peer sees an unparseable frame and the message is simply
+    // gone -- a swallowed signalling reply is indistinguishable from a stalled
+    // connection. Writers are the render thread (frame/texture broadcast) and
+    // libdatachannel's callback thread (signalling replies).
+    std::mutex ws_write_lock;
 
     void set_nonblocking(int fd) {
         int flags = fcntl(fd, F_GETFL, 0);
@@ -408,6 +416,7 @@ public:
             }
         }
         frame.insert(frame.end(), text.begin(), text.end());
+        std::lock_guard<std::mutex> wl(ws_write_lock);
         return send_raw(fd, frame.data(), frame.size());
     }
 
@@ -431,6 +440,7 @@ public:
 
         const uint8_t* ptr = (const uint8_t*)data;
         frame.insert(frame.end(), ptr, ptr + len);
+        std::lock_guard<std::mutex> wl(ws_write_lock);
         return send_raw(fd, frame.data(), frame.size());
     }
 
