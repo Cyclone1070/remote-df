@@ -89,8 +89,58 @@ The container log contains **4,597+** occurrences of:
 [TEXTURE_DC_ERROR] Message size exceeds limit
 ```
 
-Dropped oversized texture messages are a strong candidate for the missing artwork. This is a
-lead, not a proven cause — the log line's origin in the source has not been established.
+The origin of that log line **is now established**. It is the catch block of
+`send_texture_packet_dc()` in [`interposer/df_streamer.cpp`](./interposer/df_streamer.cpp), which
+builds one `dc->send()` containing a texture's **entire** RGBA buffer and, on failure, logs the
+exception and moves on. There was no retry, no re-request path and no chunking.
+
+Because the stream channel is `maxRetransmits: 0`, a texture that fails was **permanently** lost
+for the life of that connection, and nothing in the client could ask for it again. The renderer
+then drew the frame anyway, silently skipping absent sprites — which is the missing artwork and
+the black tiles.
+
+Three changes close the loss path:
+
+1. **The frame channel is now ordered** (`ordered: true`, still `maxRetransmits: 0`). Frames arrive
+   in send order and a loss is repaired by bridging rather than by a retransmit that would
+   head-of-line block every later frame.
+2. **Assets gate the frame.** The renderer collects every texture the command buffer references
+   and refuses to draw while any are absent, holding the last good frame instead of displaying one
+   with holes in it.
+3. **Opcode `0x08` asset bridge.** The client reports the frame it is stuck on together with the
+   texture ids it *already holds*, and the host responds with **only** the missing ones
+   ([`df_streamer.cpp`](./interposer/df_streamer.cpp) `resend_missing_textures`, resolved against
+   the encoder's history ring). Requests are keyed on the missing set with a 1.5 s backoff, so an
+   absent asset is not re-requested on every arriving frame.
+
+### RESOLVED — 0 px parity with native
+
+The title screen now compares **0 px different against all six native frames**, background
+artwork included. The arena measures **0 px across nine steps** with a **0.000%** soak worst case,
+down from 0.526%.
+
+Two independent causes had to be closed, and neither was the one originally suspected.
+
+**1. The size cap.** DataChannels refuse any message above the peer's advertised
+`a=max-message-size`, which Chrome sets to **262,144**. A 1280×720 RGBA surface is ~3.6 MB, so
+those textures were refused at the API boundary every time — `Message size exceeds limit`, logged
+and forgotten, with no retry and no way for the client to ask again. Textures are now **chunked to
+128 KB** and reassembled client-side (`ingestTextureChunk`). A full-screen background becomes 29
+chunks; a small texture still costs exactly one message. Measured after the change: 2,182 chunks /
+42 MB delivered with **zero** `TEXTURE_DC_ERROR`.
+
+**2. Recovery was a no-op.** The first bridge asked *"resend what frame N needs"* and the host
+diffed that against **its own copy of frame N**. The client's accumulated command buffer and that
+single frame disagree, so the diff came out empty and the host replied *"Client already holds every
+asset for frame N"* — **zero resends in the entire log**. A lost chunk was therefore permanent and
+the gate waited on it forever. Opcode `0x08` now carries the **missing ids directly**, so the host
+resends exactly those with no frame to agree about. Observed working: `Frame 8 asked for 2
+asset(s); sent 2, 0 not held here`.
+
+The gate itself was nearly a third defect. On first deploy it held the very first frame forever and
+the screen came up **blank white**, because `syncAssets` only ran when a frame or texture *arrived*
+and an idle DF sends nothing. Fixed with a per-asset retry budget; the cap is deliberately **not**
+raised via `setMaxMessageSize`, chunking handles it.
 
 ---
 

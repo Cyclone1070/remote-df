@@ -271,7 +271,13 @@ async function captureStep(page, canvas, step, index, label) {
  * ------------------------------------------------------------------ */
 async function makeHelpers(page, canvas) {
   const box = await canvas.boundingBox();
-  const at = (x, y) => [box.x + x, box.y + y];
+  // Accepts either click([x, y]) or click(x, y): step definitions pass the
+// coordinate tuples as a single array, and concatenating an array onto a
+// number silently produces a string, which Playwright then rejects.
+const at = (...args) => {
+    const [x, y] = Array.isArray(args[0]) ? args[0] : args;
+    return [box.x + x, box.y + y];
+};
   return {
     wait: (ms) => page.waitForTimeout(ms),
     press: async (key) => {

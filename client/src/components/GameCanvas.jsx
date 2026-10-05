@@ -33,10 +33,12 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
         const sequencer = new FrameSequencer({
             applyFullFrame: cmds => {
                 renderer.applyFullFrame(cmds);
+                syncAssets();
                 window.__dfFrameCount = (window.__dfFrameCount || 0) + 1;
             },
             applyDelta: (totalCmdCount, updates) => {
                 renderer.applyDelta(totalCmdCount, updates);
+                syncAssets();
                 window.__dfFrameCount = (window.__dfFrameCount || 0) + 1;
             },
             requestBridgingDelta: lastSeq => sendInputBuffer(DFProtocol.encodeGapAck(lastSeq)),
@@ -58,6 +60,98 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
             }
         });
         window.__dfSequencer = sequencer;
+
+        // Asset gating.
+        //
+        // A frame is not displayable until every texture it references has
+        // arrived. When one is missing we hold the last good frame on screen
+        // and tell the host which assets we already hold, so it resends only
+        // what is genuinely missing. The draw loops used to skip absent
+        // textures silently, which is how one lost asset became black tiles
+        // and a missing wordmark instead of a visibly held frame.
+        let assetBridgeKey = '';
+        let assetBridgeAt = 0;
+        // Re-asking for the same absent assets on every arriving frame would be
+        // pure amplification: a texture that did not arrive either gets dropped
+        // again or was never sendable in the first place.
+        const ASSET_BRIDGE_BACKOFF_MS = 1500;
+        const ASSET_BRIDGE_MAX_TRIES = 3;
+
+        // Some textures can never arrive: one whose RGBA exceeds the
+        // DataChannel message size limit is rejected every time it is offered.
+        // Holding the frame on those forever bricks the display, so an asset
+        // that has survived this many attempts is marked unfetchable and stops
+        // gating. Until chunking lands, that degrades to the old draw-with-holes
+        // behaviour for those ids only - strictly better than never rendering.
+        const assetTries = new Map();
+        const unfetchable = new Set();
+        let assetGeneration = -1;
+
+        function syncAssets() {
+            // A reclaimed atlas means the textures we gave up on are no longer
+            // hopeless - there is simply an empty atlas to put them in now.
+            // Forget the earlier verdict, or those ids would stay black forever.
+            if (renderer.atlasGeneration !== assetGeneration) {
+                if (assetGeneration !== -1) {
+                    assetTries.clear();
+                    unfetchable.clear();
+                    assetBridgeKey = '';
+                    assetBridgeAt = 0;
+                }
+                assetGeneration = renderer.atlasGeneration;
+            }
+
+            const allMissing = renderer.missingTextureIds();
+            const missing = new Set();
+            for (const id of allMissing) {
+                if (!unfetchable.has(id)) missing.add(id);
+            }
+
+            renderer.assetsReady = missing.size === 0;
+            window.__dfAssetsMissing = allMissing.size;
+            window.__dfAssetsUnfetchable = unfetchable.size;
+            if (missing.size === 0) {
+                assetBridgeKey = '';
+                if (isDebug && assetBridgeAt !== 0) {
+                    assetBridgeAt = 0;
+                    console.log('[Assets] Frame displayable - resuming');
+                }
+                return;
+            }
+
+            const key = Array.from(missing).sort((a, b) => a - b).join(',');
+            const now = performance.now();
+            if (key === assetBridgeKey && now - assetBridgeAt < ASSET_BRIDGE_BACKOFF_MS) return;
+            assetBridgeKey = key;
+            assetBridgeAt = now;
+
+            const exhausted = [];
+            for (const id of missing) {
+                const tries = (assetTries.get(id) || 0) + 1;
+                assetTries.set(id, tries);
+                if (tries >= ASSET_BRIDGE_MAX_TRIES) {
+                    unfetchable.add(id);
+                    exhausted.push(id);
+                }
+            }
+            if (exhausted.length > 0) {
+                console.warn(
+                    `[Assets] Giving up on ${exhausted.length} texture(s) after ${ASSET_BRIDGE_MAX_TRIES} attempts: ` +
+                    `${exhausted.join(',')}. These are unsendable - display continues without them.`
+                );
+                // Re-evaluate immediately: this pass may have just unfrozen the frame.
+                syncAssets();
+                return;
+            }
+
+            const seq = sequencer.lastSeq;
+            // Send the missing ids themselves, not the held set: the host then
+            // resends exactly these, with no frame lookup that could disagree.
+            sendInputBuffer(DFProtocol.encodeAssetBridgeRequest(seq, missing));
+            if (isDebug) {
+                console.log(`[Assets] Holding frame ${seq}: ${missing.size} texture(s) missing [${key}], requesting bridge (opcode 0x08)`);
+            }
+        }
 
         // Rotating 1-byte debug stamp (1..255) for physical M2P latency
         let currentDebugStamp = 0;
@@ -196,13 +290,69 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
             }
         }
 
+        // Incomplete textures, keyed by texId. A texture is only handed to the
+// renderer once every chunk has arrived; until then the frame that references
+// it stays gated.
+const pendingTextures = new Map();
+
+function ingestTextureChunk(chunk) {
+            // Fast path: fits in one message, no assembly and no extra copy.
+            if (chunk.chunkCount === 1) {
+                const rgba = new Uint8ClampedArray(
+                    chunk.data.buffer, chunk.data.byteOffset, chunk.data.byteLength
+                );
+                renderer.setTexture(chunk.texId, { texId: chunk.texId, w: chunk.w, h: chunk.h, rgba });
+                return;
+            }
+
+            let pending = pendingTextures.get(chunk.texId);
+            if (!pending) {
+                pending = {
+                    w: chunk.w, h: chunk.h,
+                    totalLen: chunk.totalLen,
+                    chunkCount: chunk.chunkCount,
+                    chunks: new Map()
+                };
+                pendingTextures.set(chunk.texId, pending);
+            }
+
+            if (!pending.chunks.has(chunk.chunkIndex)) {
+                // Copy out of the receive buffer so we are not pinning it.
+                pending.chunks.set(chunk.chunkIndex, chunk.data.slice());
+            }
+            if (pending.chunks.size < pending.chunkCount) return;
+
+            const out = new Uint8ClampedArray(pending.totalLen);
+            let off = 0;
+            for (let i = 0; i < pending.chunkCount; i++) {
+                const c = pending.chunks.get(i);
+                if (!c) { pendingTextures.delete(chunk.texId); return; }
+                out.set(c, off);
+                off += c.length;
+            }
+            if (off !== pending.totalLen) {
+                // Sizes disagree; refuse rather than upload a corrupt texture.
+                console.warn(`[Assets] Texture ${chunk.texId} assembled ${off} of ${pending.totalLen} bytes - discarding`);
+                pendingTextures.delete(chunk.texId);
+                return;
+            }
+
+            pendingTextures.delete(chunk.texId);
+            renderer.setTexture(chunk.texId, {
+                texId: chunk.texId, w: pending.w, h: pending.h, rgba: out
+            });
+        }
+
         function handleFrameBinary(buffer) {
             if (isDestroyed) return;
             if (isDebug) bytesReceived += buffer.byteLength;
 
-            const tex = DFProtocol.decodeTexture(buffer);
-            if (tex) {
-                renderer.setTexture(tex.texId, tex);
+            const chunk = DFProtocol.decodeTexture(buffer);
+            if (chunk) {
+                ingestTextureChunk(chunk);
+                // A held frame may now be displayable, or may still be waiting
+                // on others; re-check rather than assuming this one unblocked it.
+                syncAssets();
                 return;
             }
 
@@ -264,7 +414,12 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
                 // Create stream DataChannel (UDP deltas) and reliable input DataChannel
                 console.log('[WebRTC] Creating df-stream and df-input DataChannels...');
                 dc = pc.createDataChannel('df-stream', {
-                    ordered: false,
+                    // Ordered, but no SCTP retransmission. Frames arrive in the
+                    // order they were sent, and one that is still lost is
+                    // repaired by the bridging protocol rather than by a
+                    // retransmit, which would stall and head-of-line block
+                    // every later frame queued behind it.
+                    ordered: true,
                     maxRetransmits: 0
                 });
                 dc.binaryType = 'arraybuffer';
@@ -282,7 +437,7 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
                 };
 
                 dc.onopen = () => {
-                    console.log('[WebRTC] True UDP DataChannel OPENED!');
+                    console.log('[WebRTC] Ordered stream DataChannel (no retransmit) + reliable input DataChannel OPENED!');
                     setIsWebRTCReady(true);
                     if (onTransportChange) onTransportChange('UDP (WebRTC)');
                     handleResize(true);

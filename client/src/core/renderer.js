@@ -6,6 +6,11 @@ export class DFRenderer {
         this.dirty = true;
         this.textures = new Map(); // id -> { x, y, w, h, u0, v0, u1, v1, rawData, offscreen }
 
+        // A frame is only displayable once every texture it references has
+        // arrived. While this is false the last good frame stays on screen
+        // instead of being replaced by one with holes in it.
+        this.assetsReady = true;
+
         this.gl = canvas.getContext('webgl2', {
             alpha: false,
             antialias: false,
@@ -193,7 +198,19 @@ export class DFRenderer {
         }
 
         if (this.atlasY + h + 1 >= this.atlasHeight) {
-            console.error('[DFRenderer] Texture atlas overflow!');
+            // The atlas is append-only, so every distinct texture size DF ever
+            // emits consumes a permanent slice of it. Zooming makes DF emit
+            // textures at each new scale, and after enough zoom cycles the atlas
+            // is full - at which point nothing can ever be stored again and
+            // resending cannot help, because there is nowhere to put the result.
+            // Reclaim and retry once on the fresh atlas; the asset bridge then
+            // refetches whatever the current frame still needs.
+            if (!this._reclaimedThisBatch) {
+                this._reclaimedThisBatch = true;
+                this.resetAtlas();
+                return this.setTexture(id, imageOrData);
+            }
+            console.error(`[DFRenderer] Texture atlas full and reclaimed; texture ${id} (${w}x${h}) will not fit even on an empty atlas`);
             return;
         }
 
@@ -218,12 +235,29 @@ export class DFRenderer {
         this.dirty = true;
     }
 
+    resetAtlas() {
+        const gl = this.gl;
+        if (gl) {
+            gl.bindTexture(gl.TEXTURE_2D, this.atlasTexture);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, this.atlasWidth, this.atlasHeight,
+                0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+        }
+        this.textures.clear();
+        this.atlasX = 1;
+        this.atlasY = 1;
+        this.atlasRowHeight = 0;
+        this.atlasGeneration = (this.atlasGeneration || 0) + 1;
+        this.dirty = true;
+    }
+
     applyFullFrame(cmds) {
+        this._reclaimedThisBatch = false;
         this.commands = cmds;
         this.dirty = true;
     }
 
     applyDelta(totalCmdCount, updates) {
+        this._reclaimedThisBatch = false;
         // A frame that carries no updates and leaves the command count alone is
         // a no-op: scheduling a redraw for it burns a full re-upload of every
         // sprite for nothing. Idle streams are almost entirely these.
@@ -246,6 +280,32 @@ export class DFRenderer {
         if (changed) this.dirty = true;
     }
 
+    hasTexture(id) {
+        return this.textures.has(id);
+    }
+
+    // Distinct textures the current command buffer draws from.
+    collectTextureIds() {
+        const ids = new Set();
+        const cmds = this.commands;
+        for (let i = 0; i < cmds.length; i++) {
+            const c = cmds[i];
+            if (c && c.texId) ids.add(c.texId);
+        }
+        return ids;
+    }
+
+    // Textures this frame needs that are not here yet. The draw loops used to
+    // skip these silently, which is what turned one lost asset into black
+    // tiles and a missing wordmark rather than a visibly held frame.
+    missingTextureIds() {
+        const missing = new Set();
+        for (const id of this.collectTextureIds()) {
+            if (!this.textures.has(id)) missing.add(id);
+        }
+        return missing;
+    }
+
     resize(width, height) {
         this.canvas.width = width;
         this.canvas.height = height;
@@ -256,6 +316,9 @@ export class DFRenderer {
     }
 
     render() {
+        // Hold the last good frame until its assets arrive. Drawing now would
+        // put a frame with holes in it on screen.
+        if (!this.assetsReady) return false;
         if (!this.dirty) return false;
 
         if (this.gl) {

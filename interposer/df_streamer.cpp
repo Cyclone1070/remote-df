@@ -53,7 +53,9 @@ struct TextureHeader {
     uint16_t tex_id;
     uint16_t w;
     uint16_t h;
-    uint32_t payload_len;  // w * h * 4
+    uint32_t payload_len;  // total RGBA bytes for the whole texture, across all chunks
+    uint16_t chunk_index;  // 0-based index of this chunk
+    uint16_t chunk_count;  // total chunks this texture is split into (1 = unchunked)
 };
 
 struct InputEvent {
@@ -769,6 +771,9 @@ extern "C" int SDL_PollEvent(void* event) {
 }
 
 // Handle client input directly in memory
+// Defined below, next to the texture send path it depends on.
+static void resend_missing_textures(uint32_t seq, const std::vector<uint16_t>& requested);
+
 void handle_client_input_event(const uint8_t* data, size_t len) {
     if (len >= 5 && data[0] == 7) { // GAP_ACK / COMBINED_DELTA_REQ
         uint32_t acked_seq = 0;
@@ -776,6 +781,28 @@ void handle_client_input_event(const uint8_t* data, size_t len) {
         g_pending_combined_base.store(acked_seq);
         fprintf(stderr, "[COMBINED_DELTA] Received GAP_ACK for seq %u from client\n", acked_seq);
         fflush(stderr);
+        return;
+    }
+    if (len >= 7 && data[0] == 8) { // ASSET_BRIDGE_REQ
+        uint32_t seq = 0;
+        memcpy(&seq, data + 1, sizeof(uint32_t));
+        uint16_t want_count = 0;
+        memcpy(&want_count, data + 5, sizeof(uint16_t));
+
+        // Texture ids are u16 on the wire (DrawCommand::tex_id), so parse them
+        // as such rather than as bytes.
+        std::vector<uint16_t> wanted;
+        if (want_count > 0 &&
+            len >= static_cast<size_t>(7) + static_cast<size_t>(want_count) * sizeof(uint16_t)) {
+            wanted.resize(want_count);
+            memcpy(wanted.data(), data + 7, static_cast<size_t>(want_count) * sizeof(uint16_t));
+        } else {
+            want_count = 0;
+        }
+
+        fprintf(stderr, "[ASSET_BRIDGE] Request for seq %u, client wants %u asset(s)\n", seq, want_count);
+        fflush(stderr);
+        resend_missing_textures(seq, wanted);
         return;
     }
     if (len < sizeof(InputEvent)) return;
@@ -979,28 +1006,99 @@ static std::mutex g_rtc_lock;
 static std::unordered_map<int, ClientRtcSession> g_rtc_sessions;
 static std::vector<std::shared_ptr<rtc::DataChannel>> g_active_dcs;
 
-static void send_texture_packet_dc(std::shared_ptr<rtc::DataChannel> dc, const CachedTexture& ct) {
+// DataChannel messages are refused outright above the peer's advertised
+// a=max-message-size (Chrome: 262144). A 1280x720 RGBA surface is ~3.6 MB, so
+// anything larger than this is split across several messages and reassembled
+// by the client. The budget leaves generous headroom under the advertised cap.
+#define TEXTURE_CHUNK_BYTES (128u * 1024u)
+
+// Sends one chunk. chunk_index/chunk_count are carried in the header; the
+// client uses chunk_count == 1 for the ordinary single-message case so small
+// textures keep costing exactly what they cost before.
+static void send_texture_chunk_dc(std::shared_ptr<rtc::DataChannel> dc, const CachedTexture& ct,
+                                  uint32_t chunk_index, uint32_t chunk_count) {
     if (!dc || !dc->isOpen() || ct.rgba.empty()) return;
+
+    const size_t total = ct.rgba.size();
+    const size_t offset = (size_t)chunk_index * TEXTURE_CHUNK_BYTES;
+    if (offset >= total) return;
+    size_t len = std::min((size_t)TEXTURE_CHUNK_BYTES, total - offset);
+
     TextureHeader hdr;
     hdr.magic[0] = 'D';
     hdr.magic[1] = 'T';
     hdr.tex_id = ct.id;
     hdr.w = ct.w;
     hdr.h = ct.h;
-    hdr.payload_len = (uint32_t)ct.rgba.size();
+    hdr.payload_len = (uint32_t)total;
+    hdr.chunk_index = (uint16_t)chunk_index;
+    hdr.chunk_count = (uint16_t)chunk_count;
 
-    std::vector<uint8_t> packet(sizeof(hdr) + ct.rgba.size());
+    std::vector<uint8_t> packet(sizeof(hdr) + len);
     memcpy(packet.data(), &hdr, sizeof(hdr));
-    memcpy(packet.data() + sizeof(hdr), ct.rgba.data(), ct.rgba.size());
+    memcpy(packet.data() + sizeof(hdr), ct.rgba.data() + offset, len);
 
     g_tex_count++;
     g_tex_bytes += packet.size();
     try {
         dc->send((const std::byte*)packet.data(), packet.size());
     } catch (const std::exception& e) {
-        fprintf(stderr, "[TEXTURE_DC_ERROR] %s\n", e.what());
+        // Oversized is the failure this chunking exists to prevent; if it still
+        // fires, say so loudly rather than losing the asset silently.
+        fprintf(stderr, "[TEXTURE_DC_ERROR] %s (tex %u chunk %u/%u, %zu bytes)\n",
+                e.what(), ct.id, chunk_index, chunk_count, len);
         fflush(stderr);
     }
+}
+
+static uint32_t texture_chunk_count(const CachedTexture& ct) {
+    return (uint32_t)((ct.rgba.size() + TEXTURE_CHUNK_BYTES - 1) / TEXTURE_CHUNK_BYTES);
+}
+
+// Sends every chunk of a texture.
+static void send_texture_all_chunks_dc(std::shared_ptr<rtc::DataChannel> dc, const CachedTexture& ct) {
+    uint32_t n = texture_chunk_count(ct);
+    for (uint32_t i = 0; i < n; i++) send_texture_chunk_dc(dc, ct, i, n);
+}
+
+// Resends the textures the client says it is missing.
+//
+// The client names the ids directly. An earlier version instead asked "resend
+// what frame N needs" and resolved that against this side's copy of frame N.
+// The client's accumulated command buffer and that single frame disagree, so
+// the diff came out empty and the client was told it already held everything -
+// leaving the lost texture permanently incomplete and the frame held forever.
+// Naming the missing ids removes the need to agree about frames at all.
+static void resend_missing_textures(uint32_t seq, const std::vector<uint16_t>& requested) {
+    if (requested.empty()) return;
+
+    std::vector<uint16_t> wanted;
+    for (uint16_t id : requested) {
+        if (id == 0) continue;
+        if (std::find(wanted.begin(), wanted.end(), id) != wanted.end()) continue;
+        wanted.push_back(id);
+    }
+
+    size_t sent = 0;
+    size_t unknown = 0;
+    {
+        std::lock_guard<std::mutex> rlock(g_rtc_lock);
+        for (auto& dc : g_active_dcs) {
+            if (!dc || !dc->isOpen()) continue;
+            std::lock_guard<std::mutex> tlock(g_tex_lock);
+            for (uint16_t id : wanted) {
+                if (id > g_texture_count) { unknown++; continue; }
+                CachedTexture& ct = g_cached_textures[id - 1];
+                if (ct.rgba.empty()) { unknown++; continue; }
+                send_texture_all_chunks_dc(dc, ct);
+                sent++;
+            }
+        }
+    }
+
+    fprintf(stderr, "[ASSET_BRIDGE] Frame %u asked for %zu asset(s); sent %zu, %zu not held here\n",
+            seq, wanted.size(), sent, unknown);
+    fflush(stderr);
 }
 
 static std::string extract_json_str(const std::string& json, const std::string& key) {
@@ -1141,7 +1239,7 @@ void handle_client_text_message(int fd, const std::string& msg) {
                             std::lock_guard<std::mutex> lock(g_tex_lock);
                             for (uint16_t i = 0; i < g_texture_count; i++) {
                                 if (!g_cached_textures[i].rgba.empty()) {
-                                    send_texture_packet_dc(dc, g_cached_textures[i]);
+                                    send_texture_all_chunks_dc(dc, g_cached_textures[i]);
                                 }
                             }
                         }
@@ -1297,7 +1395,7 @@ void* SDL_CreateTextureFromSurface(void* renderer, void* surface) {
             std::lock_guard<std::mutex> lock(g_rtc_lock);
             for (auto& dc : g_active_dcs) {
                 if (dc && dc->isOpen()) {
-                    send_texture_packet_dc(dc, ct);
+                    send_texture_all_chunks_dc(dc, ct);
                 }
             }
         }
