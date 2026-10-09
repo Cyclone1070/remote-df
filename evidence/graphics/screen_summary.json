@@ -1,0 +1,22 @@
+{
+ "A_title": {
+  "draws": 2258,
+  "distinctSprites": 89,
+  "spritesShown": 89
+ },
+ "B_arena_menu": {
+  "draws": 19892,
+  "distinctSprites": 74,
+  "spritesShown": 74
+ },
+ "C_arena_map": {
+  "draws": 4646,
+  "distinctSprites": 401,
+  "spritesShown": 401
+ },
+ "D_arena_scrolled": {
+  "draws": 4658,
+  "distinctSprites": 403,
+  "spritesShown": 403
+ }
+}
