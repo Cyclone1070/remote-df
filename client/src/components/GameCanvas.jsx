@@ -86,6 +86,9 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
         const assetTries = new Map();
         const unfetchable = new Set();
         let assetGeneration = -1;
+        // Set whenever a picture lands. Used to tell "this one is unsendable"
+        // apart from "the stream is still working through a backlog".
+        let pictureArrivedSinceRequest = false;
 
         function syncAssets() {
             // A reclaimed atlas means the textures we gave up on are no longer
@@ -125,6 +128,18 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
             assetBridgeKey = key;
             assetBridgeAt = now;
 
+            // A picture arriving proves the pipeline works, so nothing should be
+            // written off while it is still delivering. The three tries were
+            // counted against a fixed clock, so a client catching up on a few
+            // hundred pictures exhausted them purely because the stream was
+            // slow, then left permanent holes in the display. Only a picture
+            // that stops making progress while nothing else arrives is genuinely
+            // unsendable.
+            if (pictureArrivedSinceRequest) {
+                assetTries.clear();
+                pictureArrivedSinceRequest = false;
+            }
+
             const exhausted = [];
             for (const id of missing) {
                 const tries = (assetTries.get(id) || 0) + 1;
@@ -135,6 +150,14 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
                 }
             }
             if (exhausted.length > 0) {
+                // Diagnostic: how far each abandoned picture actually got. Tells
+                // "no chunks ever arrived" apart from "it was arriving and then
+                // stalled", which point at completely different causes.
+                const progress = exhausted.map((id) => {
+                    const p = pendingTextures.get(id);
+                    return `${id}:${p ? p.chunks.size + '/' + p.chunkCount : 'none'}`;
+                }).join(' ');
+                console.warn(`[Assets] progress at give-up: ${progress}`);
                 console.warn(
                     `[Assets] Giving up on ${exhausted.length} texture(s) after ${ASSET_BRIDGE_MAX_TRIES} attempts: ` +
                     `${exhausted.join(',')}. These are unsendable - display continues without them.`
@@ -296,12 +319,21 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
 const pendingTextures = new Map();
 
 function ingestTextureChunk(chunk) {
+            // Any chunk arriving proves the picture pipeline is working, so it
+            // counts as progress. This used to be set only when a picture
+            // finished assembling, which meant a large picture - the 8 MB title
+            // backdrop is 64 chunks - could be arriving steadily, chunk by
+            // chunk, while still being written off as unsendable, because none
+            // of the pictures completing in that window happened to be this one.
+            // Measured at give-up: 23 of its 64 chunks had already arrived.
+            pictureArrivedSinceRequest = true;
             // Fast path: fits in one message, no assembly and no extra copy.
             if (chunk.chunkCount === 1) {
                 const rgba = new Uint8ClampedArray(
                     chunk.data.buffer, chunk.data.byteOffset, chunk.data.byteLength
                 );
                 renderer.setTexture(chunk.texId, { texId: chunk.texId, w: chunk.w, h: chunk.h, rgba });
+                pictureArrivedSinceRequest = true;
                 return;
             }
 
@@ -341,6 +373,7 @@ function ingestTextureChunk(chunk) {
             renderer.setTexture(chunk.texId, {
                 texId: chunk.texId, w: pending.w, h: pending.h, rgba: out
             });
+            pictureArrivedSinceRequest = true;
         }
 
         function handleFrameBinary(buffer) {

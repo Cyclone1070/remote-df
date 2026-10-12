@@ -27,11 +27,15 @@ cd "$HERE"
 
 log() { printf '\n== %s\n' "$*"; }
 
+# The scratch dir is assumed by every step below but nothing created it, so a
+# fresh host failed at the first copy with a confusing tar "Write error".
+ssh "$HOST" "mkdir -p $REMOTE_SRC"
+
 # The build runs inside a container image because libdatachannel's headers are not
 # installed on the host or in the runtime container.
 build_interposer() {
   log "build interposer"
-  for f in interposer/df_streamer.cpp interposer/ws_server.hpp interposer/sha1_b64.hpp; do
+  for f in interposer/df_streamer.cpp interposer/ws_server.hpp interposer/sha1_b64.hpp interposer/texture_queue.hpp; do
     cat "$f" | ssh "$HOST" "cat > $REMOTE_SRC/$(basename "$f")"
   done
   ssh "$HOST" "podman run --rm -v $REMOTE_SRC:/src:Z -w /src $BUILD_IMAGE sh -c '

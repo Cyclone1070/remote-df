@@ -152,6 +152,7 @@ describe('Atlas reclaim', () => {
     const mk = () => {
         const r = Object.create(DFRenderer.prototype);
         r.textures = new Map();
+        r.fingerprints = new Map();
         r.atlasWidth = 4096; r.atlasHeight = 4096;
         r.atlasX = 1; r.atlasY = 1; r.atlasRowHeight = 0;
         r.atlasGeneration = 0; r.dirty = false;

@@ -21,9 +21,15 @@
 #include <rtc/rtc.hpp>
 
 #include "ws_server.hpp"
+#include "texture_queue.hpp"
 
 #define MAX_DRAW_COMMANDS 32768
-#define MAX_TEXTURES 4096
+// The whole u16 id space, so an id is never handed to a second picture in any
+// realistic session. Each id costs a pointer plus a small struct, and the pixel
+// data behind it is only allocated for pictures the game actually made, so
+// covering the full range is cheap: the old 4096 limit was what forced ids to be
+// recycled, which is the one case the client cannot detect.
+#define MAX_TEXTURES 65535
 
 #pragma pack(push, 1)
 struct SDL_Rect {
@@ -186,6 +192,7 @@ static void* (*real_SDL_CreateTextureFromSurface)(void*, void*) = nullptr;
 static uint32_t (*real_SDL_GetMouseState)(int*, int*) = nullptr;
 static void (*real_SDL_DestroyTexture)(void*) = nullptr;
 static int (*real_SDL_RenderReadPixels)(void*, const SDL_Rect*, uint32_t, void*, int) = nullptr;
+static int (*real_SDL_GetRendererOutputSize)(void*, int*, int*) = nullptr;
 static void* (*real_SDL_ConvertSurfaceFormat)(void*, uint32_t, uint32_t) = nullptr;
 static void (*real_SDL_FreeSurface)(void*) = nullptr;
 static void* g_gps_ptr = nullptr;
@@ -475,6 +482,7 @@ static void resolve_symbols() {
     if (!real_SDL_GetMouseState) real_SDL_GetMouseState = (uint32_t(*)(int*,int*))dlsym(RTLD_NEXT, "SDL_GetMouseState");
     if (!real_SDL_DestroyTexture) real_SDL_DestroyTexture = (void(*)(void*))dlsym(RTLD_NEXT, "SDL_DestroyTexture");
     if (!real_SDL_RenderReadPixels) real_SDL_RenderReadPixels = (int(*)(void*,const SDL_Rect*,uint32_t,void*,int))dlsym(RTLD_NEXT, "SDL_RenderReadPixels");
+    if (!real_SDL_GetRendererOutputSize) real_SDL_GetRendererOutputSize = (int(*)(void*,int*,int*))dlsym(RTLD_NEXT, "SDL_GetRendererOutputSize");
     if (!real_SDL_ConvertSurfaceFormat) real_SDL_ConvertSurfaceFormat = (void*(*)(void*,uint32_t,uint32_t))dlsym(RTLD_NEXT, "SDL_ConvertSurfaceFormat");
     if (!real_SDL_FreeSurface) real_SDL_FreeSurface = (void(*)(void*))dlsym(RTLD_NEXT, "SDL_FreeSurface");
     if (!g_gps_ptr) g_gps_ptr = dlsym(RTLD_DEFAULT, "gps");
@@ -617,6 +625,21 @@ static bool g_stamp_pending = false;
 // and the network took the time" -- different root causes, different fixes.
 static std::vector<int64_t> g_queue_at_send;
 static uint64_t g_tex_count = 0;
+// Ids handed to a second picture, which only happens if the whole id space is
+// exhausted. Must stay 0: any other value means a client can be shown a stale
+// picture for that id.
+static uint64_t g_tex_recycled = 0;
+// Draws of textures we never saw created, and draws skipped because we hold no
+// pixels for them. Either being non-zero means a sprite the game drew is not in
+// the stream, which shows up as a correct-looking frame with something missing.
+static uint64_t g_draw_unknown = 0;
+static uint64_t g_draw_nopixels = 0;
+// Frames the backpressure guard refused to send. Texture chunks have no such
+// guard, so when a zoom makes the game re-rasterise its whole sprite set the
+// send queue fills with pictures and frames are dropped behind them. That is a
+// freeze the client cannot report, because it never receives the frame. Counting
+// it here is the only place it is visible.
+static uint64_t g_frames_skipped = 0;
 static uint64_t g_tex_bytes = 0;
 // Cold-path keepalive. Suppressing silent frames cut traffic to ~1-3 packets/s,
 // and a packet sent onto an idle path pays a delay penalty (measured: transport
@@ -974,22 +997,45 @@ void sync_client_textures(int fd) {
     force_full_display();
 }
 
-static uint16_t get_texture_id(void* texture) {
+// Looks up the id a texture was already given. Returns 0 if we never saw it
+// created. Draw-time only: it must never allocate, or a texture the game made
+// through a path we do not hook would silently adopt an unrelated id.
+static uint16_t lookup_texture_id(void* texture) {
     if (!texture) return 0;
     std::lock_guard<std::mutex> lock(g_tex_lock);
     for (uint16_t i = 0; i < g_texture_count; i++) {
         if (g_textures[i] == texture) return i + 1;
     }
-    // Monotonically allocate new IDs so destroyed texture slots are never recycled across frame transitions
+    return 0;
+}
+
+// Gives a newly created texture an id of its own. Always allocates.
+//
+// This used to search first and match on the raw pointer. That is unsound: the
+// game frees a texture's memory and the allocator hands the same address
+// straight to the next texture. Zoom makes it certain rather than unlikely,
+// because it destroys and recreates the entire sprite set in one burst. The new
+// picture then inherited the old picture's id, and since the client caches
+// pictures by id it drew the old sprite wherever the new one belonged - and the
+// two stayed fused for the rest of the session, because nothing ever told the
+// client the id had changed hands. That is the corruption: stable, whole-sprite,
+// shows up after a few zooms, and invisible to the client's missing-picture
+// check, which sees the id present and assumes the picture is right.
+static uint16_t alloc_texture_id(void* texture) {
+    if (!texture) return 0;
+    std::lock_guard<std::mutex> lock(g_tex_lock);
     if (g_texture_count < MAX_TEXTURES) {
         uint16_t id = ++g_texture_count;
         g_textures[id - 1] = texture;
         return id;
     }
-    // Fallback: recycle null slots only if MAX_TEXTURES is completely saturated
+    // Only reachable once the whole id space is used up. Counted, because an id
+    // handed to a second picture is the one case where the client can still be
+    // shown a stale picture.
     for (uint16_t i = 0; i < MAX_TEXTURES; i++) {
         if (g_textures[i] == nullptr) {
             g_textures[i] = texture;
+            g_tex_recycled++;
             return i + 1;
         }
     }
@@ -1011,6 +1057,57 @@ static std::vector<std::shared_ptr<rtc::DataChannel>> g_active_dcs;
 // anything larger than this is split across several messages and reassembled
 // by the client. The budget leaves generous headroom under the advertised cap.
 #define TEXTURE_CHUNK_BYTES (128u * 1024u)
+
+// How many bytes of picture the send queue may hold before pictures start
+// waiting. Frames are exempt: a delta frame is ~114 B and a full frame ~4 KB,
+// so they fit in the noise beside this budget, whereas one 1920x1080 picture is
+// 8,294,400 B and can bury the queue on its own.
+//
+// This replaces the old arrangement, where pictures were sent unconditionally
+// and the FRAME path refused to send whenever the queue passed 131,072 B. That
+// threshold was smaller than a single chunk (131,088 B), so one picture was
+// enough to stop frames going out; measured on the host it dropped 1,224 frames
+// in a session with the queue reaching 16.3 MB. Dropping a frame is not a
+// saving, it is the freeze the client reports, because the frame is what the
+// user is looking at and the picture is not.
+#define TEXTURE_QUEUE_BUDGET (512u * 1024u)
+
+// Pictures that could not be sent yet, oldest first, each remembering the first
+// chunk it still owes so an interrupted picture resumes instead of restarting.
+static TextureQueue g_texture_queue(TEXTURE_QUEUE_BUDGET);
+// The queue is touched from two threads: pictures are queued from the RTC
+// thread (an explicit request) and drained from the render thread (a present or
+// a draw call), so it needs its own lock.
+static std::mutex g_tex_queue_lock;
+// Cheap read-only mirror of the queue depth, so the hot draw path can skip the
+// lock entirely when there is nothing waiting. Being a hint, a stale value only
+// delays a drain by one draw call.
+static std::atomic<uint32_t> g_tex_queue_hint{0};
+static uint64_t g_tex_deferred = 0;   // times a speculative picture waited
+static uint64_t g_tex_requested = 0;  // times a requested picture jumped ahead
+static uint64_t g_tex_resumed = 0;    // pictures taken back off the queue
+static int64_t g_queue_at_tex_max = 0;
+// No ceiling is needed on the waiting list: defer() keys by picture id and the
+// id space is capped at MAX_TEXTURES, so the list cannot grow past that.
+
+static void queue_texture(uint16_t id, uint32_t next_chunk, bool urgent) {
+    std::lock_guard<std::mutex> lock(g_tex_queue_lock);
+    if (urgent) {
+        g_texture_queue.defer_front(id, next_chunk);
+        g_tex_requested++;
+    } else {
+        g_texture_queue.defer(id, next_chunk);
+        g_tex_deferred++;
+    }
+    g_tex_queue_hint.store((uint32_t)g_texture_queue.size(), std::memory_order_relaxed);
+}
+
+static bool take_queued_texture(uint16_t& id, uint32_t& next_chunk, bool& urgent) {
+    std::lock_guard<std::mutex> lock(g_tex_queue_lock);
+    bool got = g_texture_queue.take(id, next_chunk, urgent);
+    g_tex_queue_hint.store((uint32_t)g_texture_queue.size(), std::memory_order_relaxed);
+    return got;
+}
 
 // Sends one chunk. chunk_index/chunk_count are carried in the header; the
 // client uses chunk_count == 1 for the ordinary single-message case so small
@@ -1055,10 +1152,82 @@ static uint32_t texture_chunk_count(const CachedTexture& ct) {
     return (uint32_t)((ct.rgba.size() + TEXTURE_CHUNK_BYTES - 1) / TEXTURE_CHUNK_BYTES);
 }
 
-// Sends every chunk of a texture.
-static void send_texture_all_chunks_dc(std::shared_ptr<rtc::DataChannel> dc, const CachedTexture& ct) {
+// Sends every chunk of a texture, stopping the moment the queue holds enough
+// picture bytes that a frame would have to queue behind them. Whatever is left
+// is remembered, so the next drain carries on from the same chunk rather than
+// starting the picture again.
+//
+// `urgent` marks a picture the client explicitly asked for. That one is blocking
+// a frame it already has commands for, so it goes to the front of the queue.
+//
+// Returns true only if every chunk went out now. A false return means the
+// picture was queued instead, which the caller must not report as sent: doing so
+// made a request for 193 pictures that had barely started look fully satisfied.
+static bool send_texture_all_chunks_dc(std::shared_ptr<rtc::DataChannel> dc, const CachedTexture& ct,
+                                       bool urgent = false) {
+    if (!dc || !dc->isOpen() || ct.rgba.empty()) return false;
     uint32_t n = texture_chunk_count(ct);
-    for (uint32_t i = 0; i < n; i++) send_texture_chunk_dc(dc, ct, i, n);
+    for (uint32_t i = 0; i < n; i++) {
+        int64_t q = (int64_t)dc->bufferedAmount();
+        if (q > g_queue_at_tex_max) g_queue_at_tex_max = q;
+        if (!g_texture_queue.has_room(q)) {
+            queue_texture(ct.id, i, urgent);
+            return false;
+        }
+        send_texture_chunk_dc(dc, ct, i, n);
+    }
+    return true;
+}
+
+// Hands waiting pictures to the link while there is room for them.
+static void drain_pending_textures() {
+    if (g_tex_queue_hint.load(std::memory_order_relaxed) == 0) return;
+
+    std::lock_guard<std::mutex> rlock(g_rtc_lock);
+    for (auto& dc : g_active_dcs) {
+        if (!dc || !dc->isOpen()) continue;
+        for (;;) {
+            int64_t q = (int64_t)dc->bufferedAmount();
+            if (q > g_queue_at_tex_max) g_queue_at_tex_max = q;
+            if (!g_texture_queue.has_room(q)) break;
+
+            uint16_t id = 0;
+            uint32_t next = 0;
+            bool urgent = false;
+            if (!take_queued_texture(id, next, urgent)) break;
+            if (id == 0 || id > g_texture_count) continue;
+
+            std::lock_guard<std::mutex> tlock(g_tex_lock);
+            CachedTexture& ct = g_cached_textures[id - 1];
+            if (ct.rgba.empty()) continue;  // destroyed since it was queued
+
+            uint32_t n = texture_chunk_count(ct);
+            g_tex_resumed++;
+            for (uint32_t i = next; i < n; i++) {
+                int64_t q2 = (int64_t)dc->bufferedAmount();
+                if (!g_texture_queue.has_room(q2)) {
+                    // Put back with the same urgency: a picture bigger than the
+                    // budget is sent over several drains, and dropping to
+                    // speculative half way would send it to the back of the
+                    // queue and lose the client's request behind it.
+                    queue_texture(id, i, urgent);
+                    break;
+                }
+                send_texture_chunk_dc(dc, ct, i, n);
+            }
+        }
+    }
+}
+
+// Called from the draw path, which runs thousands of times per frame, so the
+// queue is refilled as soon as the link has room instead of once per present.
+// Without this, throughput was capped at one budget per present: on a fast link
+// the queue empties in milliseconds and then sits idle for the rest of the
+// frame, which is what let a fresh client's requested pictures take longer to
+// arrive than its three-attempt patience allowed.
+static void maybe_drain_textures() {
+    if (g_tex_queue_hint.load(std::memory_order_relaxed) == 0) return;
+    drain_pending_textures();
 }
 
 // Resends the textures the client says it is missing.
@@ -1079,7 +1248,7 @@ static void resend_missing_textures(uint32_t seq, const std::vector<uint16_t>& r
         wanted.push_back(id);
     }
 
-    size_t sent = 0;
+    size_t queued = 0;
     size_t unknown = 0;
     {
         std::lock_guard<std::mutex> rlock(g_rtc_lock);
@@ -1090,14 +1259,24 @@ static void resend_missing_textures(uint32_t seq, const std::vector<uint16_t>& r
                 if (id > g_texture_count) { unknown++; continue; }
                 CachedTexture& ct = g_cached_textures[id - 1];
                 if (ct.rgba.empty()) { unknown++; continue; }
-                send_texture_all_chunks_dc(dc, ct);
-                sent++;
+                // Urgent: this picture is why a frame the client already holds
+                // commands for cannot be drawn. Queueing rather than sending
+                // here is deliberate: an eager send always starts at chunk 0,
+                // so a repeated request re-sent the opening chunks and spent the
+                // whole budget on bytes the client already had, leaving the
+                // transfer to advance only through the drain. A picture the
+                // client re-asks for every 1.5s could then be starved of
+                // progress until it was given up on, which is how the
+                // title-screen backdrop stayed missing while the rest of the
+                // frame was pixel-perfect.
+                queue_texture(id, 0, true);
+                queued++;
             }
         }
     }
 
-    fprintf(stderr, "[ASSET_BRIDGE] Frame %u asked for %zu asset(s); sent %zu, %zu not held here\n",
-            seq, wanted.size(), sent, unknown);
+    fprintf(stderr, "[ASSET_BRIDGE] Frame %u asked for %zu asset(s); %zu queued for delivery, %zu not held here\n",
+            seq, wanted.size(), queued, unknown);
     fflush(stderr);
 }
 
@@ -1337,16 +1516,49 @@ uint32_t SDL_GetMouseState(int* x, int* y) {
     return g_mouse_buttons;
 }
 
+// Total picture bytes held. Maintained as pictures are stored and released
+// rather than recomputed: the id space now spans the whole u16 range, so a scan
+// on every destroy would walk tens of thousands of slots.
+static size_t g_cached_bytes = 0;
+
+// Ceiling on retained pictures. A picture whose texture has been destroyed is
+// kept because a frame already on the wire may still name its id, and the client
+// will ask for it; those requests have to be answerable or the client gives up
+// and leaves a permanent hole. Only once this many bytes are held are the
+// orphaned ones released, so the retention stays bounded.
+#define CACHED_BYTES_MAX (192u * 1024u * 1024u)
+
+// Drops the pixels of every slot whose texture is gone. Live pictures are never
+// touched: those are still being drawn.
+static void release_orphaned_textures_locked() {
+    for (uint16_t i = 0; i < g_texture_count; i++) {
+        if (g_textures[i] == nullptr && !g_cached_textures[i].rgba.empty()) {
+            g_cached_bytes -= g_cached_textures[i].rgba.size();
+            g_cached_textures[i].rgba.clear();
+        }
+    }
+}
+
 void SDL_DestroyTexture(void* texture) {
     if (!real_SDL_DestroyTexture) resolve_symbols();
     if (texture) {
         std::lock_guard<std::mutex> lock(g_tex_lock);
         for (uint16_t i = 0; i < g_texture_count; i++) {
             if (g_textures[i] == texture) {
+                // The slot is freed but the pixels are not. Destroying the
+                // texture only means the game will not draw it again; it does
+                // not mean the client has stopped needing it. A frame that
+                // reached the wire just before this destroy still names the id,
+                // and the client asks for it - and if the pixels are gone here
+                // that request can never be answered, so the client retries
+                // three times, calls it unsendable and leaves a hole in the
+                // display for the rest of the session.
                 g_textures[i] = nullptr;
-                g_cached_textures[i].rgba.clear();
                 break;
             }
+        }
+        if (g_cached_bytes > CACHED_BYTES_MAX) {
+            release_orphaned_textures_locked();
         }
     }
     if (real_SDL_DestroyTexture && texture) real_SDL_DestroyTexture(texture);
@@ -1360,14 +1572,18 @@ void* SDL_CreateTextureFromSurface(void* renderer, void* surface) {
     SDL_Surface_Internal* s = (SDL_Surface_Internal*)surface;
     if (s->w <= 0 || s->h <= 0 || !s->pixels) return tex;
 
-    uint16_t id = get_texture_id(tex);
+    // A texture the game has just created is a picture the client has never
+    // seen, so it always gets a fresh id rather than possibly inheriting one.
+    uint16_t id = alloc_texture_id(tex);
     if (id > 0 && id <= MAX_TEXTURES) {
         std::lock_guard<std::mutex> lock(g_tex_lock);
         CachedTexture& ct = g_cached_textures[id - 1];
         ct.id = id;
         ct.w = (uint16_t)s->w;
         ct.h = (uint16_t)s->h;
+        g_cached_bytes -= ct.rgba.size();
         ct.rgba.resize((size_t)ct.w * ct.h * 4);
+        g_cached_bytes += ct.rgba.size();
 
         if (real_SDL_ConvertSurfaceFormat) {
             void* conv = real_SDL_ConvertSurfaceFormat(surface, 376840196 /* SDL_PIXELFORMAT_ABGR8888 -> RGBA on LE */, 0);
@@ -1409,14 +1625,47 @@ int SDL_RenderClear(void* renderer) {
     return real_SDL_RenderClear ? real_SDL_RenderClear(renderer) : 0;
 }
 
+// True if this id has pixels we could actually put on the wire.
+static bool texture_pixels_available(uint16_t id) {
+    std::lock_guard<std::mutex> lock(g_tex_lock);
+    return id >= 1 && id <= g_texture_count && !g_cached_textures[id - 1].rgba.empty();
+}
+
 int SDL_RenderCopy(void* renderer, void* texture, const SDL_Rect* srcrect, const SDL_Rect* dstrect) {
     if (!real_SDL_RenderCopy) resolve_symbols();
+    // Refill the picture queue here rather than only once per present: this hook
+    // runs thousands of times per frame, so the link is kept busy instead of
+    // idling between presents.
+    maybe_drain_textures();
     int res = real_SDL_RenderCopy ? real_SDL_RenderCopy(renderer, texture, srcrect, dstrect) : 0;
     if (res != 0) return res;
 
+    // A picture the client can never be sent must not be named in a frame. If it
+    // is, the client holds that whole frame waiting for it, spends its retries
+    // on a request that cannot be satisfied, then writes the id off and leaves a
+    // hole in the display - and the frame sat frozen the whole time for nothing.
+    // This is reachable rather than theoretical: a texture the game creates
+    // without a surface (plain SDL_CreateTexture, which is not hooked) gets an
+    // id here at draw time and never has any pixels cached, which is exactly how
+    // ids 10 and 11 stayed permanently missing.
+    uint16_t tid = lookup_texture_id(texture);
+    if (tid == 0) {
+        // Never saw this texture created. Name it anyway: the client then knows
+        // the picture exists and holds the frame until it arrives, instead of
+        // silently drawing a screen with a large sprite missing. Counted, because
+        // a sprite dropped here is invisible corruption - the rest of the frame
+        // is correct, so nothing looks obviously broken.
+        g_draw_unknown++;
+        tid = alloc_texture_id(texture);
+    }
+    if (tid == 0 || !texture_pixels_available(tid)) {
+        g_draw_nopixels++;
+        return res;
+    }
+
     if (g_frame_cmd_count < MAX_DRAW_COMMANDS) {
         DrawCommand& cmd = g_frame_cmds[g_frame_cmd_count++];
-        cmd.tex_id = get_texture_id(texture);
+        cmd.tex_id = tid;
         if (srcrect) {
             cmd.src_x = (int16_t)srcrect->x; cmd.src_y = (int16_t)srcrect->y;
             cmd.src_w = (int16_t)srcrect->w; cmd.src_h = (int16_t)srcrect->h;
@@ -1468,15 +1717,26 @@ void SDL_RenderPresent(void* renderer) {
         }
     }
 
-    // On-demand snapshot trigger for QA parity suite
+    // On-demand snapshot trigger for QA parity suite.
+    //
+    // The size is asked of the renderer rather than taken from the tracked
+    // window size: the game resizes its window, and reading with a pitch that
+    // does not match the target makes SDL refuse, which is why this produced no
+    // file at all and left the parity suite with no ground truth.
     if (access("/tmp/df_snap_trigger", F_OK) == 0 && real_SDL_RenderReadPixels) {
         unlink("/tmp/df_snap_trigger");
-        std::vector<uint8_t> snap_pixel_buf(g_current_w * g_current_h * 4);
-        if (real_SDL_RenderReadPixels(renderer, nullptr, 376840196 /* SDL_PIXELFORMAT_ABGR8888 -> RGBA */, snap_pixel_buf.data(), g_current_w * 4) == 0) {
-            FILE* fp = fopen("/tmp/df_snap_host.raw", "wb");
-            if (fp) {
-                fwrite(snap_pixel_buf.data(), 1, snap_pixel_buf.size(), fp);
-                fclose(fp);
+        int ow = g_current_w, oh = g_current_h;
+        if (real_SDL_GetRendererOutputSize) real_SDL_GetRendererOutputSize(renderer, &ow, &oh);
+        if (ow > 0 && oh > 0) {
+            std::vector<uint8_t> snap_pixel_buf((size_t)ow * (size_t)oh * 4);
+            if (real_SDL_RenderReadPixels(renderer, nullptr, 376840196 /* SDL_PIXELFORMAT_ABGR8888 -> RGBA */, snap_pixel_buf.data(), ow * 4) == 0) {
+                FILE* fp = fopen("/tmp/df_snap_host.raw", "wb");
+                if (fp) {
+                    fwrite(snap_pixel_buf.data(), 1, snap_pixel_buf.size(), fp);
+                    fclose(fp);
+                    FILE* mp = fopen("/tmp/df_snap_host.meta", "w");
+                    if (mp) { fprintf(mp, "%d %d\n", ow, oh); fclose(mp); }
+                }
             }
         }
     }
@@ -1497,15 +1757,15 @@ void SDL_RenderPresent(void* renderer) {
     // number and the client's stamp are all left untouched, so the next present
     // recomputes the same delta with more changes folded in and sends once the
     // queue has drained.
-    bool link_backed_up = false;
-    {
-        std::lock_guard<std::mutex> lock(g_rtc_lock);
-        for (auto& dc : g_active_dcs) {
-            if (dc && dc->isOpen() && dc->bufferedAmount() >= 131072) { link_backed_up = true; break; }
-        }
-    }
-
-    if (g_frame_cmd_count > 0 && has_receivers && !link_backed_up) {
+    // Frames are never held back for picture traffic. The queue can only grow
+    // from pictures, and pictures are throttled at the source now (see
+    // TEXTURE_QUEUE_BUDGET), so there is always room for a frame: a delta frame
+    // is ~114 B against a 512 KB picture budget.
+    //
+    // The guard that used to live here tested 131,072 B, which is smaller than a
+    // single 131,088 B chunk -- so one picture was enough to stop frames going
+    // out, and the client sat on a stale screen until the queue drained.
+    if (g_frame_cmd_count > 0 && has_receivers) {
         uint8_t stamp = 0;
         if (g_has_client_stamp && g_current_client_stamp != 0) {
             // NOTE: the age is NOT measured here. Presents happen whether or
@@ -1603,7 +1863,7 @@ void SDL_RenderPresent(void* renderer) {
                     s95 = (double)v[(size_t)std::min(v.size() - 1, (size_t)(v.size() * 0.95))];
                     smax = (double)v.back();
                 }
-                fprintf(stderr, "[FRAME_STATS] sent=%llu silent=%llu full=%llu delta=%llu avg_full=%lluB avg_delta=%lluB enc_calls=%llu enc_p50=%.0fus enc_p95=%.0fus enc_max=%.0fus STAMP_n=%llu STAMP_p50=%.0fms STAMP_p95=%.0fms STAMP_max=%.0fms QUEUE_p50=%lld QUEUE_p95=%lld QUEUE_max=%lld TEX_n=%llu TEX_kb=%llu KA=%llu\n",
+                fprintf(stderr, "[FRAME_STATS] sent=%llu silent=%llu full=%llu delta=%llu avg_full=%lluB avg_delta=%lluB enc_calls=%llu enc_p50=%.0fus enc_p95=%.0fus enc_max=%.0fus STAMP_n=%llu STAMP_p50=%.0fms STAMP_p95=%.0fms STAMP_max=%.0fms QUEUE_p50=%lld QUEUE_p95=%lld QUEUE_max=%lld TEX_n=%llu TEX_kb=%llu KA=%llu SKIP_n=%llu TEXQ_defer=%llu TEXQ_req=%llu TEXQ_resume=%llu TEXQ_pend=%u TEXQ_qmax=%lld TEX_ids=%u TEX_recycled=%llu TEX_kbheld=%llu DRAW_unknown=%llu DRAW_nopixels=%llu\n",
                         (unsigned long long)g_sent_seq,
                         (unsigned long long)s.stat_nothing,
                         (unsigned long long)s.stat_full,
@@ -1615,7 +1875,17 @@ void SDL_RenderPresent(void* renderer) {
                         (unsigned long long)g_stamp_seen, s50, s95, smax,
                         (long long)q50, (long long)q95, (long long)qmax,
                         (unsigned long long)g_tex_count, (unsigned long long)(g_tex_bytes / 1024),
-                        (unsigned long long)g_keepalive_sent);
+                        (unsigned long long)g_keepalive_sent,
+                        (unsigned long long)g_frames_skipped,
+                        (unsigned long long)g_tex_deferred, (unsigned long long)g_tex_requested,
+                        (unsigned long long)g_tex_resumed,
+                        (unsigned)g_tex_queue_hint.load(std::memory_order_relaxed),
+                        (long long)g_queue_at_tex_max,
+                        (unsigned)g_texture_count,
+                        (unsigned long long)g_tex_recycled,
+                        (unsigned long long)(g_cached_bytes / 1024),
+                        (unsigned long long)g_draw_unknown,
+                        (unsigned long long)g_draw_nopixels);
                 fflush(stderr);
             }
         }
@@ -1623,6 +1893,11 @@ void SDL_RenderPresent(void* renderer) {
 
     g_frame_cmd_count = 0;
     real_SDL_RenderPresent(renderer);
+
+    // Pictures wait for frames, never the other way round. Running this after
+    // the present also means the chunk copying happens while the renderer would
+    // otherwise be idle waiting on vsync, instead of delaying the frame.
+    drain_pending_textures();
 }
 
 __attribute__((constructor))
