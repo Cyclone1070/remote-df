@@ -107,6 +107,9 @@ public:
     size_t size() const { return pending_.size(); }
     bool empty() const { return pending_.empty(); }
     size_t budget() const { return budget_; }
+    // Adjustable after construction so the picture backlog can be switched off
+    // while the game is running, without a restart.
+    void set_budget(size_t b) { budget_ = b; }
 
 private:
     struct Pending {

@@ -1,13 +1,13 @@
 CXX ?= g++
 CXXFLAGS ?= -shared -fPIC -O3 -Wall -Wextra -std=c++17 -I/usr/local/include
-LDFLAGS ?= -ldl -lpthread -lzstd -ldatachannel -lssl -lcrypto
+LDFLAGS ?= -ldl -lpthread -lzstd -lz -ldatachannel -lssl -lcrypto -ljpeg
 
 TARGET = libdf_streamer.so
 SRCS = df_streamer.cpp
 
 all: $(TARGET)
 
-$(TARGET): $(SRCS) sha1_b64.hpp ws_server.hpp texture_queue.hpp
+$(TARGET): $(SRCS) sha1_b64.hpp ws_server.hpp texture_queue.hpp raw_jpeg.hpp
 	$(CXX) $(CXXFLAGS) $(SRCS) -o $(TARGET) $(LDFLAGS)
 
 clean:

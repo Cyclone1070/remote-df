@@ -121,7 +121,10 @@ await page.goto(URL, { waitUntil: 'domcontentloaded' });
 const launch = page.locator('text=Launch Game');
 try { await launch.waitFor({ state: 'visible', timeout: 8000 }); await launch.click(); }
 catch { console.log('attaching to running session'); }
-await page.waitForSelector('canvas', { timeout: 120000 });
+// attached, not visible: the canvas is created at full size as soon as the client
+// starts, but Playwright's visibility check can keep failing on it, and the size
+// is what this bench actually needs.
+await page.waitForSelector('canvas', { state: 'attached', timeout: 120000 });
 const box = await page.locator('canvas').first().boundingBox();
 
 await page.waitForTimeout(18000);

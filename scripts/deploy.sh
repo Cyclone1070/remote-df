@@ -35,13 +35,16 @@ ssh "$HOST" "mkdir -p $REMOTE_SRC"
 # installed on the host or in the runtime container.
 build_interposer() {
   log "build interposer"
-  for f in interposer/df_streamer.cpp interposer/ws_server.hpp interposer/sha1_b64.hpp interposer/texture_queue.hpp; do
+  # The headers are on this list because the compile below only sees $REMOTE_SRC:
+  # a header that is not copied here fails the build with "file not found", and the
+  # stale-artefact check turns that into a hard stop rather than a silent ship.
+  for f in interposer/df_streamer.cpp interposer/ws_server.hpp interposer/sha1_b64.hpp interposer/texture_queue.hpp interposer/raw_jpeg.hpp interposer/raw_png.hpp; do
     cat "$f" | ssh "$HOST" "cat > $REMOTE_SRC/$(basename "$f")"
   done
   ssh "$HOST" "podman run --rm -v $REMOTE_SRC:/src:Z -w /src $BUILD_IMAGE sh -c '
     g++ -shared -fPIC -O3 -Wall -Wextra -std=c++17 -I/usr/local/include \
         df_streamer.cpp -o libdf_streamer.so \
-        -ldl -lpthread -lzstd -ldatachannel -lssl -lcrypto'" 2>&1 | tail -20
+        -ldl -lpthread -lzstd -lz -ldatachannel -lssl -lcrypto -ljpeg'" 2>&1 | tail -20
   # A failed compile leaves the previous .so in place, which would ship stale code.
   # Refuse to continue unless the artefact is newer than the source we just sent.
   ssh "$HOST" "test $REMOTE_SRC/df_streamer.cpp -nt $REMOTE_SRC/libdf_streamer.so && {

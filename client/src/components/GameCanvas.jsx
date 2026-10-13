@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { DFRenderer } from '../core/renderer.js';
 import { DFProtocol } from '../core/protocol.js';
+import * as fzstd from 'fzstd';
 import { DFInput } from '../core/input.js';
 import { FrameSequencer } from '../core/frameSequencer.js';
 
@@ -328,7 +329,8 @@ function ingestTextureChunk(chunk) {
             // Measured at give-up: 23 of its 64 chunks had already arrived.
             pictureArrivedSinceRequest = true;
             // Fast path: fits in one message, no assembly and no extra copy.
-            if (chunk.chunkCount === 1) {
+            // A compressed picture still has to be decompressed first.
+            if (chunk.chunkCount === 1 && !chunk.compressed) {
                 const rgba = new Uint8ClampedArray(
                     chunk.data.buffer, chunk.data.byteOffset, chunk.data.byteLength
                 );
@@ -343,6 +345,7 @@ function ingestTextureChunk(chunk) {
                     w: chunk.w, h: chunk.h,
                     totalLen: chunk.totalLen,
                     chunkCount: chunk.chunkCount,
+                    compressed: chunk.compressed,
                     chunks: new Map()
                 };
                 pendingTextures.set(chunk.texId, pending);
@@ -370,8 +373,31 @@ function ingestTextureChunk(chunk) {
             }
 
             pendingTextures.delete(chunk.texId);
+
+            let rgba = out;
+            if (pending.compressed) {
+                // The wire carried w*h*4 bytes after zstd. Decompressing is
+                // lossless, so this is the same picture the game drew, just
+                // smaller on the way here. A picture that fails to decompress is
+                // dropped rather than uploaded: a half-decoded texture would be
+                // corruption the client then caches.
+                const want = pending.w * pending.h * 4;
+                try {
+                    const plain = fzstd.decompress(new Uint8Array(out.buffer, out.byteOffset, out.byteLength),
+                                                   new Uint8Array(want));
+                    if (plain.byteLength !== want) {
+                        console.warn(`[Assets] Texture ${chunk.texId} decompressed to ${plain.byteLength}, want ${want} - discarding`);
+                        return;
+                    }
+                    rgba = new Uint8ClampedArray(plain.buffer, plain.byteOffset, plain.byteLength);
+                } catch (e) {
+                    console.warn(`[Assets] Texture ${chunk.texId} failed to decompress - discarding`, e);
+                    return;
+                }
+            }
+
             renderer.setTexture(chunk.texId, {
-                texId: chunk.texId, w: pending.w, h: pending.h, rgba: out
+                texId: chunk.texId, w: pending.w, h: pending.h, rgba
             });
             pictureArrivedSinceRequest = true;
         }

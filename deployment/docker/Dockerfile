@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     libssl-dev \
     libzstd-dev \
+    libjpeg-turbo8-dev \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
@@ -52,11 +53,16 @@ RUN CGO_ENABLED=0 GOOS=linux go build -tags embed_ui -ldflags="-s -w" -o /bin/se
 # Stage 4: Minimal runtime image
 FROM ubuntu:24.04
 
+# libjpeg-turbo8 is a runtime dependency of libdf_streamer.so now that the opt-in
+# raw pixel mode encodes frames with it: the interposer is preloaded into the game,
+# so a missing libjpeg.so.8 stops the game from starting at all, whether or not
+# DF_RAW_STREAM is ever set.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb \
     libsdl2-2.0-0 \
     libsdl2-image-2.0-0 \
     libzstd1 \
+    libjpeg-turbo8 \
     ca-certificates \
     curl \
     tini \

@@ -20,8 +20,26 @@
 #include <variant>
 #include <rtc/rtc.hpp>
 
+// Raw pixel mode (DF_RAW_STREAM=1) encodes its frames with libjpeg, and the raw
+// link is a TCP client. Both are included here rather than in raw_jpeg.hpp so the
+// dependencies of the interposer stay visible in one place. The standard headers
+// come first on purpose: jpeglib.h uses size_t and FILE without including anything
+// that defines them.
+#include <cstddef>
+#include <cstdio>
+#include <jpeglib.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <netdb.h>
+#include <poll.h>
+#include <fcntl.h>
+#include <errno.h>
+
 #include "ws_server.hpp"
 #include "texture_queue.hpp"
+#include "raw_jpeg.hpp"
+#include "raw_png.hpp"
 
 #define MAX_DRAW_COMMANDS 32768
 // The whole u16 id space, so an id is never handed to a second picture in any
@@ -55,11 +73,14 @@ struct DeltaUpdate {
 };
 
 struct TextureHeader {
-    uint8_t magic[2];      // 'D', 'T'
+    // 'D','T' carries RGBA exactly as the game made it. 'D','Z' carries the same
+    // RGBA after zstd, in which case payload_len is the compressed length and the
+    // receiver gets w*h*4 back out of the decompressor.
+    uint8_t magic[2];
     uint16_t tex_id;
     uint16_t w;
     uint16_t h;
-    uint32_t payload_len;  // total RGBA bytes for the whole texture, across all chunks
+    uint32_t payload_len;  // total bytes for the whole texture across chunks, as sent
     uint16_t chunk_index;  // 0-based index of this chunk
     uint16_t chunk_count;  // total chunks this texture is split into (1 = unchunked)
 };
@@ -160,6 +181,14 @@ struct CachedTexture {
     uint16_t w = 0;
     uint16_t h = 0;
     std::vector<uint8_t> rgba;
+    // mutable: the send path takes these by const ref, but recording that a
+    // picture has gone out once is bookkeeping, not a change to the picture.
+    mutable bool sent_once = false;
+    // Filled the first time this picture is put on the wire. mutable for the same
+    // reason as sent_once: building it does not change what the picture is, and
+    // the send path only ever holds a const reference.
+    mutable std::vector<uint8_t> compressed;
+    mutable bool compress_tried = false;
 };
 
 struct SDL_PixelFormat_Internal {
@@ -625,10 +654,24 @@ static bool g_stamp_pending = false;
 // and the network took the time" -- different root causes, different fixes.
 static std::vector<int64_t> g_queue_at_send;
 static uint64_t g_tex_count = 0;
+// Splits the picture traffic into first-time sends and repeats. A repeat is
+// pure waste: the client already holds that picture, so the only reason to send
+// it again is that something threw its copy away.
+static uint64_t g_tex_new = 0;
+static uint64_t g_tex_repeat = 0;
+// The connect-time dump: every cached picture pushed at a client that has just
+// arrived and therefore holds nothing yet.
+static uint64_t g_tex_dump_count = 0;
+static uint64_t g_tex_dump_bytes = 0;
 // Ids handed to a second picture, which only happens if the whole id space is
 // exhausted. Must stay 0: any other value means a client can be shown a stale
 // picture for that id.
 static uint64_t g_tex_recycled = 0;
+// Everything put on the link toward the client: draw commands plus pictures.
+// Counted at the send calls, because this is the number the whole-picture
+// baseline has to be compared against and neither side may estimate it.
+static uint64_t g_wire_bytes = 0;
+static uint64_t g_wire_frames = 0;
 // Draws of textures we never saw created, and draws skipped because we hold no
 // pixels for them. Either being non-zero means a sprite the game drew is not in
 // the stream, which shows up as a correct-looking frame with something missing.
@@ -676,12 +719,64 @@ extern "C" void _ZN9enablerst10update_fpsEv(void* self) {
     g_sim_ticks++;
 }
 
+// A bench needs a fixed window. The raw baseline captures the whole window, so a
+// size that changes whenever a client connects makes two runs measure different
+// numbers of pixels and no comparison between them means anything. When
+// /tmp/df_window_size holds WxH, that size wins and client resize requests are
+// ignored; without the file nothing changes.
+#define WINDOW_PIN_FILE "/tmp/df_window_size"
+
+static bool pinned_window_size(int& w, int& h) {
+    static std::atomic<int64_t> last_check_ms{0};
+    static std::atomic<int> cached_w{0}, cached_h{0};
+    static std::atomic<bool> ever_checked{false};
+    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (!ever_checked.load() || now - last_check_ms.load() >= 1000) {
+        last_check_ms.store(now);
+        ever_checked.store(true);
+        cached_w.store(0);
+        cached_h.store(0);
+        FILE* f = fopen(WINDOW_PIN_FILE, "r");
+        if (f) {
+            int pw = 0, ph = 0;
+            if (fscanf(f, "%dx%d", &pw, &ph) == 2 && pw >= 912 && ph >= 552) {
+                cached_w.store(pw);
+                cached_h.store(ph);
+            }
+            fclose(f);
+        }
+    }
+    w = cached_w.load();
+    h = cached_h.load();
+    return w > 0 && h > 0;
+}
+
 // Hook SDL_PollEvent: guarantees DF mainloop() always sees mouse clicks before mouse release
 extern "C" int SDL_PollEvent(void* event) {
     if (!real_SDL_PollEvent) resolve_symbols();
 
     int target_w = g_pending_resize_w.exchange(0);
     int target_h = g_pending_resize_h.exchange(0);
+
+    int pin_w = 0, pin_h = 0;
+    if (pinned_window_size(pin_w, pin_h)) {
+        // Apply the pinned size once so the window matches it, then swallow every
+        // client request: the point of the pin is that no client can move it.
+        static int applied_w = 0, applied_h = 0;
+        if (applied_w != pin_w || applied_h != pin_h) {
+            target_w = pin_w;
+            target_h = pin_h;
+            applied_w = pin_w;
+            applied_h = pin_h;
+            fprintf(stderr, "[WINDOW] pinned to %dx%d\n", pin_w, pin_h);
+            fflush(stderr);
+        } else {
+            target_w = 0;
+            target_h = 0;
+        }
+    }
+
     if (target_w >= 912 && target_h >= 552 && g_df_window) {
         g_current_w = target_w;
         g_current_h = target_h;
@@ -1058,6 +1153,57 @@ static std::vector<std::shared_ptr<rtc::DataChannel>> g_active_dcs;
 // by the client. The budget leaves generous headroom under the advertised cap.
 #define TEXTURE_CHUNK_BYTES (128u * 1024u)
 
+// Lossless pictures - opt-in, DF_PIC_LOSSLESS=1 or the file /tmp/df_pic_lossless.
+// Pictures have always gone out as plain RGBA, which is lossless but several
+// times larger than it needs to be: the tiles the game draws are mostly flat and
+// compress hard. Compressing is free in quality terms - zstd gives back exactly
+// the bytes that went in - so the only question it raises is how much of the
+// traffic it removes, which is what the bench is for.
+#define PIC_LOSSLESS_TRIGGER_FILE "/tmp/df_pic_lossless"
+// Below this the header and the extra pass cost more than the saving.
+#define PIC_LOSSLESS_MIN_BYTES 1024u
+
+static bool g_pic_lossless_env = false;
+
+static bool texture_lossless_on() {
+    static std::atomic<int64_t> last_check_ms{0};
+    static std::atomic<bool> cached{false};
+    static std::atomic<bool> ever_checked{false};
+    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (!ever_checked.load() || now - last_check_ms.load() >= 1000) {
+        last_check_ms.store(now);
+        cached.store(g_pic_lossless_env || (access(PIC_LOSSLESS_TRIGGER_FILE, F_OK) == 0));
+        ever_checked.store(true);
+    }
+    return cached.load();
+}
+
+// The bytes this picture will put on the wire. Compresses at most once per
+// picture and keeps the result, because a picture is re-sent on every reconnect
+// and on every request and re-compressing it each time would burn the game's
+// frame time for no reason.
+static const std::vector<uint8_t>& texture_wire_bytes(const CachedTexture& ct, bool& is_compressed) {
+    is_compressed = false;
+    if (!texture_lossless_on() || ct.rgba.size() < PIC_LOSSLESS_MIN_BYTES) return ct.rgba;
+
+    if (!ct.compress_tried) {
+        ct.compress_tried = true;
+        size_t bound = ZSTD_compressBound(ct.rgba.size());
+        ct.compressed.resize(bound);
+        size_t got = ZSTD_compress(ct.compressed.data(), bound, ct.rgba.data(), ct.rgba.size(), 1);
+        // A picture that did not get smaller is sent as it is: the tag would
+        // cost a byte and buy nothing.
+        if (ZSTD_isError(got) || got >= ct.rgba.size()) ct.compressed.clear();
+        else ct.compressed.resize(got);
+    }
+
+    if (ct.compressed.empty()) return ct.rgba;
+    is_compressed = true;
+    return ct.compressed;
+}
+
+
 // How many bytes of picture the send queue may hold before pictures start
 // waiting. Frames are exempt: a delta frame is ~114 B and a full frame ~4 KB,
 // so they fit in the noise beside this budget, whereas one 1920x1080 picture is
@@ -1072,9 +1218,46 @@ static std::vector<std::shared_ptr<rtc::DataChannel>> g_active_dcs;
 // user is looking at and the picture is not.
 #define TEXTURE_QUEUE_BUDGET (512u * 1024u)
 
+// Overridable at runtime so the picture backlog can be turned off in an
+// experiment. With the budget at 0 no picture is ever sent, which isolates how
+// much of the interactive lag comes from frames queueing behind bulk picture
+// traffic on the one shared link rather than from the frame path itself.
+//
+// DF_TEX_BUDGET in the environment wins; otherwise a file is consulted, which is
+// how the raw-pixel toggle already works and needs no restart to flip.
+static size_t texture_queue_budget() {
+    static size_t env_budget = [] {
+        const char* pl = getenv("DF_PIC_LOSSLESS");
+        g_pic_lossless_env = (pl && pl[0] == '1');
+        const char* s = getenv("DF_TEX_BUDGET");
+        if (!s) return (size_t)SIZE_MAX;
+        long v = atol(s);
+        return v < 0 ? (size_t)SIZE_MAX : (size_t)v;
+    }();
+    if (env_budget != (size_t)SIZE_MAX) return env_budget;
+
+    static size_t cached = (size_t)TEXTURE_QUEUE_BUDGET;
+    static uint64_t next_check_ms = 0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+    if (now >= next_check_ms) {
+        next_check_ms = now + 1000;
+        FILE* f = fopen("/tmp/df_tex_budget", "r");
+        if (f) {
+            long v = 0;
+            if (fscanf(f, "%ld", &v) == 1 && v >= 0) cached = (size_t)v;
+            fclose(f);
+        } else {
+            cached = (size_t)TEXTURE_QUEUE_BUDGET;
+        }
+    }
+    return cached;
+}
+
 // Pictures that could not be sent yet, oldest first, each remembering the first
 // chunk it still owes so an interrupted picture resumes instead of restarting.
-static TextureQueue g_texture_queue(TEXTURE_QUEUE_BUDGET);
+static TextureQueue g_texture_queue(texture_queue_budget());
 // The queue is touched from two threads: pictures are queued from the RTC
 // thread (an explicit request) and drained from the render thread (a present or
 // a draw call), so it needs its own lock.
@@ -1116,14 +1299,16 @@ static void send_texture_chunk_dc(std::shared_ptr<rtc::DataChannel> dc, const Ca
                                   uint32_t chunk_index, uint32_t chunk_count) {
     if (!dc || !dc->isOpen() || ct.rgba.empty()) return;
 
-    const size_t total = ct.rgba.size();
+    bool compressed = false;
+    const std::vector<uint8_t>& bytes = texture_wire_bytes(ct, compressed);
+    const size_t total = bytes.size();
     const size_t offset = (size_t)chunk_index * TEXTURE_CHUNK_BYTES;
     if (offset >= total) return;
     size_t len = std::min((size_t)TEXTURE_CHUNK_BYTES, total - offset);
 
     TextureHeader hdr;
     hdr.magic[0] = 'D';
-    hdr.magic[1] = 'T';
+    hdr.magic[1] = compressed ? 'Z' : 'T';
     hdr.tex_id = ct.id;
     hdr.w = ct.w;
     hdr.h = ct.h;
@@ -1133,10 +1318,19 @@ static void send_texture_chunk_dc(std::shared_ptr<rtc::DataChannel> dc, const Ca
 
     std::vector<uint8_t> packet(sizeof(hdr) + len);
     memcpy(packet.data(), &hdr, sizeof(hdr));
-    memcpy(packet.data() + sizeof(hdr), ct.rgba.data() + offset, len);
+    memcpy(packet.data() + sizeof(hdr), bytes.data() + offset, len);
 
     g_tex_count++;
     g_tex_bytes += packet.size();
+    // Pictures count toward the wire total too: the comparison against whole
+    // frames is only honest if both sides count everything they send.
+    g_wire_bytes += packet.size();
+    // Classify once per picture, on its first chunk, so a chunked picture is
+    // counted as one send rather than one per chunk.
+    if (chunk_index == 0) {
+        if (ct.sent_once) g_tex_repeat++;
+        else { g_tex_new++; ct.sent_once = true; }
+    }
     try {
         dc->send((const std::byte*)packet.data(), packet.size());
     } catch (const std::exception& e) {
@@ -1149,7 +1343,9 @@ static void send_texture_chunk_dc(std::shared_ptr<rtc::DataChannel> dc, const Ca
 }
 
 static uint32_t texture_chunk_count(const CachedTexture& ct) {
-    return (uint32_t)((ct.rgba.size() + TEXTURE_CHUNK_BYTES - 1) / TEXTURE_CHUNK_BYTES);
+    bool compressed = false;
+    const std::vector<uint8_t>& bytes = texture_wire_bytes(ct, compressed);
+    return (uint32_t)((bytes.size() + TEXTURE_CHUNK_BYTES - 1) / TEXTURE_CHUNK_BYTES);
 }
 
 // Sends every chunk of a texture, stopping the moment the queue holds enough
@@ -1166,6 +1362,7 @@ static uint32_t texture_chunk_count(const CachedTexture& ct) {
 static bool send_texture_all_chunks_dc(std::shared_ptr<rtc::DataChannel> dc, const CachedTexture& ct,
                                        bool urgent = false) {
     if (!dc || !dc->isOpen() || ct.rgba.empty()) return false;
+    g_texture_queue.set_budget(texture_queue_budget());
     uint32_t n = texture_chunk_count(ct);
     for (uint32_t i = 0; i < n; i++) {
         int64_t q = (int64_t)dc->bufferedAmount();
@@ -1182,6 +1379,7 @@ static bool send_texture_all_chunks_dc(std::shared_ptr<rtc::DataChannel> dc, con
 // Hands waiting pictures to the link while there is room for them.
 static void drain_pending_textures() {
     if (g_tex_queue_hint.load(std::memory_order_relaxed) == 0) return;
+    g_texture_queue.set_budget(texture_queue_budget());
 
     std::lock_guard<std::mutex> rlock(g_rtc_lock);
     for (auto& dc : g_active_dcs) {
@@ -1418,9 +1616,15 @@ void handle_client_text_message(int fd, const std::string& msg) {
                             std::lock_guard<std::mutex> lock(g_tex_lock);
                             for (uint16_t i = 0; i < g_texture_count; i++) {
                                 if (!g_cached_textures[i].rgba.empty()) {
+                                    g_tex_dump_count++;
+                                    g_tex_dump_bytes += g_cached_textures[i].rgba.size();
                                     send_texture_all_chunks_dc(dc, g_cached_textures[i]);
                                 }
                             }
+                            fprintf(stderr, "[TEXDUMP] client fd=%d: pushed %llu cached pictures (%llu KB)\n",
+                                    fd, (unsigned long long)g_tex_dump_count,
+                                    (unsigned long long)(g_tex_dump_bytes / 1024));
+                            fflush(stderr);
                         }
                     }
                 });
@@ -1488,6 +1692,565 @@ void handle_client_disconnected(int fd) {
         }
         g_rtc_sessions.erase(it);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Framebuffer readback
+// ---------------------------------------------------------------------------
+
+// SDL_PIXELFORMAT_ABGR8888, which on a little-endian machine is the byte order
+// R,G,B,A. Spelled out as a name because the two readback callers below have to
+// agree on it: the QA snapshot compares against the client's canvas and the raw
+// mode encodes it as JPEG, and a silent disagreement about channel order would
+// look like a rendering bug in the game.
+#define RAW_SDL_PIXELFORMAT_ABGR8888 376840196u
+
+// Read the framebuffer the way the QA snapshot does, into memory this time.
+//
+// The size is asked of the renderer rather than taken from the tracked window
+// size: the game resizes its window, and reading with a pitch that does not match
+// the target makes SDL refuse the call, which is why snapshotting once produced
+// no file at all and left the parity suite with no ground truth. Sharing one copy
+// of that rule means the snapshot and the raw stream cannot drift apart on either
+// the size or the pixel format.
+static bool read_framebuffer_rgba(void* renderer, std::vector<uint8_t>& buf, int* out_w, int* out_h) {
+    if (!real_SDL_RenderReadPixels) return false;
+    int ow = g_current_w, oh = g_current_h;
+    if (real_SDL_GetRendererOutputSize) real_SDL_GetRendererOutputSize(renderer, &ow, &oh);
+    if (ow <= 0 || oh <= 0) return false;
+
+    buf.resize((size_t)ow * (size_t)oh * 4);
+    if (real_SDL_RenderReadPixels(renderer, nullptr, RAW_SDL_PIXELFORMAT_ABGR8888,
+                                  buf.data(), ow * 4) != 0) {
+        return false;
+    }
+    *out_w = ow;
+    *out_h = oh;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Raw pixel mode - opt-in, DF_RAW_STREAM=1 or the file /tmp/df_raw_on.
+//
+// A sanity-check baseline, not a replacement for the command stream: whole frames
+// as JPEG, so the screen the client ends up showing can be compared against a path
+// that cannot be subtle about what the frame contained. It is off unless it is
+// asked for, and when it is off the render thread pays a couple of atomic loads
+// and one rate-limited stat per second - no readback, no encoding, no thread, no
+// socket. (A clock read comes with the rate limit; that is a handful of
+// nanoseconds and is the price of not doing a stat on every frame.)
+//
+// Transport is a single TCP connection with the interposer as the client, to
+// 127.0.0.1:8491 unless DF_RAW_TARGET says host:port:
+//   interposer -> server : u32 length, then that many bytes of one JPEG
+//   server -> interposer : u32 length, then that many bytes of input, in exactly
+//                          the encoding the WebRTC data channel already delivers
+// Every integer is big-endian.
+// ---------------------------------------------------------------------------
+
+#define RAW_DEFAULT_TARGET "127.0.0.1:8491"
+// The runtime switch. Not a nicer DF_RAW_STREAM: changing an environment variable
+// means recreating the container, which means restarting the game, and the point of
+// this mode is to compare the two paths on the same session. Touching a file is
+// something the human can do from outside while the game is running.
+#define RAW_TRIGGER_FILE "/tmp/df_raw_on"
+#define RAW_TOGGLE_CHECK_MS 1000
+#define RAW_JPEG_QUALITY 80
+// Lossless picture mode - opt-in, DF_RAW_LOSSLESS=1 or the file
+// /tmp/df_raw_lossless. JPEG at any quality is an approximation, so a size
+// comparison against pictures that are sent bit-exact compares two different
+// claims. This switch lets the baseline send exactly the pixels the game made,
+// so the only thing left differing between the two paths is how they represent
+// what they send.
+#define RAW_LOSSLESS_TRIGGER_FILE "/tmp/df_raw_lossless"
+#define RAW_PNG_LEVEL 1
+#define RAW_CODEC_JPEG 0
+#define RAW_CODEC_PNG 1
+#define RAW_RETRY_MS 500
+#define RAW_CONNECT_TIMEOUT_MS 500
+// Captures closer together than this are skipped. Reading back a 1280x720 frame
+// and encoding it costs several milliseconds of the machine the game is running
+// on, and a menu screen can present far faster than that; without the cap the raw
+// mode would compete with the game for the sake of frames nobody sees.
+#define RAW_MIN_CAPTURE_MS 12
+// Bounds a length prefix from the peer. The largest input message the WebRTC path
+// can produce is an asset-bridge request naming every texture id, so this has to
+// be generous; anything past it is a desynchronised stream and the link is dropped.
+#define RAW_INPUT_MAX (1u << 20)
+
+static bool g_raw_env_on = false;             // DF_RAW_STREAM was 1 at startup
+static bool g_raw_lossless_env = false;       // DF_RAW_LOSSLESS was 1 at startup
+
+// Checked on the same one-second cadence as the mode switch itself, so it costs
+// a file test per second rather than one per frame. A static local keeps this
+// self-contained; both callers are on the raw worker thread.
+static bool raw_lossless_on() {
+    static std::atomic<int64_t> last_check_ms{0};
+    static std::atomic<bool> cached{false};
+    static std::atomic<bool> ever_checked{false};
+    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (!ever_checked.load() || now - last_check_ms.load() >= RAW_TOGGLE_CHECK_MS) {
+        last_check_ms.store(now);
+        bool want = g_raw_lossless_env || (access(RAW_LOSSLESS_TRIGGER_FILE, F_OK) == 0);
+        if (want != cached.load()) {
+            fprintf(stderr, "[RAW] picture codec -> %s\n", want ? "lossless PNG" : "JPEG q80");
+            fflush(stderr);
+        }
+        cached.store(want);
+        ever_checked.store(true);
+    }
+    return cached.load();
+}
+static std::atomic<bool> g_raw_on{false};     // effective state, can change at runtime
+static std::atomic<bool> g_raw_watcher{false};// a worker thread exists to watch the switch
+static std::atomic<int64_t> g_raw_last_check_ms{0};
+static std::atomic<bool> g_raw_checked_once{false};
+static std::chrono::steady_clock::time_point g_raw_clock_start;
+static std::atomic<uint64_t> g_raw_sent{0};
+static std::atomic<uint64_t> g_raw_dropped{0};
+static std::atomic<uint64_t> g_raw_bytes{0};
+static std::atomic<uint64_t> g_raw_encode_us{0};
+static std::atomic<int> g_raw_connected{0};
+static std::atomic<bool> g_raw_stop{false};
+static std::thread g_raw_thread;
+// A plain char buffer, not a std::string, and deliberately so.
+//
+// raw_init() writes this, and raw_init() is called from init_interposer(), which
+// is a constructor attribute. A constructor attribute function runs BEFORE this
+// translation unit's own static initializers, so assigning to a std::string here
+// is an assignment to an object whose constructor has not run yet: the game
+// segfaulted during startup, before it drew a single frame, with no stack for a
+// debugger to unwind. A char array is initialised statically, so there is no
+// ordering to get wrong.
+static char g_raw_host[256] = "127.0.0.1";
+static unsigned g_raw_port = 8491;
+
+// One staging buffer, not a queue. The render thread fills it and marks it ready;
+// the worker swaps the pixels out and encodes them privately. If the worker has
+// not taken the previous frame yet the new one is dropped, which is the right
+// answer: a backlog of frames would show the session ageing in lockstep, and the
+// stream is only useful if what it shows is now.
+static std::mutex g_raw_frame_lock;
+static std::vector<uint8_t> g_raw_staging;   // shared: filled by the render thread
+static std::vector<uint8_t> g_raw_worker;    // owned by the worker while encoding
+static bool g_raw_frame_ready = false;
+static int g_raw_frame_w = 0;
+static int g_raw_frame_h = 0;
+
+// Reads the switch at most about once a second and updates the effective state.
+//
+// Called from the present path only while no worker exists, and from the worker
+// itself afterwards, so exactly one thread is doing the stat. The rate limit is
+// the whole point: a stat per frame would put a filesystem call into the present
+// path, and this mode is not allowed to cost anything there when it is off. A
+// missing file is a normal state, not an error - it is how the mode is switched
+// off - so it is reported only as the one transition line.
+static void raw_poll_toggle() {
+    // The first call is never rate limited. The clock the limit is measured
+    // against starts at load, so a plain comparison would skip the very first
+    // check - and that is the one that decides whether the mode was asked for at
+    // startup, which left DF_RAW_STREAM=1 doing nothing until the game happened to
+    // present a frame.
+    bool first_check = !g_raw_checked_once.exchange(true);
+    int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - g_raw_clock_start).count();
+    if (!first_check && now - g_raw_last_check_ms.load() < RAW_TOGGLE_CHECK_MS) return;
+    g_raw_last_check_ms.store(now);
+
+    bool want = g_raw_env_on || (access(RAW_TRIGGER_FILE, F_OK) == 0);
+    if (want == g_raw_on.load()) return;
+
+    g_raw_on.store(want);
+    if (!want) {
+        // Anything already staged is dropped. A frame captured seconds before the
+        // switch went off would otherwise be the first thing sent when it comes
+        // back on, which is exactly the kind of stale picture this mode is used to
+        // rule out.
+        std::lock_guard<std::mutex> lock(g_raw_frame_lock);
+        g_raw_frame_ready = false;
+    }
+    fprintf(stderr, "[RAW] raw pixel mode %s (source: %s)\n", want ? "enabled" : "disabled",
+            g_raw_env_on ? "DF_RAW_STREAM=1" : RAW_TRIGGER_FILE);
+    fflush(stderr);
+}
+
+// Render thread. Copies the frame that is about to be presented into the staging
+// buffer and returns; the encoding and the sending happen on the worker, because
+// a JPEG takes milliseconds and the game must not wait for it.
+static void raw_capture_frame(void* renderer) {
+    static std::chrono::steady_clock::time_point last_capture;
+    auto now = std::chrono::steady_clock::now();
+    if (last_capture.time_since_epoch().count() != 0 &&
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - last_capture).count() < RAW_MIN_CAPTURE_MS) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_raw_frame_lock);
+        if (g_raw_frame_ready) {
+            g_raw_dropped++;
+            return;
+        }
+    }
+
+    // Past this point g_raw_frame_ready is false, and only this thread ever sets
+    // it, so the worker cannot be looking at the staging buffer: filling it
+    // outside the lock is safe and keeps the lock hold time at zero.
+    last_capture = now;
+    int w = 0, h = 0;
+    if (!read_framebuffer_rgba(renderer, g_raw_staging, &w, &h)) return;
+
+    std::lock_guard<std::mutex> lock(g_raw_frame_lock);
+    g_raw_frame_w = w;
+    g_raw_frame_h = h;
+    g_raw_frame_ready = true;
+}
+
+// Connect to the raw server. Returns -1 and leaves nothing behind when the server
+// is not there; the caller retries. The connect is bounded by a poll rather than
+// left to the kernel: a blocking connect to a target that neither answers nor
+// refuses sits in SYN retries for over a minute, and the destructor joins this
+// thread, so an unreachable DF_RAW_TARGET would hold the game's shutdown open for
+// that long.
+static int raw_connect() {
+    char port[16];
+    snprintf(port, sizeof(port), "%u", g_raw_port);
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    struct addrinfo* res = nullptr;
+    if (getaddrinfo(g_raw_host, port, &hints, &res) != 0) return -1;
+
+    int fd = -1;
+    for (struct addrinfo* ai = res; ai != nullptr; ai = ai->ai_next) {
+        int s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (s < 0) continue;
+
+        int flags = fcntl(s, F_GETFL, 0);
+        if (flags < 0) { close(s); continue; }
+        fcntl(s, F_SETFL, flags | O_NONBLOCK);
+        bool ok = (connect(s, ai->ai_addr, ai->ai_addrlen) == 0);
+        if (!ok && errno == EINPROGRESS) {
+            struct pollfd pfd;
+            pfd.fd = s;
+            pfd.events = POLLOUT;
+            pfd.revents = 0;
+            if (poll(&pfd, 1, RAW_CONNECT_TIMEOUT_MS) > 0) {
+                int err = 0;
+                socklen_t elen = sizeof(err);
+                ok = (getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &elen) == 0 && err == 0);
+            }
+        }
+        if (!ok) { close(s); continue; }
+        fcntl(s, F_SETFL, flags);
+        fd = s;
+        break;
+    }
+    freeaddrinfo(res);
+    if (fd < 0) return -1;
+
+    // A frame is written as a length and then a payload. Waiting for Nagle to
+    // coalesce the two would add a round trip of delay to every single frame, so
+    // the small header goes out on its own.
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    // A peer that stops reading must not park this thread forever: a timeout turns
+    // that into a send failure, which tears the link down and reconnects.
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    return fd;
+}
+
+// Writing to a socket whose peer has gone away raises SIGPIPE, whose default action
+// is to kill the process - that would mean the game dying because the raw server
+// was restarted. MSG_NOSIGNAL asks for the error return instead.
+static bool raw_send_all(int fd, const uint8_t* p, size_t n) {
+    while (n > 0) {
+#ifdef MSG_NOSIGNAL
+        ssize_t k = send(fd, p, n, MSG_NOSIGNAL);
+#else
+        ssize_t k = send(fd, p, n, 0);
+#endif
+        if (k > 0) {
+            p += (size_t)k;
+            n -= (size_t)k;
+            continue;
+        }
+        if (k < 0 && errno == EINTR) continue;
+        return false;
+    }
+    return true;
+}
+
+// Read exactly n bytes, giving up when the connection has been declared finished.
+// The poll timeout is why a shutdown is noticed even on a socket that has gone
+// completely quiet: a bare recv would sit there until the peer closed.
+static bool raw_read_exact(int fd, uint8_t* dst, size_t n, const std::atomic<bool>* alive) {
+    size_t got = 0;
+    while (got < n) {
+        if (!alive->load() || g_raw_stop.load()) return false;
+        struct pollfd pfd;
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int pr = poll(&pfd, 1, 200);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (pr == 0) continue;
+        // Data first: a peer that sent its last message and then closed reports
+        // POLLIN together with POLLHUP, and treating the hangup as the answer
+        // would throw the final input away.
+        if (pfd.revents & POLLIN) {
+            ssize_t k = recv(fd, dst + got, n - got, 0);
+            if (k > 0) { got += (size_t)k; continue; }
+            if (k < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+            return false;
+        }
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return false;
+    }
+    return true;
+}
+
+// Input arrives on the same socket as the video. The payloads are byte for byte
+// what the WebRTC data channel already delivers, so they go through the same
+// handler: a second dispatch path would drift from the first, and an input bug
+// that only shows up in raw mode would be the hardest kind to find.
+static void raw_reader_loop(int fd, std::atomic<bool>* alive) {
+    uint8_t hdr[4];
+    while (alive->load() && !g_raw_stop.load()) {
+        if (!raw_read_exact(fd, hdr, sizeof(hdr), alive)) break;
+        uint32_t len = ((uint32_t)hdr[0] << 24) | ((uint32_t)hdr[1] << 16) |
+                       ((uint32_t)hdr[2] << 8) | (uint32_t)hdr[3];
+        if (len == 0 || len > RAW_INPUT_MAX) {
+            fprintf(stderr, "[RAW] input length %u out of range, dropping raw link\n", len);
+            fflush(stderr);
+            break;
+        }
+        std::vector<uint8_t> payload(len);
+        if (!raw_read_exact(fd, payload.data(), payload.size(), alive)) break;
+        handle_client_input_event(payload.data(), payload.size());
+    }
+
+    alive->store(false);
+    // Wake the sender: it may be parked in poll() or in a send() that will never
+    // finish, and the socket cannot be closed until it has stopped using it.
+    shutdown(fd, SHUT_RDWR);
+}
+
+enum class RawSendResult { Idle, Sent, Dead };
+
+// Worker side. Takes the staged frame if there is one and writes it as one frame
+// message. Returns Dead only when the socket is finished with; a frame that was
+// dropped or refused is not an error.
+static RawSendResult raw_send_staged(int fd, std::vector<uint8_t>& jpeg) {
+    jpeg.clear();
+
+    int w = 0, h = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_raw_frame_lock);
+        if (!g_raw_frame_ready) return RawSendResult::Idle;
+        // Swap rather than copy: the render thread gets the previous scratch
+        // buffer back and can start on the next frame while this one is encoded.
+        g_raw_staging.swap(g_raw_worker);
+        w = g_raw_frame_w;
+        h = g_raw_frame_h;
+        g_raw_frame_ready = false;
+    }
+
+    if (w <= 0 || h <= 0 || g_raw_worker.size() < (size_t)w * (size_t)h * 4) return RawSendResult::Idle;
+
+    // The payload carries a one-byte codec tag. The receiving end would
+    // otherwise have to sniff the bytes to tell a JPEG from a PNG, and sniffing
+    // is exactly the kind of guess that turns into a blank screen with no error.
+    bool lossless = raw_lossless_on();
+    auto t0 = std::chrono::steady_clock::now();
+    bool ok;
+    if (lossless) {
+        jpeg.clear();
+        jpeg.push_back(RAW_CODEC_PNG);
+        ok = raw_png_encode(g_raw_worker.data(), w, h, RAW_PNG_LEVEL, jpeg);
+    } else {
+        ok = raw_jpeg_encode(g_raw_worker.data(), w, h, RAW_JPEG_QUALITY, jpeg);
+        if (ok) jpeg.insert(jpeg.begin(), RAW_CODEC_JPEG);   // the encoder replaces the buffer
+    }
+    g_raw_encode_us += (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    if (!ok || jpeg.size() <= 1) {
+        g_raw_dropped++;
+        return RawSendResult::Idle;
+    }
+
+    uint32_t len = (uint32_t)jpeg.size();
+    uint8_t hdr[4] = {(uint8_t)(len >> 24), (uint8_t)(len >> 16), (uint8_t)(len >> 8), (uint8_t)len};
+    if (!raw_send_all(fd, hdr, sizeof(hdr)) || !raw_send_all(fd, jpeg.data(), jpeg.size())) {
+        return RawSendResult::Dead;
+    }
+
+    g_raw_sent++;
+    g_raw_bytes += len;
+    return RawSendResult::Sent;
+}
+
+// One owner for the connection: connect, then run the encoder while a reader
+// thread handles input on the same socket. Two threads cannot both be responsible
+// for reconnecting, and the socket is only closed after the reader has been joined,
+// so neither can end up using a descriptor that has been recycled for something
+// else. Nothing here can block the game - every failure is a dropped frame and a
+// retry.
+static void raw_link_loop() {
+    std::vector<uint8_t> jpeg;
+    while (!g_raw_stop.load()) {
+        // Once this thread exists it owns the switch check, so the present path
+        // goes back to a single atomic load. This thread is idle most of the time
+        // and the check is rate limited, so it costs nothing here.
+        raw_poll_toggle();
+        if (!g_raw_on.load()) {
+            // Switched off while running. The thread stays alive so the switch can
+            // be flipped back without restarting the game, but it stops dialling
+            // and stops encoding: an off baseline has to be indistinguishable from
+            // the interposer that has no raw mode at all.
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
+        }
+
+        int fd = raw_connect();
+        if (fd < 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(RAW_RETRY_MS));
+            continue;
+        }
+
+        g_raw_connected.store(1);
+        fprintf(stderr, "[RAW] connected to %s:%u\n", g_raw_host, g_raw_port);
+        fflush(stderr);
+
+        std::atomic<bool> alive{true};
+        std::thread reader;
+        try {
+            reader = std::thread(raw_reader_loop, fd, &alive);
+        } catch (const std::exception& ex) {
+            fprintf(stderr, "[RAW] reader thread failed to start: %s\n", ex.what());
+            fflush(stderr);
+            close(fd);
+            g_raw_connected.store(0);
+            std::this_thread::sleep_for(std::chrono::milliseconds(RAW_RETRY_MS));
+            continue;
+        }
+
+        while (alive.load() && !g_raw_stop.load() && g_raw_on.load()) {
+            // Checked here as well as at the top of the outer loop, because the
+            // switch has to be noticed while a connection is up - that is the
+            // whole point of switching at runtime. Without this the worker sat in
+            // its send loop and removing the file only took effect after the link
+            // happened to drop. The check rate limits itself, so a loop that runs
+            // every couple of milliseconds pays one atomic load per pass.
+            raw_poll_toggle();
+            RawSendResult r = raw_send_staged(fd, jpeg);
+            if (r == RawSendResult::Dead) {
+                alive.store(false);
+                break;
+            }
+            if (r == RawSendResult::Idle) {
+                // Nothing staged. Sleeping instead of spinning costs at most a
+                // couple of milliseconds on the first frame of a fresh capture,
+                // and the capture side caps itself at one frame per
+                // RAW_MIN_CAPTURE_MS anyway.
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        }
+
+        alive.store(false);
+        shutdown(fd, SHUT_RDWR);
+        if (reader.joinable()) reader.join();
+        close(fd);
+        g_raw_connected.store(0);
+
+        // Only a genuine drop is reported as one. Saying "link down, retrying"
+        // when the mode was simply switched off would send the next person
+        // looking for a broken connection that never existed.
+        if (!g_raw_stop.load() && g_raw_on.load()) {
+            fprintf(stderr, "[RAW] link down, retrying in %dms\n", RAW_RETRY_MS);
+            fflush(stderr);
+            std::this_thread::sleep_for(std::chrono::milliseconds(RAW_RETRY_MS));
+        }
+    }
+}
+
+// The worker only exists once the mode is actually on - started at load when the
+// switch is already on, or on the first transition to on afterwards. While the mode
+// is off the process has to have exactly the threads it had before this was added,
+// so there is nothing to start and nothing to stop.
+static void raw_start_worker() {
+    g_raw_watcher.store(true);
+    try {
+        g_raw_thread = std::thread(raw_link_loop);
+    } catch (const std::exception& ex) {
+        // Leave the mode off rather than half on: a capture that nothing ever
+        // encodes would only spend the render thread's time. The next tick tries
+        // again, and the message is printed once so a failing start cannot fill
+        // the log a line per second.
+        g_raw_watcher.store(false);
+        g_raw_on.store(false);
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            fprintf(stderr, "[RAW] worker thread failed to start: %s\n", ex.what());
+            fflush(stderr);
+        }
+        return;
+    }
+    fprintf(stderr, "[RAW] worker started, target %s:%u, quality %d\n",
+            g_raw_host, g_raw_port, RAW_JPEG_QUALITY);
+    fflush(stderr);
+}
+
+// Render-thread side of the switch. On a disabled interposer this is an atomic
+// load plus, at most once a second, one stat - nothing else happens. The stat only
+// runs while no worker exists: once there is one, this thread goes back to reading
+// a flag, and the frame is only read back when the mode is on.
+static void raw_present_tick(void* renderer) {
+    if (!g_raw_watcher.load()) {
+        raw_poll_toggle();
+        if (g_raw_on.load() && !g_raw_watcher.load()) raw_start_worker();
+    }
+    // Reads the frame that is about to be presented, because that is the one the
+    // client would be looking at.
+    if (g_raw_on.load()) raw_capture_frame(renderer);
+}
+
+// Called once from the interposer constructor. Nothing here starts a thread or
+// opens a socket unless the mode is already on at startup; otherwise the present
+// path picks the switch up within a second of the file appearing.
+static void raw_init() {
+    const char* env = getenv("DF_RAW_STREAM");
+    { const char* l = getenv("DF_RAW_LOSSLESS"); g_raw_lossless_env = (l && l[0] == '1'); }
+    g_raw_env_on = (env && atoi(env) == 1);
+
+    // Parsed even while off, so a target that is going to be used later is already
+    // known: reading two environment variables once at load costs nothing.
+    const char* target = getenv("DF_RAW_TARGET");
+    std::string t = (target && *target) ? target : RAW_DEFAULT_TARGET;
+    size_t colon = t.rfind(':');
+    if (colon != std::string::npos && colon > 0 && colon + 1 < t.size()) {
+        snprintf(g_raw_host, sizeof(g_raw_host), "%s", t.substr(0, colon).c_str());
+        g_raw_port = (unsigned)atoi(t.c_str() + colon + 1);
+    } else {
+        fprintf(stderr, "[RAW] DF_RAW_TARGET '%s' is not host:port, using %s\n", t.c_str(), RAW_DEFAULT_TARGET);
+        fflush(stderr);
+    }
+
+    g_raw_clock_start = std::chrono::steady_clock::now();
+    // Prints the one transition that can happen at load, and nothing at all when
+    // there is neither the environment variable nor the file.
+    raw_poll_toggle();
+    if (g_raw_on.load()) raw_start_worker();
 }
 
 extern "C" {
@@ -1719,27 +2482,29 @@ void SDL_RenderPresent(void* renderer) {
 
     // On-demand snapshot trigger for QA parity suite.
     //
-    // The size is asked of the renderer rather than taken from the tracked
-    // window size: the game resizes its window, and reading with a pitch that
-    // does not match the target makes SDL refuse, which is why this produced no
-    // file at all and left the parity suite with no ground truth.
-    if (access("/tmp/df_snap_trigger", F_OK) == 0 && real_SDL_RenderReadPixels) {
+    // The readback itself lives in read_framebuffer_rgba, shared with the raw
+    // pixel mode: the size is asked of the renderer rather than taken from the
+    // tracked window size, because the game resizes its window and reading with a
+    // pitch that does not match the target makes SDL refuse, which is why this
+    // produced no file at all and left the parity suite with no ground truth.
+    if (access("/tmp/df_snap_trigger", F_OK) == 0) {
         unlink("/tmp/df_snap_trigger");
-        int ow = g_current_w, oh = g_current_h;
-        if (real_SDL_GetRendererOutputSize) real_SDL_GetRendererOutputSize(renderer, &ow, &oh);
-        if (ow > 0 && oh > 0) {
-            std::vector<uint8_t> snap_pixel_buf((size_t)ow * (size_t)oh * 4);
-            if (real_SDL_RenderReadPixels(renderer, nullptr, 376840196 /* SDL_PIXELFORMAT_ABGR8888 -> RGBA */, snap_pixel_buf.data(), ow * 4) == 0) {
-                FILE* fp = fopen("/tmp/df_snap_host.raw", "wb");
-                if (fp) {
-                    fwrite(snap_pixel_buf.data(), 1, snap_pixel_buf.size(), fp);
-                    fclose(fp);
-                    FILE* mp = fopen("/tmp/df_snap_host.meta", "w");
-                    if (mp) { fprintf(mp, "%d %d\n", ow, oh); fclose(mp); }
-                }
+        std::vector<uint8_t> snap_pixel_buf;
+        int ow = 0, oh = 0;
+        if (read_framebuffer_rgba(renderer, snap_pixel_buf, &ow, &oh)) {
+            FILE* fp = fopen("/tmp/df_snap_host.raw", "wb");
+            if (fp) {
+                fwrite(snap_pixel_buf.data(), 1, snap_pixel_buf.size(), fp);
+                fclose(fp);
+                FILE* mp = fopen("/tmp/df_snap_host.meta", "w");
+                if (mp) { fprintf(mp, "%d %d\n", ow, oh); fclose(mp); }
             }
         }
     }
+
+    // Raw pixel mode, when it was asked for. Almost always this is an atomic load
+    // and a return, so the disabled interposer behaves exactly as it did before.
+    raw_present_tick(renderer);
 
     bool has_receivers = (g_server && g_server->active_ws_clients() > 0);
     if (!has_receivers) {
@@ -1821,6 +2586,8 @@ void SDL_RenderPresent(void* renderer) {
                         g_queue_at_send.push_back((int64_t)dc->bufferedAmount());
                         if (g_queue_at_send.size() > 900) g_queue_at_send.erase(g_queue_at_send.begin(), g_queue_at_send.begin() + 300);
                         dc->send((const std::byte*)frame_packet.data(), frame_packet.size());
+                        g_wire_bytes += frame_packet.size();
+                        g_wire_frames++;
                     }
                 }
                 // Sequence numbers are consumed only by frames that were actually
@@ -1863,7 +2630,12 @@ void SDL_RenderPresent(void* renderer) {
                     s95 = (double)v[(size_t)std::min(v.size() - 1, (size_t)(v.size() * 0.95))];
                     smax = (double)v.back();
                 }
-                fprintf(stderr, "[FRAME_STATS] sent=%llu silent=%llu full=%llu delta=%llu avg_full=%lluB avg_delta=%lluB enc_calls=%llu enc_p50=%.0fus enc_p95=%.0fus enc_max=%.0fus STAMP_n=%llu STAMP_p50=%.0fms STAMP_p95=%.0fms STAMP_max=%.0fms QUEUE_p50=%lld QUEUE_p95=%lld QUEUE_max=%lld TEX_n=%llu TEX_kb=%llu KA=%llu SKIP_n=%llu TEXQ_defer=%llu TEXQ_req=%llu TEXQ_resume=%llu TEXQ_pend=%u TEXQ_qmax=%lld TEX_ids=%u TEX_recycled=%llu TEX_kbheld=%llu DRAW_unknown=%llu DRAW_nopixels=%llu\n",
+                // The RAW_ fields are dormant unless DF_RAW_STREAM=1: RAW_on says
+                // whether the mode was asked for, RAW_conn whether the raw server
+                // is currently connected, and RAW_enc_us is the mean JPEG encode
+                // time per sent frame - the number that decides whether the 12ms
+                // capture cap is doing anything useful.
+                fprintf(stderr, "[FRAME_STATS] sent=%llu silent=%llu full=%llu delta=%llu avg_full=%lluB avg_delta=%lluB enc_calls=%llu enc_p50=%.0fus enc_p95=%.0fus enc_max=%.0fus STAMP_n=%llu STAMP_p50=%.0fms STAMP_p95=%.0fms STAMP_max=%.0fms QUEUE_p50=%lld QUEUE_p95=%lld QUEUE_max=%lld WIRE_kb=%llu WIRE_frames=%llu TEX_n=%llu TEX_kb=%llu TEX_new=%llu TEX_repeat=%llu DUMP_n=%llu DUMP_kb=%llu KA=%llu SKIP_n=%llu TEXQ_defer=%llu TEXQ_req=%llu TEXQ_resume=%llu TEXQ_pend=%u TEXQ_qmax=%lld TEX_ids=%u TEX_recycled=%llu TEX_kbheld=%llu DRAW_unknown=%llu DRAW_nopixels=%llu RAW_on=%d RAW_sent=%llu RAW_drop=%llu RAW_kb=%llu RAW_enc_us=%llu RAW_conn=%d\n",
                         (unsigned long long)g_sent_seq,
                         (unsigned long long)s.stat_nothing,
                         (unsigned long long)s.stat_full,
@@ -1874,7 +2646,10 @@ void SDL_RenderPresent(void* renderer) {
                         e50, e95, emax,
                         (unsigned long long)g_stamp_seen, s50, s95, smax,
                         (long long)q50, (long long)q95, (long long)qmax,
+                        (unsigned long long)(g_wire_bytes / 1024), (unsigned long long)g_wire_frames,
                         (unsigned long long)g_tex_count, (unsigned long long)(g_tex_bytes / 1024),
+                        (unsigned long long)g_tex_new, (unsigned long long)g_tex_repeat,
+                        (unsigned long long)g_tex_dump_count, (unsigned long long)(g_tex_dump_bytes / 1024),
                         (unsigned long long)g_keepalive_sent,
                         (unsigned long long)g_frames_skipped,
                         (unsigned long long)g_tex_deferred, (unsigned long long)g_tex_requested,
@@ -1885,7 +2660,13 @@ void SDL_RenderPresent(void* renderer) {
                         (unsigned long long)g_tex_recycled,
                         (unsigned long long)(g_cached_bytes / 1024),
                         (unsigned long long)g_draw_unknown,
-                        (unsigned long long)g_draw_nopixels);
+                        (unsigned long long)g_draw_nopixels,
+                        (int)(g_raw_on.load() ? 1 : 0),
+                        (unsigned long long)g_raw_sent.load(),
+                        (unsigned long long)g_raw_dropped.load(),
+                        (unsigned long long)(g_raw_bytes.load() / 1024),
+                        (unsigned long long)(g_raw_sent.load() ? g_raw_encode_us.load() / g_raw_sent.load() : 0),
+                        (int)g_raw_connected.load());
                 fflush(stderr);
             }
         }
@@ -1910,10 +2691,17 @@ static void init_interposer() {
     std::string root = r_str ? r_str : "/tmp/remote-df/client";
     g_server = new EmbeddedServer();
     g_server->start(port, root);
+    // Started last, so the raw mode is never the reason a stream fails to come up.
+    raw_init();
 }
 
 __attribute__((destructor))
 static void cleanup_interposer() {
+    // Stop the raw worker and wait for it before the globals it reads go away.
+    // Without this the thread could be inside the input handler while the process
+    // is tearing down the state that handler uses.
+    g_raw_stop.store(true);
+    if (g_raw_thread.joinable()) g_raw_thread.join();
     if (g_server) { g_server->stop(); delete g_server; g_server = nullptr; }
 }
 

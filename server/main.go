@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/cyclone1070/remote-df/server/features/config"
 	"github.com/cyclone1070/remote-df/server/features/games"
+	"github.com/cyclone1070/remote-df/server/features/raw"
 	"github.com/cyclone1070/remote-df/server/features/session"
 	"github.com/cyclone1070/remote-df/server/infrastructure/web"
 )
@@ -61,6 +63,9 @@ func main() {
 	port := flag.Int("port", getEnvInt("PORT", 8484), "Public HTTP/WS server port")
 	streamPort := flag.Int("stream-port", getEnvInt("STREAM_PORT", 8485), "Internal game stream port")
 	headless := flag.Bool("headless", getEnvBool("HEADLESS", false), "Run as pure headless API server (no UI routes)")
+	rawEnabled := flag.Bool("raw", getEnvBool("DF_RAW", false), "Enable the raw pixel baseline listeners (MJPEG + interposer link)")
+	rawPort := flag.Int("raw-port", getEnvInt("RAW_PORT", 8490), "Raw pixel baseline HTTP/WS port")
+	rawLinkPort := flag.Int("raw-link-port", getEnvInt("RAW_LINK_PORT", 8491), "Raw pixel baseline interposer link port (localhost only)")
 	flag.Parse()
 
 	log.Printf("Starting Remote-DF Server on :%d (headless: %v)...", *port, *headless)
@@ -102,6 +107,45 @@ func main() {
 		Handler: mux,
 	}
 
+	// Raw pixel baseline: a separate, opt-in listener pair that streams whole
+	// JPEG frames instead of draw commands. It has its own mux on its own port,
+	// so the routes above are untouched, and it stays off unless DF_RAW=1.
+	var rawServer *http.Server
+	var rawLink *raw.LinkServer
+
+	if *rawEnabled {
+		frameHolder := raw.NewFrameHolder()
+		rawLink = raw.NewLinkServer(frameHolder)
+
+		rawLinkListener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", *rawLinkPort))
+		if err != nil {
+			// The baseline is a diagnostic. It must never take the main server
+			// down with it, so a port clash is reported and skipped.
+			log.Printf("Raw baseline disabled: cannot listen on 127.0.0.1:%d: %v", *rawLinkPort, err)
+		} else {
+			go func() {
+				if err := rawLink.Serve(rawLinkListener); err != nil {
+					log.Printf("Raw baseline link stopped: %v", err)
+				}
+			}()
+		}
+
+		rawMux := http.NewServeMux()
+		raw.NewRawController(frameHolder, rawLink).RegisterRoutes(rawMux)
+		rawServer = &http.Server{
+			Addr:    fmt.Sprintf(":%d", *rawPort),
+			Handler: rawMux,
+		}
+
+		go func() {
+			if err := rawServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("Raw baseline server stopped: %v", err)
+			}
+		}()
+
+		log.Printf("Raw pixel baseline on :%d (interposer link 127.0.0.1:%d)", *rawPort, *rawLinkPort)
+	}
+
 	// Graceful shutdown handling
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
@@ -120,6 +164,15 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+
+	if rawServer != nil {
+		if err := rawServer.Shutdown(ctx); err != nil {
+			log.Printf("Raw baseline forced shutdown error: %v", err)
+		}
+	}
+	if rawLink != nil {
+		_ = rawLink.Close()
+	}
 
 	if err := server.Shutdown(ctx); err != nil {
 		log.Printf("Server forced shutdown error: %v", err)

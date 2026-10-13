@@ -197,3 +197,49 @@ describe('Atlas reclaim', () => {
         assert.equal(r.textures.has(3), true);
     });
 });
+
+// The compressed picture path: the interposer sends 'D','Z' with zstd'd RGBA and
+// the client has to notice the tag and hand back the same pixels. Getting the tag
+// wrong is the failure that matters, because misreading a compressed picture as
+// plain RGBA uploads noise into the texture cache and the client then draws it.
+describe('Compressed texture chunks', () => {
+    function makeCompressedChunk({ texId, w, h, compressedLen, chunkIndex, chunkCount, payload }) {
+        const buf = new ArrayBuffer(16 + payload.length);
+        const view = new DataView(buf);
+        view.setUint8(0, 0x44);      // 'D'
+        view.setUint8(1, 0x5a);      // 'Z'
+        view.setUint16(2, texId, true);
+        view.setUint16(4, w, true);
+        view.setUint16(6, h, true);
+        view.setUint32(8, compressedLen, true);
+        view.setUint16(12, chunkIndex, true);
+        view.setUint16(14, chunkCount, true);
+        new Uint8Array(buf, 16).set(payload);
+        return buf;
+    }
+
+    it('flags a compressed chunk and reports the on-wire length', () => {
+        const payload = Uint8Array.from([9, 8, 7]);
+        const buf = makeCompressedChunk({ texId: 3, w: 4, h: 4, compressedLen: 3, chunkIndex: 0, chunkCount: 1, payload });
+        const c = DFProtocol.decodeTexture(buf);
+
+        assert.equal(c.texId, 3);
+        assert.equal(c.compressed, true);
+        assert.equal(c.totalLen, 3, 'totalLen is the compressed length, not w*h*4');
+        assert.deepEqual([...c.data], [9, 8, 7]);
+    });
+
+    it('still reports a plain chunk as uncompressed', () => {
+        const payload = Uint8Array.from([1, 2, 3, 4]);
+        const buf = makeChunk({ texId: 1, w: 1, h: 1, totalLen: 4, chunkIndex: 0, chunkCount: 1, payload });
+        assert.equal(DFProtocol.decodeTexture(buf).compressed, false);
+    });
+
+    it('rejects a message with neither tag', () => {
+        const buf = new ArrayBuffer(20);
+        const view = new DataView(buf);
+        view.setUint8(0, 0x44);
+        view.setUint8(1, 0x58);  // 'X'
+        assert.equal(DFProtocol.decodeTexture(buf), null);
+    });
+});
