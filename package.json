@@ -8,7 +8,12 @@
     "test": "tests"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "sh tests/tier1-unit/run.sh && node --test tests/tier2-contract/*.mjs",
+    "test:unit": "sh tests/tier1-unit/run.sh",
+    "test:contract": "node --test tests/tier2-contract/*.mjs",
+    "test:integration": "node tests/tier3-integration/run.mjs",
+    "test:diagnose": "node tests/diagnostics/full-state.mjs",
+    "gate": "npm test && npm run test:integration"
   },
   "repository": {
     "type": "git",

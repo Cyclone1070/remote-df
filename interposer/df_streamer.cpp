@@ -14,7 +14,6 @@
 #include <sys/stat.h>
 #include <zstd.h>
 #include <execinfo.h>
-#include <unordered_map>
 #include <algorithm>
 #include <memory>
 #include <variant>
@@ -36,6 +35,8 @@
 #include <fcntl.h>
 #include <errno.h>
 
+#include "stamp_slot.hpp"
+#include "wire_log.hpp"
 #include "ws_server.hpp"
 #include "texture_queue.hpp"
 #include "raw_jpeg.hpp"
@@ -267,11 +268,6 @@ static std::mutex g_tex_lock;
 static DrawCommand g_frame_cmds[MAX_DRAW_COMMANDS];
 static uint16_t g_frame_cmd_count = 0;
 
-// Set by the present handler; read inside the encoder so a keepalive can
-// bypass the silence rule. Declared here because the encoder is defined above
-// the present handler.
-static bool g_keepalive_due = false;
-
 struct FrameSnapshot {
     uint32_t seq = 0;
     uint16_t cmd_count = 0;
@@ -279,6 +275,22 @@ struct FrameSnapshot {
 };
 
 enum class EncodeResult { Nothing, Delta, Full };
+
+// Proof or refutation of the "nothing changed" decision.
+//
+// The encoder decides a frame is a no-op by comparing draw-command lists. That is
+// a claim about what is on screen and it can be checked: sample the framebuffer
+// at the moment the claim is made and compare it with the last frame actually
+// sent. If the pixels differ while the commands do not, the claim is wrong, and
+// the display is frozen by a comparison that cannot see the change.
+static std::atomic<uint64_t> g_nothing_pixels_same{0};
+static std::atomic<uint64_t> g_nothing_pixels_changed{0};
+static uint64_t g_last_sent_pixel_hash = 0;
+static bool g_last_sent_pixel_hash_valid = false;
+// Set by the present hook, which is the only place holding the renderer.
+static void* g_probe_renderer = nullptr;
+
+extern "C" { static bool sample_pixel_hash(void* renderer, uint64_t& out); }
 
 class DeltaEncoder {
 public:
@@ -376,8 +388,17 @@ public:
         // A requested bridge is never suppressed - that packet is what advances
         // a client that is parked on an older sequence.
         if (!force_keyframe && !is_combined && base_count > 0 &&
-            curr_count == base_count && num_updates == 0 && !g_keepalive_due) {
+            curr_count == base_count && num_updates == 0) {
             stat_nothing++;
+            // The commands are identical. Did the picture change anyway?
+            uint64_t now_hash = 0;
+            if (sample_pixel_hash(g_probe_renderer, now_hash)) {
+                if (g_last_sent_pixel_hash_valid && now_hash != g_last_sent_pixel_hash) {
+                    g_nothing_pixels_changed.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    g_nothing_pixels_same.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
             return EncodeResult::Nothing;
         }
 
@@ -492,6 +513,7 @@ public:
     }
 };
 
+
 static DeltaEncoder g_delta_encoder;
 // Render-tick counter: advances on every present, used to name recorded frames.
 static uint32_t g_frame_seq = 0;
@@ -543,6 +565,50 @@ static uint32_t g_df_window_id = 1;
 static void* g_df_window = nullptr;
 static int g_current_w = 1280;
 static int g_current_h = 720;
+// The newest pointer position that has not been handed to the game yet.
+//
+// Mouse movement arrives as absolute positions, one message per movement, and a
+// frozen game cannot drain them as fast as they arrive. Queued, they are a
+// recording: when the game recovers it walks through every position the pointer
+// passed through, which to the player is the camera panning on its own in
+// directions they never dragged. Only the newest position is news - the older
+// ones describe a pointer that has already moved on - so one is kept and the rest
+// are superseded. Coalescing this way cannot lose the current position, which is
+// the only one that matters, and it bounds the work to one event per poll however
+// long the game was away.
+static std::atomic<bool> g_motion_pending{false};
+static std::atomic<int>  g_motion_x{0};
+static std::atomic<int>  g_motion_y{0};
+static std::atomic<int>  g_motion_state{0};
+// The longest single blocking send and the longest present, in microseconds.
+//
+// A stalled display looks the same whether the game stopped drawing or the socket
+// stopped accepting, and those two need opposite repairs. These are maxima rather
+// than averages on purpose: a stream that is healthy 95% of the time and wedges
+// for eight seconds is exactly the case an average hides.
+static std::atomic<uint64_t> g_presents{0};
+static std::atomic<uint64_t> g_presents_silent{0};
+// Why a present produced no frame: no draw commands captured at all, or the
+// encoder found nothing changed. They are different faults with the same symptom.
+static std::atomic<uint64_t> g_presents_nocmd{0};
+// What the game pays for being recorded. The draw hook runs once per sprite per
+// present, so a microsecond here is a second per frame at these call counts.
+static std::atomic<uint64_t> g_hook_ns{0};
+static std::atomic<uint64_t> g_hook_calls{0};
+// Time the game is stuck inside the present hook: delta encoding, the send, and
+// any socket wait. This is the number that says whether the interposer is what
+// makes the game slow, and it has been declared-but-never-written for a while.
+static std::atomic<uint64_t> g_present_us_total{0};
+static std::atomic<uint64_t> g_present_us_max{0};
+static std::atomic<uint64_t> g_present_count{0};
+// Input pipeline, end to end: messages off the wire, motion events handed to the
+// game, and motion the game actually drained. A camera that will not move is
+// either not being told to, or not asking.
+static std::atomic<uint64_t> g_input_msgs{0};
+static std::atomic<uint64_t> g_motion_delivered{0};
+static std::atomic<uint64_t> g_motion_superseded{0};
+static std::atomic<int64_t> g_send_block_max_us{0};
+static std::atomic<int64_t> g_present_max_us{0};
 static std::atomic<int> g_pending_resize_w{0};
 static std::atomic<int> g_pending_resize_h{0};
 static void* real_SDL_CreateWindow = nullptr;
@@ -635,20 +701,33 @@ extern "C" void _ZN15enabler_inputst9add_inputER9SDL_Eventj(void* self, void* ev
     }
 }
 
-static uint8_t g_current_client_stamp = 0;
-static bool g_has_client_stamp = false;
-static std::chrono::steady_clock::time_point g_client_stamp_time;
+// The client-input stamp slot. The rule that decides whether an input was
+// answered lives in interposer/stamp_slot.hpp, where it is unit tested without
+// the interposer's dependencies (tests/stamp_slot_test.cpp) - a rule this
+// central is not allowed to exist only as inline code in a 3000-line file.
+static stamp_slot::State g_stamp_slot;
 
 // A stamp only describes latency while the input that produced it is still
-// recent. Frames are now emitted only when the scene actually changes, so a
-// stamp from an input that changed nothing would otherwise ride along on some
-// unrelated later frame and report seconds of latency that never happened.
-static const int64_t g_stamp_max_age_ms = 200;
+// recent. Frames are emitted only when the scene changes, so a stamp from an
+// input that changed nothing would otherwise ride along on some unrelated later
+// frame and report a latency that never happened.
+//
+// Long rather than short, deliberately. A cap tight enough to catch that would
+// also discard every genuinely slow answer, and a bench that throws away its
+// slowest samples reports a latency better than the one the player gets. What it
+// has to exclude is a stamp that has outlived its input by so long that no frame
+// could still be answering it; a second is well past that, and the count of
+// expired stamps is reported so a run where this decides anything is visible.
+static const int64_t g_stamp_max_age_ms = 1000;
 // Age of an input stamp when the frame carrying it actually went out. This is
 // the server-side share of felt latency: input received -> changed frame sent.
 static std::vector<int64_t> g_stamp_ages_ms;
+// Frames that really carried a stamp and went out on the draw-command path.
+// This is the draw-command path's own count of answered inputs; the raw path
+// keeps its own (g_raw_stamp_answered), and the input-side totals - received,
+// overwritten, expired, deferred - live in the stamp slot itself, where the rule
+// that decides them is unit tested.
 static uint64_t g_stamp_seen = 0;
-static bool g_stamp_pending = false;
 // Bytes still queued in the SCTP send buffer at the moment a frame is handed to
 // it. Distinguishes "our queue is backed up" from "we handed it over instantly
 // and the network took the time" -- different root causes, different fixes.
@@ -677,28 +756,28 @@ static uint64_t g_wire_frames = 0;
 // the stream, which shows up as a correct-looking frame with something missing.
 static uint64_t g_draw_unknown = 0;
 static uint64_t g_draw_nopixels = 0;
-// Frames the backpressure guard refused to send. Texture chunks have no such
-// guard, so when a zoom makes the game re-rasterise its whole sprite set the
-// send queue fills with pictures and frames are dropped behind them. That is a
-// freeze the client cannot report, because it never receives the frame. Counting
-// it here is the only place it is visible.
-static uint64_t g_frames_skipped = 0;
 static uint64_t g_tex_bytes = 0;
-// Cold-path keepalive. Suppressing silent frames cut traffic to ~1-3 packets/s,
-// and a packet sent onto an idle path pays a delay penalty (measured: transport
-// p95 150ms vs the baseline's 86ms with an EMPTY send queue, so the cost is not
-// local buffering). The baseline's continuous 50/s stream was quietly keeping
-// the path warm. Emitting a content-free delta when the link has been idle
-// tests that directly: if the tail closes, the cause is idleness, not volume.
-static uint64_t g_keepalive_sent = 0;
-static std::chrono::steady_clock::time_point g_last_send_time;
-static bool g_sent_any = false;
-static std::chrono::steady_clock::time_point g_stamp_pending_time;
-
 static int64_t steady_now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+
+// Every message this process handed to a link, with the send-queue depth at that
+// moment and, for a raw capture, what the encode cost. Kept here rather than
+// derived from the counters because a spike needs the message that caused it,
+// not a session total - and because the previous attempt at this recorded only
+// frames and pings, which on this link is 1% of the traffic.
+static wire_log::Log g_wire_log;
+
+// The host's wall clock, for lining these events up with the page's timeline.
+// The page and the host are different machines, so the bench estimates the
+// offset from a round trip (see clockAlign in measure.js) rather than assuming
+// the two clocks agree.
+static int64_t epoch_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
 static std::mutex g_btn_sync_lock;
 static bool g_in_poll_pass = false;
 static bool g_btn_down_in_pass[8] = {false};
@@ -843,7 +922,25 @@ extern "C" int SDL_PollEvent(void* event) {
         }
     }
 
-    // 2. Poll real SDL
+    // 2. Hand over the newest pointer position, if one is waiting.
+    //
+    // Before polling SDL, so it is delivered with the same responsiveness as any
+    // other event, and after the held button events, so pressing and releasing
+    // still take priority over where the pointer has got to.
+    if (g_motion_pending.exchange(false, std::memory_order_acquire)) {
+        SDL2_Event m_ev;
+        memset(&m_ev, 0, sizeof(m_ev));
+        m_ev.motion.type = 0x400; // SDL_MOUSEMOTION
+        m_ev.motion.windowID = g_df_window_id;
+        m_ev.motion.state = g_motion_state.load(std::memory_order_relaxed);
+        m_ev.motion.x = g_motion_x.load(std::memory_order_relaxed);
+        m_ev.motion.y = g_motion_y.load(std::memory_order_relaxed);
+        if (event) memcpy(event, &m_ev, sizeof(SDL2_Event));
+        g_motion_delivered.fetch_add(1, std::memory_order_relaxed);
+        return 1;
+    }
+
+    // 3. Poll real SDL
     SDL2_Event cur;
     while (real_SDL_PollEvent && real_SDL_PollEvent(&cur)) {
         if (cur.type == 0x401) { // SDL_MOUSEBUTTONDOWN
@@ -890,7 +987,8 @@ extern "C" int SDL_PollEvent(void* event) {
 
 // Handle client input directly in memory
 // Defined below, next to the texture send path it depends on.
-static void resend_missing_textures(uint32_t seq, const std::vector<uint16_t>& requested);
+static void resend_missing_textures(uint32_t seq, const std::vector<uint16_t>& requested,
+                                   const std::vector<uint32_t>& requested_chunks);
 
 void handle_client_input_event(const uint8_t* data, size_t len) {
     if (len >= 5 && data[0] == 7) { // GAP_ACK / COMBINED_DELTA_REQ
@@ -918,17 +1016,38 @@ void handle_client_input_event(const uint8_t* data, size_t len) {
             want_count = 0;
         }
 
-        fprintf(stderr, "[ASSET_BRIDGE] Request for seq %u, client wants %u asset(s)\n", seq, want_count);
+        // The client may append one chunk index per picture, naming the chunk it
+        // is actually waiting for. Optional: a client that does not send them
+        // gets the old behaviour, so the two halves can be deployed separately.
+        std::vector<uint32_t> wanted_chunks;
+        const size_t chunk_off = static_cast<size_t>(7) + static_cast<size_t>(want_count) * sizeof(uint16_t);
+        if (want_count > 0 &&
+            len >= chunk_off + static_cast<size_t>(want_count) * sizeof(uint16_t)) {
+            wanted_chunks.resize(want_count);
+            for (uint16_t i = 0; i < want_count; i++) {
+                uint16_t c = 0;
+                memcpy(&c, data + chunk_off + static_cast<size_t>(i) * sizeof(uint16_t), sizeof(uint16_t));
+                wanted_chunks[i] = c;
+            }
+        }
+
+        fprintf(stderr, "[ASSET_BRIDGE] Request for seq %u, client wants %u asset(s)%s",
+                seq, want_count, wanted_chunks.empty() ? "" : " (with chunk hints)");
+        fprintf(stderr, "\n");
         fflush(stderr);
-        resend_missing_textures(seq, wanted);
+        resend_missing_textures(seq, wanted, wanted_chunks);
         return;
     }
     if (len < sizeof(InputEvent)) return;
     const InputEvent* ev = (const InputEvent*)data;
     if (len >= 17 && data[16] != 0) {
-        g_current_client_stamp = data[16];
-        g_has_client_stamp = true;
-        g_client_stamp_time = std::chrono::steady_clock::now();
+        // One slot, deliberately: the stamp describes the newest input waiting
+        // for a frame, and a frame can only answer the input it was drawn for.
+        // An input that arrives while an earlier stamp is still unclaimed
+        // overwrites it, and that input will never produce a sample - which is
+        // counted rather than smoothed over.
+        g_wire_log.note(epoch_now_ms(), wire_log::Input, (uint32_t)len, -1, 0, data[16]);
+        g_stamp_slot.receive(data[16], steady_now_ms());
     }
 
     ensure_mouse_focus();
@@ -936,14 +1055,12 @@ void handle_client_input_event(const uint8_t* data, size_t len) {
     if (ev->event_type == 1) { // MOUSEMOTION
         g_mouse_x = ev->x;
         g_mouse_y = ev->y;
-        SDL2_Event m_ev;
-        memset(&m_ev, 0, sizeof(m_ev));
-        m_ev.motion.type = 0x400; // SDL_MOUSEMOTION
-        m_ev.motion.windowID = g_df_window_id;
-        m_ev.motion.state = g_mouse_buttons;
-        m_ev.motion.x = ev->x;
-        m_ev.motion.y = ev->y;
-        if (real_SDL_PushEvent) real_SDL_PushEvent(&m_ev);
+        // Superseded, not queued: see the note on g_motion_pending.
+        g_motion_x.store(ev->x, std::memory_order_relaxed);
+        g_motion_y.store(ev->y, std::memory_order_relaxed);
+        g_motion_state.store(g_mouse_buttons, std::memory_order_relaxed);
+        g_motion_pending.store(true, std::memory_order_release);
+        g_motion_superseded.fetch_add(1, std::memory_order_relaxed);
     } else if (ev->event_type == 2 || ev->event_type == 3) { // MOUSEBUTTONDOWN / UP
         g_mouse_x = ev->x;
         g_mouse_y = ev->y;
@@ -1147,6 +1264,242 @@ static std::mutex g_rtc_lock;
 static std::unordered_map<int, ClientRtcSession> g_rtc_sessions;
 static std::vector<std::shared_ptr<rtc::DataChannel>> g_active_dcs;
 
+// Serialises encoding and sending between the present path, which runs on the
+// game's thread, and any other event with its own reason to send - a client
+// connecting, which arrives on the network thread. Without it the two would
+// interleave inside g_delta_encoder and corrupt the delta chain.
+static std::mutex g_send_lock;
+
+// The picture the game last drew, kept so a client connecting while the game
+// sits still can still be sent what is on screen. Every present empties the
+// command buffer, so without this copy there is nothing left to send between
+// draws - which is exactly why a client joining a still screen got a black
+// canvas and stayed there until the user happened to press something.
+static std::vector<DrawCommand> g_last_picture;
+static bool g_last_picture_valid = false;
+
+// Defined below, next to SDL_RenderPresent. Declared here because the
+// data-channel open callback above it is what a client arriving actually
+// triggers, and that has to be able to send the current picture.
+//
+// The extern "C" wrapper is not decoration: the definition lands inside the big
+// extern "C" block further down, and a plain declaration here would give it C++
+// linkage instead, which the compiler rejects as a conflicting declaration.
+extern "C" {
+static bool service_picture_send(const DrawCommand* cmds, uint16_t count,
+                                 bool force_keyframe, uint32_t combined_base);
+}
+
+// --- what the data channel accepted -------------------------------------------
+//
+// The question these answer: when a frame or a picture does not arrive at the
+// client, did it leave this process at all? libdatachannel's DataChannel::send()
+// has three distinguishable outcomes, and nothing else in this process can tell
+// them apart:
+//
+//   true    the message went into SCTP's send path
+//   false   SCTP could not take it and libdatachannel QUEUED it locally
+//           (impl/sctptransport.cpp: trySendMessage returns false on EWOULDBLOCK
+//           and send() pushes the message onto its own queue, which is drained
+//           when SCTP reports writable - it does not drop)
+//   throw   the message is over the peer's advertised limit, or the channel is
+//           closed (impl/datachannel.cpp: outgoing())
+//
+// `buffered` is what libdatachannel is holding for this channel, so a link that
+// is being offered more than SCTP will take shows up here before anywhere else.
+static std::atomic<uint64_t> g_dc_send_calls{0};
+static std::atomic<uint64_t> g_dc_send_queued{0};
+static std::atomic<uint64_t> g_dc_send_threw{0};
+static std::atomic<uint64_t> g_dc_bytes_offered{0};
+static std::atomic<int64_t>  g_dc_buffered_max{0};
+static std::atomic<int64_t>  g_dc_buffered_now{0};
+// What the channel was actually created as. On this end the peer's DCEP open
+// message decides it, so this is the negotiated answer rather than our intent.
+// Pictures travel on their own channel, reliable and ordered.
+//
+// They used to share the unreliable stream channel with the frames, and that
+// channel is right for frames: a frame is small, and one that is lost is repaired
+// by asking for it again, so paying for retransmission - and head-of-line
+// blocking everything queued behind it - would make the display late to fix a
+// frame it can already replace. Pictures are the opposite. A lost picture chunk
+// cannot be replaced by a later one, it has to be resent, and the client cannot
+// draw any frame that names the picture until the last chunk is there. Putting
+// both on one channel means choosing between a display that is late and a
+// display that is black; putting them on two means each gets what it needs.
+static std::shared_ptr<rtc::DataChannel> g_asset_dc;
+static std::mutex g_asset_dc_lock;
+static std::atomic<int>      g_dc_rel_unordered{-1};
+static std::atomic<int>      g_dc_rel_max_retransmits{-1};
+static std::atomic<int>      g_dc_rel_max_lifetime{-1};
+static std::atomic<int>      g_dc_rel_streams{-1};
+
+// One place where every message to the client's data channel is handed over, so
+// the counts are the same count for frames and pictures alike.
+static bool dc_send_counted(std::shared_ptr<rtc::DataChannel>& dc, const uint8_t* data, size_t size) {
+    g_dc_send_calls.fetch_add(1, std::memory_order_relaxed);
+    g_dc_bytes_offered.fetch_add(size, std::memory_order_relaxed);
+    try {
+        bool ok = dc->send((const std::byte*)data, size);
+        if (!ok) g_dc_send_queued.fetch_add(1, std::memory_order_relaxed);
+        int64_t b = (int64_t)dc->bufferedAmount();
+        g_dc_buffered_now.store(b, std::memory_order_relaxed);
+        int64_t prev = g_dc_buffered_max.load(std::memory_order_relaxed);
+        while (b > prev && !g_dc_buffered_max.compare_exchange_weak(prev, b)) {}
+        return ok;
+    } catch (const std::exception& e) {
+        g_dc_send_threw.fetch_add(1, std::memory_order_relaxed);
+        throw;
+    }
+}
+
+// Reads the negotiated reliability off a channel, once, when it opens. Reported
+// in /df-stats so the answer comes from the running connection rather than from
+// the source that asked for it.
+static void note_channel_reliability(const std::shared_ptr<rtc::DataChannel>& dc) {
+    try {
+        rtc::Reliability r = dc->reliability();
+        g_dc_rel_unordered.store(r.unordered ? 1 : 0);
+        g_dc_rel_max_retransmits.store(r.maxRetransmits ? (int)*r.maxRetransmits : -1);
+        g_dc_rel_max_lifetime.store(r.maxPacketLifeTime ? (int)r.maxPacketLifeTime->count() : -1);
+    } catch (...) {
+        g_dc_rel_unordered.store(-2);
+    }
+}
+
+// --- a controlled message stream, for the one question the game cannot ask -----
+//
+// "Does this link lose messages, and if so at what rate" cannot be answered with
+// the game driving the traffic: the game decides how much it sends, and a run's
+// offered rate is whatever that session's scene happened to produce. This offers
+// a chosen number of messages of a chosen size per second instead, so the loss
+// curve can be swept and the point where arrivals stop tracking the offer can be
+// found rather than inferred.
+//
+// Controlled by /tmp/df_load_probe, three numbers on one line:
+//
+//     <messages per second> <message bytes> <total messages, 0 = until stopped>
+//
+// The messages are marked 'D','P' and carry their own sequence number, so the
+// page can count arrivals by sequence and a gap is a specific message rather than
+// a difference of two counts. They are NOT written to the wire log: at these
+// rates one sweep would evict the whole session's real traffic from it.
+#define LOAD_PROBE_FILE "/tmp/df_load_probe"
+static std::atomic<bool>     g_probe_stop{false};
+static std::atomic<uint64_t> g_probe_sent{0};
+static std::atomic<uint64_t> g_probe_bytes{0};
+static std::atomic<int>      g_probe_on{0};
+static std::atomic<int>      g_probe_rate{0};
+static std::atomic<int>      g_probe_size{0};
+static std::atomic<uint64_t> g_probe_target{0};
+static std::atomic<int>      g_probe_done{0};
+
+static void load_probe_loop() {
+    std::string last_spec;
+    int rate = 0, size = 0;
+    uint64_t target = 0;
+    uint64_t sent = 0;
+    uint32_t seq = 0;
+    while (!g_probe_stop.load()) {
+        // Re-read the knob five times a second: a sweep changes it between runs,
+        // and removing the file ends the current run and arms the next one.
+        FILE* f = fopen(LOAD_PROBE_FILE, "r");
+        char spec[128] = {0};
+        if (f) {
+            if (fgets(spec, sizeof(spec), f) == nullptr) spec[0] = 0;
+            fclose(f);
+        }
+        if (spec[0] == 0) {
+            if (g_probe_on.exchange(0)) {
+                fprintf(stderr, "[LOADPROBE] off after %llu message(s)\n", (unsigned long long)sent);
+                fflush(stderr);
+            }
+            last_spec.clear();
+            sent = 0;
+            seq = 0;
+            g_probe_sent.store(0);
+            g_probe_bytes.store(0);
+            g_probe_done.store(0);
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
+        }
+        if (last_spec != spec) {
+            int r = 0, sz = 0; unsigned long long n = 0;
+            if (sscanf(spec, "%d %d %llu", &r, &sz, &n) >= 2 && r > 0 && sz >= 8 && sz <= 262144) {
+                last_spec = spec;
+                rate = r; size = sz; target = n;
+                sent = 0; seq = 0;
+                g_probe_sent.store(0);
+                g_probe_bytes.store(0);
+                g_probe_done.store(0);
+                g_probe_rate.store(rate);
+                g_probe_size.store(size);
+                g_probe_target.store(target);
+                g_probe_on.store(1);
+                fprintf(stderr, "[LOADPROBE] %d msg/s of %d B, target %llu\n", rate, size,
+                        (unsigned long long)target);
+                fflush(stderr);
+            } else {
+                last_spec = spec;   // do not re-report a malformed file every 200ms
+                g_probe_on.store(0);
+                continue;
+            }
+        }
+        if (!g_probe_on.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            continue;
+        }
+        if (target && sent >= target) {
+            g_probe_on.store(0);
+            g_probe_done.store(1);
+            fprintf(stderr, "[LOADPROBE] done, %llu message(s) of %d B\n",
+                    (unsigned long long)sent, size);
+            fflush(stderr);
+            continue;
+        }
+
+        // Paced in 10 ms slices: a tight loop would measure how fast send() can
+        // be called, which is not the question, and a one-message-per-sleep
+        // timer cannot reach the rates a burst needs.
+        int per_slice = rate / 100;
+        if (per_slice < 1) per_slice = 1;
+        std::vector<uint8_t> packet((size_t)size, 0);
+        packet[0] = 'D';
+        packet[1] = 'P';
+        for (int i = 0; i < per_slice && (!target || sent < target); i++) {
+            uint32_t n = ++seq;
+            memcpy(packet.data() + 2, &n, 4);
+            uint32_t sz = (uint32_t)size;
+            memcpy(packet.data() + 6, &sz, 4);
+            std::lock_guard<std::mutex> lock(g_rtc_lock);
+            for (auto& dc : g_active_dcs) {
+                if (!dc || !dc->isOpen()) continue;
+                try {
+                    dc_send_counted(dc, packet.data(), packet.size());
+                } catch (...) {
+                    // Counted by dc_send_counted; keep the sweep running.
+                }
+            }
+            sent++;
+        }
+        g_probe_sent.store(sent);
+        g_probe_bytes.store(sent * (uint64_t)size);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
+static std::thread g_probe_thread;
+static std::atomic<bool> g_probe_started{false};
+static void load_probe_start() {
+    if (g_probe_started.exchange(true)) return;
+    try {
+        g_probe_thread = std::thread(load_probe_loop);
+    } catch (const std::exception& ex) {
+        g_probe_started.store(false);
+        fprintf(stderr, "[LOADPROBE] worker failed to start: %s\n", ex.what());
+        fflush(stderr);
+    }
+}
+
 // DataChannel messages are refused outright above the peer's advertised
 // a=max-message-size (Chrome: 262144). A 1280x720 RGBA surface is ~3.6 MB, so
 // anything larger than this is split across several messages and reassembled
@@ -1216,7 +1569,21 @@ static const std::vector<uint8_t>& texture_wire_bytes(const CachedTexture& ct, b
 // in a session with the queue reaching 16.3 MB. Dropping a frame is not a
 // saving, it is the freeze the client reports, because the frame is what the
 // user is looking at and the picture is not.
-#define TEXTURE_QUEUE_BUDGET (512u * 1024u)
+// How much may sit in the transport's send queue before pictures stop being
+// added to it.
+//
+// This was 512 KB, which is BELOW this transport's own steady state: measured
+// with a client attached, bufferedAmount settles around 609 KB and the queue
+// therefore never had room, so the drain sent nothing at all rather than
+// throttling. The effect was that a joining client's pictures trickled through
+// whenever the buffer happened to dip, and the screen stayed black for 10-15s
+// while ~10 MB of pictures arrived. Measured on the same run: 512 KB, lit at
+// 15s; 128 MB, lit at 5s, with the peak buffer down from 33 MB to 3.9 MB.
+//
+// A throttle set below the operating point is not a throttle, it is a stop, so
+// this sits well above the steady state while still bounding the queue to about
+// a second of link time.
+#define TEXTURE_QUEUE_BUDGET (4u * 1024u * 1024u)
 
 // Overridable at runtime so the picture backlog can be turned off in an
 // experiment. With the budget at 0 no picture is ever sent, which isolates how
@@ -1285,6 +1652,22 @@ static void queue_texture(uint16_t id, uint32_t next_chunk, bool urgent) {
     g_tex_queue_hint.store((uint32_t)g_texture_queue.size(), std::memory_order_relaxed);
 }
 
+// Queues a picture the CLIENT asked for, starting again from its first chunk.
+//
+// Deliberately not queue_texture(id, 0, true): that keeps the transfer's own
+// position, which is a record of what was SENT, and the pictures travel on an
+// unreliable channel where a chunk can be sent and never arrive. Resuming over
+// the lost chunk leaves the picture permanently one chunk short, and the client
+// refuses to draw any frame that names an incomplete picture - so one dropped
+// chunk is a black screen. Restarting is safe because the client ignores chunks
+// it already holds.
+static void queue_texture_at(uint16_t id, uint32_t chunk) {
+    std::lock_guard<std::mutex> lock(g_tex_queue_lock);
+    g_texture_queue.defer_front_at(id, chunk);
+    g_tex_requested++;
+    g_tex_queue_hint.store((uint32_t)g_texture_queue.size(), std::memory_order_relaxed);
+}
+
 static bool take_queued_texture(uint16_t& id, uint32_t& next_chunk, bool& urgent) {
     std::lock_guard<std::mutex> lock(g_tex_queue_lock);
     bool got = g_texture_queue.take(id, next_chunk, urgent);
@@ -1298,7 +1681,6 @@ static bool take_queued_texture(uint16_t& id, uint32_t& next_chunk, bool& urgent
 static void send_texture_chunk_dc(std::shared_ptr<rtc::DataChannel> dc, const CachedTexture& ct,
                                   uint32_t chunk_index, uint32_t chunk_count) {
     if (!dc || !dc->isOpen() || ct.rgba.empty()) return;
-
     bool compressed = false;
     const std::vector<uint8_t>& bytes = texture_wire_bytes(ct, compressed);
     const size_t total = bytes.size();
@@ -1331,8 +1713,18 @@ static void send_texture_chunk_dc(std::shared_ptr<rtc::DataChannel> dc, const Ca
         if (ct.sent_once) g_tex_repeat++;
         else { g_tex_new++; ct.sent_once = true; }
     }
+    // Recorded at the send, with the queue as it was before it: a picture chunk
+    // is a message like any other and leaving it out of the log is what made the
+    // first version of this instrumentation unable to see 99% of the traffic.
+    g_wire_log.note(epoch_now_ms(), wire_log::Artwork, (uint32_t)packet.size(),
+                    dc ? (int64_t)dc->bufferedAmount() : -1, 0, 0);
     try {
-        dc->send((const std::byte*)packet.data(), packet.size());
+        const auto send_t0 = std::chrono::steady_clock::now();
+        dc_send_counted(dc, packet.data(), packet.size());
+        const int64_t us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - send_t0).count();
+        int64_t prev = g_send_block_max_us.load(std::memory_order_relaxed);
+        while (us > prev && !g_send_block_max_us.compare_exchange_weak(prev, us)) {}
     } catch (const std::exception& e) {
         // Oversized is the failure this chunking exists to prevent; if it still
         // fires, say so loudly rather than losing the asset silently.
@@ -1340,6 +1732,7 @@ static void send_texture_chunk_dc(std::shared_ptr<rtc::DataChannel> dc, const Ca
                 e.what(), ct.id, chunk_index, chunk_count, len);
         fflush(stderr);
     }
+
 }
 
 static uint32_t texture_chunk_count(const CachedTexture& ct) {
@@ -1382,7 +1775,21 @@ static void drain_pending_textures() {
     g_texture_queue.set_budget(texture_queue_budget());
 
     std::lock_guard<std::mutex> rlock(g_rtc_lock);
-    for (auto& dc : g_active_dcs) {
+
+    // One destination list, never both: a chunk sent down the asset channel and
+    // again down the stream channel arrives twice, and while the client would
+    // discard the copy, the second send is what fills the unreliable channel and
+    // gets dropped - the very behaviour this split exists to avoid.
+    std::vector<std::shared_ptr<rtc::DataChannel>> targets;
+    {
+        std::lock_guard<std::mutex> alk(g_asset_dc_lock);
+        if (g_asset_dc && g_asset_dc->isOpen()) targets.push_back(g_asset_dc);
+    }
+    if (targets.empty()) {
+        for (auto& dc : g_active_dcs) if (dc && dc->isOpen()) targets.push_back(dc);
+    }
+
+    for (auto& dc : targets) {
         if (!dc || !dc->isOpen()) continue;
         for (;;) {
             int64_t q = (int64_t)dc->bufferedAmount();
@@ -1428,22 +1835,57 @@ static void maybe_drain_textures() {
     drain_pending_textures();
 }
 
-// Resends the textures the client says it is missing.
+// Keeps pushing queued pictures until there are none left, on its own thread.
 //
+// Wanted when the game is not drawing, because both of the drains that normally
+// keep the queue moving - the one in the draw path and the one in the present -
+// are driven by the game drawing. A client that asks for a picture while the
+// game sits still would otherwise have its request queued and never sent.
+//
+// One worker at a time, and it exits on its own once the queue is empty, so the
+// cost is a thread that lives exactly as long as there is something to send.
+static void start_texture_drain_worker() {
+    static std::atomic<bool> running{false};
+    if (g_tex_queue_hint.load(std::memory_order_relaxed) == 0) return;
+    if (running.exchange(true)) return;   // one already pushing
+    std::thread([] {
+        // Bounded so a client that has stopped reading cannot keep this thread
+        // alive forever; it is re-armed by the next request if that happens.
+        for (int round = 0; round < 20000; round++) {
+            if (g_tex_queue_hint.load(std::memory_order_relaxed) == 0) break;
+            drain_pending_textures();
+            if (g_tex_queue_hint.load(std::memory_order_relaxed) == 0) break;
+            // Waiting on our own socket for room, not polling the game.
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        running.store(false);
+    }).detach();
+}
+
+// Resends the textures the client says it is missing.
 // The client names the ids directly. An earlier version instead asked "resend
 // what frame N needs" and resolved that against this side's copy of frame N.
 // The client's accumulated command buffer and that single frame disagree, so
 // the diff came out empty and the client was told it already held everything -
 // leaving the lost texture permanently incomplete and the frame held forever.
 // Naming the missing ids removes the need to agree about frames at all.
-static void resend_missing_textures(uint32_t seq, const std::vector<uint16_t>& requested) {
+static void resend_missing_textures(uint32_t seq, const std::vector<uint16_t>& requested,
+                                   const std::vector<uint32_t>& requested_chunks) {
     if (requested.empty()) return;
 
-    std::vector<uint16_t> wanted;
-    for (uint16_t id : requested) {
+    // Kept as pairs rather than two parallel arrays: `wanted` collapses repeated
+    // ids, so the hint that belonged to the third entry is no longer at index
+    // three, and a misaligned hint sends a chunk the client was not waiting for
+    // while the one it was waiting for is never sent.
+    std::vector<std::pair<uint16_t, uint32_t>> wanted;
+    for (size_t i = 0; i < requested.size(); i++) {
+        uint16_t id = requested[i];
         if (id == 0) continue;
-        if (std::find(wanted.begin(), wanted.end(), id) != wanted.end()) continue;
-        wanted.push_back(id);
+        bool seen = false;
+        for (auto& w : wanted) if (w.first == id) { seen = true; break; }
+        if (seen) continue;
+        uint32_t chunk = i < requested_chunks.size() ? requested_chunks[i] : 0;
+        wanted.emplace_back(id, chunk);
     }
 
     size_t queued = 0;
@@ -1453,7 +1895,9 @@ static void resend_missing_textures(uint32_t seq, const std::vector<uint16_t>& r
         for (auto& dc : g_active_dcs) {
             if (!dc || !dc->isOpen()) continue;
             std::lock_guard<std::mutex> tlock(g_tex_lock);
-            for (uint16_t id : wanted) {
+            for (auto& w : wanted) {
+                const uint16_t id = w.first;
+                const uint32_t hint = w.second;
                 if (id > g_texture_count) { unknown++; continue; }
                 CachedTexture& ct = g_cached_textures[id - 1];
                 if (ct.rgba.empty()) { unknown++; continue; }
@@ -1467,7 +1911,12 @@ static void resend_missing_textures(uint32_t seq, const std::vector<uint16_t>& r
                 // progress until it was given up on, which is how the
                 // title-screen backdrop stayed missing while the rest of the
                 // frame was pixel-perfect.
-                queue_texture(id, 0, true);
+                // With a chunk hint, send exactly that chunk: a picture is up to
+                // 37 chunks and re-sending all of them to repair one floods the
+                // transport, which then drops the last chunk queued - the one
+                // being repaired. Without a hint, start from the beginning
+                // rather than resuming past the gap.
+                queue_texture_at(id, hint);
                 queued++;
             }
         }
@@ -1476,6 +1925,49 @@ static void resend_missing_textures(uint32_t seq, const std::vector<uint16_t>& r
     fprintf(stderr, "[ASSET_BRIDGE] Frame %u asked for %zu asset(s); %zu queued for delivery, %zu not held here\n",
             seq, wanted.size(), queued, unknown);
     fflush(stderr);
+
+    // Push what was just queued, here and now, and keep pushing until it is all
+    // gone - but off this thread.
+    //
+    // The drain otherwise only runs from the draw path and from the present, so
+    // a picture asked for while the game is sitting still was queued and then
+    // left sitting in the queue: the client waited for it, the client will not
+    // draw a frame until every picture it names has arrived, and the game was
+    // not drawing, so nothing ever pushed it. The request itself is a reason to
+    // send, exactly as a client connecting is - neither needs a draw first.
+    //
+    // Not done inline. This runs on the thread that serves the data channel, and
+    // a client joining a long-running session can be missing hundreds of
+    // pictures, which at link speed is seconds of pushing. Blocking here for
+    // those seconds stops the same thread answering anything else - signalling
+    // and stats included - and the session then looks dead to the server rather
+    // than busy. So the pushing happens on its own thread and this returns.
+    start_texture_drain_worker();
+
+    // Re-send the picture now the pictures it names have gone out.
+    //
+    // The client decides whether it can draw a frame at the moment the frame
+    // lands, not when the last picture it was waiting for turns up. On a moving
+    // screen that is invisible: the next frame arrives almost immediately and
+    // re-decides. On a still screen there is no next frame, so the client sat
+    // holding a complete frame and a complete set of pictures, having already
+    // concluded it could not draw them. Sending the frame again is what makes it
+    // look.
+    //
+    // Not conditional on the whole queue being empty: it rarely is, because the
+    // pictures for much later frames are queued behind this request, and waiting
+    // for those would be waiting for the whole stream to catch up.
+    //
+    // It also cannot loop: the client asks only for pictures it is missing, and
+    // each round of this resolves the ones it named. That convergence is the
+    // 6,5,4,3,2,1 the request log shows, not a retry storm.
+    if (queued > 0) {
+        std::lock_guard<std::mutex> send_lock(g_send_lock);
+        if (g_last_picture_valid && !g_last_picture.empty()) {
+            service_picture_send(g_last_picture.data(), (uint16_t)g_last_picture.size(),
+                                 /*force_keyframe=*/true, 0);
+        }
+    }
 }
 
 static std::string extract_json_str(const std::string& json, const std::string& key) {
@@ -1605,7 +2097,25 @@ void handle_client_text_message(int fd, const std::string& msg) {
                     fprintf(stderr, "[WebRTC] DataChannel '%s' OPEN for fd=%d\n", label.c_str(), fd);
                     fflush(stderr);
 
+                    if (label == "df-assets") {
+                        std::lock_guard<std::mutex> lk(g_asset_dc_lock);
+                        g_asset_dc = dc;
+                        fprintf(stderr, "[WebRTC] df-assets channel registered for pictures\n");
+                        fflush(stderr);
+                        return;
+                    }
+
                     if (label == "df-stream") {
+                        note_channel_reliability(dc);
+                        {
+                            rtc::Reliability r = dc->reliability();
+                            fprintf(stderr, "[WebRTC] df-stream reliability: unordered=%d "
+                                            "maxRetransmits=%d maxPacketLifeTime=%d\n",
+                                    r.unordered ? 1 : 0,
+                                    r.maxRetransmits ? (int)*r.maxRetransmits : -1,
+                                    r.maxPacketLifeTime ? (int)r.maxPacketLifeTime->count() : -1);
+                            fflush(stderr);
+                        }
                         g_need_keyframe.store(true);
                         {
                             std::lock_guard<std::mutex> lock(g_rtc_lock);
@@ -1626,12 +2136,52 @@ void handle_client_text_message(int fd, const std::string& msg) {
                                     (unsigned long long)(g_tex_dump_bytes / 1024));
                             fflush(stderr);
                         }
+                        // A client that connects while the game is sitting still
+                        // gets nothing from the draw path, because the draw path
+                        // is not running: the send used to be reachable only from
+                        // SDL_RenderPresent, so a still screen produced no frame
+                        // and the newcomer watched a black canvas until the user
+                        // happened to press something. Send the picture that is
+                        // already on screen, now, instead of waiting for a draw
+                        // that may never come.
+                        //
+                        // This runs AFTER the texture dump on purpose. A frame is
+                        // a list of references to pictures, so sending it first
+                        // hands the client a picture it cannot draw yet - it was
+                        // sent, it arrived, and the canvas stayed black anyway.
+                        // Pictures go out first, then the frame that names them.
+                        //
+                        // Also after g_active_dcs is updated, so this client is
+                        // among the receivers, and outside g_rtc_lock because
+                        // service_picture_send acquires that lock itself.
+                        {
+                            std::lock_guard<std::mutex> send_lock(g_send_lock);
+                            if (g_last_picture_valid && !g_last_picture.empty()) {
+                                service_picture_send(g_last_picture.data(),
+                                                     (uint16_t)g_last_picture.size(),
+                                                     /*force_keyframe=*/true, 0);
+                            }
+                        }
                     }
                 });
 
                 dc->onClosed([fd, dc, label]() {
                     fprintf(stderr, "[WebRTC] DataChannel '%s' CLOSED for fd=%d\n", label.c_str(), fd);
                     fflush(stderr);
+                    if (label == "df-assets") {
+                        // Forget the picture channel when it closes. Holding a
+                        // reference to a closed channel is not harmless: the
+                        // drain asks it whether it is open, gets a stale yes for
+                        // a moment, and keeps feeding pictures to a browser that
+                        // has already gone. The client on the other end of the
+                        // new connection then waits for pictures that are being
+                        // posted to its predecessor, re-asks forever, and the
+                        // tab sits on "connecting" with the server convinced it
+                        // is streaming.
+                        std::lock_guard<std::mutex> alk(g_asset_dc_lock);
+                        if (g_asset_dc == dc) g_asset_dc.reset();
+                        return;
+                    }
                     if (label == "df-stream") {
                         std::lock_guard<std::mutex> lock(g_rtc_lock);
                         g_active_dcs.erase(std::remove(g_active_dcs.begin(), g_active_dcs.end(), dc), g_active_dcs.end());
@@ -1641,6 +2191,7 @@ void handle_client_text_message(int fd, const std::string& msg) {
                 dc->onMessage([](auto data) {
                     if (std::holds_alternative<rtc::binary>(data)) {
                         auto& b = std::get<rtc::binary>(data);
+                        g_input_msgs.fetch_add(1, std::memory_order_relaxed);
                         handle_client_input_event((const uint8_t*)b.data(), b.size());
                     }
                 });
@@ -1810,6 +2361,27 @@ static std::chrono::steady_clock::time_point g_raw_clock_start;
 static std::atomic<uint64_t> g_raw_sent{0};
 static std::atomic<uint64_t> g_raw_dropped{0};
 static std::atomic<uint64_t> g_raw_bytes{0};
+// Captures whose pixels differ from the capture before them, and captures that
+// repeat it. The raw path sends every captured frame, so an idle game is a
+// continuous stream of identical pictures; the count of frames that actually
+// changed something is what a display timeline on the client has to match, and
+// it is the only way to tell a still screen from a stalled one.
+static std::atomic<uint64_t> g_raw_changed{0};
+static std::atomic<uint64_t> g_raw_same{0};
+// Stamps dropped because the input that produced them was too old to answer.
+// The age limit is what stops a stamp riding on a frame that has nothing to do
+// with the input, which reports a latency that never happened.
+static std::atomic<uint64_t> g_raw_stamp_expired{0};
+// Stamps the raw path attached to a frame that went out. This is the raw path's
+// own `stampSamples`: without it, coverage on that path could only be described
+// from the client's side, which is the number that was already wrong once.
+static std::atomic<uint64_t> g_raw_stamp_answered{0};
+// Input arrival -> the answering frame leaving here, for the raw path. The same
+// interval the draw-command path reports as STAMP_*, so a slow answer can be
+// split into "the host took this long" and "the rest was the link and the
+// display" on both paths rather than only on one.
+static std::vector<int64_t> g_raw_stamp_ages_ms;
+static std::mutex g_raw_stamp_lock;
 static std::atomic<uint64_t> g_raw_encode_us{0};
 static std::atomic<int> g_raw_connected{0};
 static std::atomic<bool> g_raw_stop{false};
@@ -1837,6 +2409,12 @@ static std::vector<uint8_t> g_raw_worker;    // owned by the worker while encodi
 static bool g_raw_frame_ready = false;
 static int g_raw_frame_w = 0;
 static int g_raw_frame_h = 0;
+// Whether the staged frame differs from the previous capture, decided where the
+// pixels are: the worker uses it to refuse to attach an input's stamp to a frame
+// that shows the same picture, and the stats use it to say how much of the
+// stream was new.
+static bool g_raw_frame_changed = false;
+static std::vector<uint8_t> g_raw_previous;  // render thread only
 
 // Reads the switch at most about once a second and updates the effective state.
 //
@@ -1901,9 +2479,18 @@ static void raw_capture_frame(void* renderer) {
     int w = 0, h = 0;
     if (!read_framebuffer_rgba(renderer, g_raw_staging, &w, &h)) return;
 
+    // Compared with the capture before it rather than with the frame last sent:
+    // what matters is whether this capture is a different picture, and the
+    // previous capture is the last picture the game produced.
+    bool changed = g_raw_previous.size() != g_raw_staging.size() ||
+                   memcmp(g_raw_previous.data(), g_raw_staging.data(), g_raw_staging.size()) != 0;
+    g_raw_previous = g_raw_staging;
+    if (changed) g_raw_changed++; else g_raw_same++;
+
     std::lock_guard<std::mutex> lock(g_raw_frame_lock);
     g_raw_frame_w = w;
     g_raw_frame_h = h;
+    g_raw_frame_changed = changed;
     g_raw_frame_ready = true;
 }
 
@@ -2070,20 +2657,66 @@ static RawSendResult raw_send_staged(int fd, std::vector<uint8_t>& jpeg) {
     // The payload carries a one-byte codec tag. The receiving end would
     // otherwise have to sniff the bytes to tell a JPEG from a PNG, and sniffing
     // is exactly the kind of guess that turns into a blank screen with no error.
+    // The stamp from the most recent input, if one is waiting. Every captured
+    // frame is sent here, so the first capture after an input is by construction
+    // the frame the game rendered in response: this is a cleaner causal link than
+    // the draw-command path has, where a frame can turn out to be a duplicate and
+    // take the stamp down with it. The stamp is spent either way so it can never
+    // be attached to a later, unrelated frame.
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(g_raw_frame_lock);
+        changed = g_raw_frame_changed;
+    }
+
+    // The stamp goes on the frame that answers the input, and only a frame whose
+    // pixels differ from the one before it can answer anything: an identical
+    // frame shows the player nothing, so crediting it with a response would
+    // manufacture a fast sample out of an input that did nothing. The stamp is
+    // held rather than spent while captures repeat, and expires if the answer
+    // never comes - a stamp that outlives its input would otherwise ride on some
+    // unrelated later frame and report a latency that never happened.
+    uint8_t stamp = 0;
+    if (g_stamp_slot.expire_if_stale(steady_now_ms(), g_stamp_max_age_ms)) {
+        g_raw_stamp_expired++;
+    }
+    // Only a frame whose pixels changed can answer an input, so the stamp is
+    // claimed only when this capture differs from the last one; otherwise it
+    // waits in the slot for the capture that does.
+    if (changed && g_stamp_slot.claim(steady_now_ms(), g_stamp_max_age_ms, stamp)) {
+        int64_t age = -1;
+        // The capture path sends every frame it takes, so the claim is answered
+        // by this very frame.
+        if (g_stamp_slot.settle(stamp_slot::Packet::Frame, steady_now_ms(), stamp, &age)) {
+            g_raw_stamp_answered++;
+            std::lock_guard<std::mutex> lock(g_raw_stamp_lock);
+            g_raw_stamp_ages_ms.push_back(age);
+            g_wire_log.note_stamp(stamp, age, epoch_now_ms(), wire_log::Raw);
+            if (g_raw_stamp_ages_ms.size() > 900) {
+                g_raw_stamp_ages_ms.erase(g_raw_stamp_ages_ms.begin(), g_raw_stamp_ages_ms.begin() + 300);
+            }
+        }
+    }
+
     bool lossless = raw_lossless_on();
     auto t0 = std::chrono::steady_clock::now();
     bool ok;
     if (lossless) {
         jpeg.clear();
         jpeg.push_back(RAW_CODEC_PNG);
+        jpeg.push_back(stamp);
         ok = raw_png_encode(g_raw_worker.data(), w, h, RAW_PNG_LEVEL, jpeg);
     } else {
         ok = raw_jpeg_encode(g_raw_worker.data(), w, h, RAW_JPEG_QUALITY, jpeg);
-        if (ok) jpeg.insert(jpeg.begin(), RAW_CODEC_JPEG);   // the encoder replaces the buffer
+        if (ok) {
+            // The encoder replaces the buffer, so the two header bytes go on after.
+            jpeg.insert(jpeg.begin(), stamp);
+            jpeg.insert(jpeg.begin(), RAW_CODEC_JPEG);
+        }
     }
     g_raw_encode_us += (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - t0).count();
-    if (!ok || jpeg.size() <= 1) {
+    if (!ok || jpeg.size() <= 2) {
         g_raw_dropped++;
         return RawSendResult::Idle;
     }
@@ -2096,6 +2729,15 @@ static RawSendResult raw_send_staged(int fd, std::vector<uint8_t>& jpeg) {
 
     g_raw_sent++;
     g_raw_bytes += len;
+    // The raw path's own cost, per frame: how long the encode took and whether
+    // the pixels changed. Without this the raw tail cannot be split into "the
+    // encoder was slow" and "the link was slow", and those have different
+    // causes.
+    {
+        int64_t encode_us = (int64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        g_wire_log.note(epoch_now_ms(), wire_log::RawFrame, len, -1, encode_us, stamp);
+    }
     return RawSendResult::Sent;
 }
 
@@ -2395,6 +3037,12 @@ static bool texture_pixels_available(uint16_t id) {
 }
 
 int SDL_RenderCopy(void* renderer, void* texture, const SDL_Rect* srcrect, const SDL_Rect* dstrect) {
+    const auto hook_t0 = std::chrono::steady_clock::now();
+    struct HookTime { std::chrono::steady_clock::time_point t0; ~HookTime() {
+        g_hook_ns.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
+        g_hook_calls.fetch_add(1, std::memory_order_relaxed);
+    } } hook_time{hook_t0};
     if (!real_SDL_RenderCopy) resolve_symbols();
     // Refill the picture queue here rather than only once per present: this hook
     // runs thousands of times per frame, so the link is kept busy instead of
@@ -2451,8 +3099,220 @@ int SDL_RenderCopyEx(void* renderer, void* texture, const SDL_Rect* srcrect, con
     return real_SDL_RenderCopyEx(renderer, texture, srcrect, dstrect, angle, center, flip);
 }
 
+// Send the picture in cmds[0..count) when there is a reason to.
+//
+// This block used to live inline in SDL_RenderPresent, so the only moment the
+// interposer could transmit anything was when the game drew. A game parked on a
+// still screen never draws again, and a client that connected after the last
+// draw was therefore never sent the picture sitting right there - it waited on a
+// black screen until the user happened to press something, which changed the
+// picture and finally produced a frame. The send is now callable from any event
+// that gives a reason to send, including a client arriving.
+//
+// Callers must hold g_send_lock. It serialises g_delta_encoder, g_sent_seq and
+// the delta chain's prev_cmds, which the present path and the connect path both
+// touch, and it is what makes an encode from the network thread safe while the
+// game keeps drawing on its own.
+//
+// Returns true when a packet actually went out - which is what consumes a
+// sequence number.
+static bool service_picture_send(const DrawCommand* cmds, uint16_t count,
+                                 bool force_keyframe, uint32_t combined_base) {
+    if (count == 0) return false;
+    {
+        static std::atomic<int> svc_log{0};
+        if (svc_log.fetch_add(1) < 30) {
+            size_t ndcs = 0, nopen = 0;
+            { std::lock_guard<std::mutex> l(g_rtc_lock);
+              ndcs = g_active_dcs.size();
+              for (auto& d : g_active_dcs) if (d && d->isOpen()) nopen++; }
+            fprintf(stderr, "[SVCSEND] count=%u force=%d dcs=%zu open=%zu\n",
+                    (unsigned)count, (int)force_keyframe, ndcs, nopen);
+            fflush(stderr);
+        }
+    }
+    // NOTE: the age is NOT measured here. Presents happen whether or not
+    // anything is transmitted, so measuring here reports the time to the next
+    // vsync rather than the time to the client's answer. Claiming carries the
+    // arrival time forward; settle() below measures the age when a frame
+    // really goes out, which is the number that matters.
+    uint8_t stamp = 0;
+    g_stamp_slot.claim(steady_now_ms(), g_stamp_max_age_ms, stamp);
+
+    std::vector<uint8_t> frame_packet;
+    EncodeResult enc = g_delta_encoder.encode_frame(g_sent_seq, cmds, count,
+                                                    force_keyframe, combined_base, stamp, frame_packet);
+    if (enc == EncodeResult::Full) {
+        g_need_keyframe.store(false);
+    }
+
+    // Did the packet that is about to go out actually carry the stamp? The
+    // stamp rides only on a frame. A keepalive used to go out here - a packet
+    // with no commands and a zeroed header, which the client dropped without
+    // ever looking at a stamp - and it used to be counted as an answer, so a
+    // run claimed 485 answers for 381 stamps the client could see. The
+    // keepalive was then measured as doing nothing at all (its removal
+    // changed no metric by more than the run-to-run spread:
+    // evidence/bench/loopback/KEEPALIVE_MATRIX.md) and removed, so the only
+    // thing that can settle a claim now is a frame.
+    bool carried_stamp = !frame_packet.empty();
+
+    // What went out settles it: a frame that carried the stamp answers the
+    // input; a present that sent nothing hands the stamp back for the next
+    // frame that really goes out, still subject to the age limit.
+    int64_t stamp_age_ms = -1;
+    if (g_stamp_slot.settle(carried_stamp ? stamp_slot::Packet::Frame : stamp_slot::Packet::Nothing,
+                            steady_now_ms(), stamp, &stamp_age_ms)) {
+        // Input arrival -> the frame that actually answers it leaving here.
+        g_stamp_ages_ms.push_back(stamp_age_ms);
+        g_wire_log.note_stamp(stamp, stamp_age_ms, epoch_now_ms(), wire_log::Smart);
+        g_stamp_seen++;
+        if (g_stamp_ages_ms.size() > 900) g_stamp_ages_ms.erase(g_stamp_ages_ms.begin(), g_stamp_ages_ms.begin() + 300);
+    }
+
+    bool report_due = false;
+    // The encoder built something, so it goes out. Nothing else is ever sent:
+    // a present whose picture did not change produces no packet at all.
+    if (!frame_packet.empty()) {
+        {
+            std::lock_guard<std::mutex> lock(g_rtc_lock);
+            for (auto& dc : g_active_dcs) {
+                if (dc && dc->isOpen()) {
+                    // No backpressure guard here: it only ever measured bytes
+                    // queued locally, which on a healthy link stays near zero,
+                    // and dropping a delta breaks the chain for every later
+                    // frame. Bulk traffic is the texture path, not this one.
+                    g_queue_at_send.push_back((int64_t)dc->bufferedAmount());
+                    if (g_queue_at_send.size() > 900) g_queue_at_send.erase(g_queue_at_send.begin(), g_queue_at_send.begin() + 300);
+                    // `extra` carries the frame's own sequence number: it is
+                    // what lets the page's log be matched against this one
+                    // frame by frame, so a frame that never arrived can be
+                    // told from one that arrived late.
+                    g_wire_log.note(epoch_now_ms(),
+                                    enc == EncodeResult::Full ? wire_log::Keyframe : wire_log::Frame,
+                                    (uint32_t)frame_packet.size(), (int64_t)dc->bufferedAmount(),
+                                    (int64_t)g_sent_seq, carried_stamp ? stamp : 0);
+                    dc_send_counted(dc, frame_packet.data(), frame_packet.size());
+                    g_wire_bytes += frame_packet.size();
+                    g_wire_frames++;
+                }
+            }
+            // Sequence numbers are consumed only by frames that were actually
+            // sent, so a silent present leaves no hole for the client to treat
+            // as packet loss.
+            g_sent_seq++;
+
+            static uint64_t last_report_seq = 0;
+            if (g_sent_seq - last_report_seq >= 25) {
+                last_report_seq = g_sent_seq;
+                report_due = true;
+            }
+        }
+
+        // Reported after the lock is released: never do blocking I/O while
+        // holding g_rtc_lock, which the signalling path also needs.
+        if (report_due) {
+            const DeltaEncoder& s = g_delta_encoder;
+            double e50 = 0, e95 = 0, emax = 0;
+            if (!s.enc_us.empty()) {
+                std::vector<double> v = s.enc_us;
+                std::sort(v.begin(), v.end());
+                e50 = v[v.size() / 2];
+                e95 = v[(size_t)std::min(v.size() - 1, (size_t)(v.size() * 0.95))];
+                emax = v.back();
+            }
+            int64_t q50 = -1, q95 = -1, qmax = -1;
+            if (!g_queue_at_send.empty()) {
+                std::vector<int64_t> q = g_queue_at_send;
+                std::sort(q.begin(), q.end());
+                q50 = q[q.size() / 2];
+                q95 = q[(size_t)std::min(q.size() - 1, (size_t)(q.size() * 0.95))];
+                qmax = q.back();
+            }
+            double s50 = -1, s95 = -1, smax = -1;
+            if (!g_stamp_ages_ms.empty()) {
+                std::vector<int64_t> v = g_stamp_ages_ms;
+                std::sort(v.begin(), v.end());
+                s50 = (double)v[v.size() / 2];
+                s95 = (double)v[(size_t)std::min(v.size() - 1, (size_t)(v.size() * 0.95))];
+                smax = (double)v.back();
+            }
+            // The RAW_ fields are dormant unless DF_RAW_STREAM=1: RAW_on says
+            // whether the mode was asked for, RAW_conn whether the raw server
+            // is currently connected, and RAW_enc_us is the mean JPEG encode
+            // time per sent frame - the number that decides whether the 12ms
+            // capture cap is doing anything useful.
+            fprintf(stderr, "[FRAME_STATS] sent=%llu silent=%llu full=%llu delta=%llu avg_full=%lluB avg_delta=%lluB enc_calls=%llu enc_p50=%.0fus enc_p95=%.0fus enc_max=%.0fus STAMP_n=%llu STAMP_p50=%.0fms STAMP_p95=%.0fms STAMP_max=%.0fms QUEUE_p50=%lld QUEUE_p95=%lld QUEUE_max=%lld WIRE_kb=%llu WIRE_frames=%llu TEX_n=%llu TEX_kb=%llu TEX_new=%llu TEX_repeat=%llu DUMP_n=%llu DUMP_kb=%llu TEXQ_defer=%llu TEXQ_req=%llu TEXQ_resume=%llu TEXQ_pend=%u TEXQ_qmax=%lld TEX_ids=%u TEX_recycled=%llu TEX_kbheld=%llu DRAW_unknown=%llu DRAW_nopixels=%llu RAW_on=%d RAW_sent=%llu RAW_drop=%llu RAW_kb=%llu RAW_enc_us=%llu RAW_conn=%d RAW_new=%llu RAW_same=%llu RAW_stamp_exp=%llu STAMP_exp=%llu\n",
+                    (unsigned long long)g_sent_seq,
+                    (unsigned long long)s.stat_nothing,
+                    (unsigned long long)s.stat_full,
+                    (unsigned long long)s.stat_delta,
+                    (unsigned long long)(s.stat_full ? s.stat_bytes_full / s.stat_full : 0),
+                    (unsigned long long)(s.stat_delta ? s.stat_bytes_delta / s.stat_delta : 0),
+                    (unsigned long long)s.stat_enc_calls,
+                    e50, e95, emax,
+                    (unsigned long long)g_stamp_seen, s50, s95, smax,
+                    (long long)q50, (long long)q95, (long long)qmax,
+                    (unsigned long long)(g_wire_bytes / 1024), (unsigned long long)g_wire_frames,
+                    (unsigned long long)g_tex_count, (unsigned long long)(g_tex_bytes / 1024),
+                    (unsigned long long)g_tex_new, (unsigned long long)g_tex_repeat,
+                    (unsigned long long)g_tex_dump_count, (unsigned long long)(g_tex_dump_bytes / 1024),
+                    (unsigned long long)g_tex_deferred, (unsigned long long)g_tex_requested,
+                    (unsigned long long)g_tex_resumed,
+                    (unsigned)g_tex_queue_hint.load(std::memory_order_relaxed),
+                    (long long)g_queue_at_tex_max,
+                    (unsigned)g_texture_count,
+                    (unsigned long long)g_tex_recycled,
+                    (unsigned long long)(g_cached_bytes / 1024),
+                    (unsigned long long)g_draw_unknown,
+                    (unsigned long long)g_draw_nopixels,
+                    (int)(g_raw_on.load() ? 1 : 0),
+                    (unsigned long long)g_raw_sent.load(),
+                    (unsigned long long)g_raw_dropped.load(),
+                    (unsigned long long)(g_raw_bytes.load() / 1024),
+                    (unsigned long long)(g_raw_sent.load() ? g_raw_encode_us.load() / g_raw_sent.load() : 0),
+                    (int)g_raw_connected.load(),
+                    (unsigned long long)g_raw_changed.load(),
+                    (unsigned long long)g_raw_same.load(),
+                    (unsigned long long)g_raw_stamp_expired.load(),
+                    (unsigned long long)g_stamp_slot.expired);
+            fflush(stderr);
+        }
+    }
+    return true;
+}
+
+
+
+// A 64x64 sample from the middle of the window: cheap enough to run on a skipped
+// present, and large enough that a camera pan cannot move without changing it.
+static bool sample_pixel_hash(void* renderer, uint64_t& out) {
+    if (!real_SDL_RenderReadPixels || !renderer) return false;
+    static uint32_t buf[64 * 64];
+    SDL_Rect r;
+    r.x = (g_current_w > 64 ? (g_current_w - 64) / 2 : 0);
+    r.y = (g_current_h > 64 ? (g_current_h - 64) / 2 : 0);
+    r.w = 64; r.h = 64;
+    if (real_SDL_RenderReadPixels(renderer, &r, 376840196 /* ABGR8888 */, buf, 64 * 4) != 0) return false;
+    uint64_t h = 1469598103934665603ull;
+    for (int i = 0; i < 64 * 64; i++) { h ^= buf[i]; h *= 1099511628211ull; }
+    out = h;
+    return true;
+}
+
+
 void SDL_RenderPresent(void* renderer) {
+    const auto present_t0 = std::chrono::steady_clock::now();
+    struct PresentTime { std::chrono::steady_clock::time_point t0; ~PresentTime() {
+        const uint64_t us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        g_present_us_total.fetch_add(us, std::memory_order_relaxed);
+        g_present_count.fetch_add(1, std::memory_order_relaxed);
+        uint64_t prev = g_present_us_max.load(std::memory_order_relaxed);
+        while (us > prev && !g_present_us_max.compare_exchange_weak(prev, us)) {}
+    } } present_time{present_t0};
     if (!real_SDL_RenderPresent) resolve_symbols();
+    g_presents.fetch_add(1, std::memory_order_relaxed);
     g_frame_seq++;
 
     // Force DF to redraw full screen on next frame so all viewport & map tiles stay fresh
@@ -2530,146 +3390,31 @@ void SDL_RenderPresent(void* renderer) {
     // The guard that used to live here tested 131,072 B, which is smaller than a
     // single 131,088 B chunk -- so one picture was enough to stop frames going
     // out, and the client sat on a stale screen until the queue drained.
+    g_probe_renderer = renderer;
+    if (g_frame_cmd_count == 0) g_presents_nocmd.fetch_add(1, std::memory_order_relaxed);
     if (g_frame_cmd_count > 0 && has_receivers) {
-        uint8_t stamp = 0;
-        if (g_has_client_stamp && g_current_client_stamp != 0) {
-            // NOTE: the age is NOT measured here. Presents happen whether or
-            // not anything is transmitted, so measuring here reports the time to
-            // the next vsync rather than the time to the client's answer. Carry
-            // the arrival time forward and measure it when a frame really goes
-            // out, which is the number that matters.
-            stamp = g_current_client_stamp;
-            g_stamp_pending = true;
-            g_stamp_pending_time = g_client_stamp_time;
-            g_has_client_stamp = false;
-            g_current_client_stamp = 0;
-        }
-
-        std::vector<uint8_t> frame_packet;
-        uint32_t combined_base = g_pending_combined_base.exchange(0);
-        {
-            int64_t since = g_sent_any ? (steady_now_ms() - std::chrono::duration_cast<std::chrono::milliseconds>(
-                g_last_send_time.time_since_epoch()).count()) : 999999;
-            g_keepalive_due = (since >= 100);
-        }
-        bool was_keepalive = g_keepalive_due;
-        EncodeResult enc = g_delta_encoder.encode_frame(g_sent_seq, g_frame_cmds, g_frame_cmd_count,
-                                                        g_need_keyframe.load(), combined_base, stamp, frame_packet);
-        if (enc == EncodeResult::Full) {
-            g_need_keyframe.store(false);
-        }
-        if (enc != EncodeResult::Nothing) {
-            g_last_send_time = std::chrono::steady_clock::now();
-            g_sent_any = true;
-            if (was_keepalive) g_keepalive_sent++;
-        }
-
-        bool report_due = false;
-        if (enc != EncodeResult::Nothing && !frame_packet.empty()) {
-            // Input arrival -> the frame that actually answers it leaving here.
-            if (g_stamp_pending) {
-                int64_t age = steady_now_ms() - std::chrono::duration_cast<std::chrono::milliseconds>(
-                    g_stamp_pending_time.time_since_epoch()).count();
-                g_stamp_ages_ms.push_back(age);
-                g_stamp_seen++;
-                if (g_stamp_ages_ms.size() > 900) g_stamp_ages_ms.erase(g_stamp_ages_ms.begin(), g_stamp_ages_ms.begin() + 300);
-                g_stamp_pending = false;
-            }
-            {
-                std::lock_guard<std::mutex> lock(g_rtc_lock);
-                for (auto& dc : g_active_dcs) {
-                    if (dc && dc->isOpen()) {
-                        // No backpressure guard here: it only ever measured bytes
-                        // queued locally, which on a healthy link stays near zero,
-                        // and dropping a delta breaks the chain for every later
-                        // frame. Bulk traffic is the texture path, not this one.
-                        g_queue_at_send.push_back((int64_t)dc->bufferedAmount());
-                        if (g_queue_at_send.size() > 900) g_queue_at_send.erase(g_queue_at_send.begin(), g_queue_at_send.begin() + 300);
-                        dc->send((const std::byte*)frame_packet.data(), frame_packet.size());
-                        g_wire_bytes += frame_packet.size();
-                        g_wire_frames++;
-                    }
-                }
-                // Sequence numbers are consumed only by frames that were actually
-                // sent, so a silent frame leaves no hole for the client to treat
-                // as packet loss.
-                g_sent_seq++;
-
-                static uint64_t last_report_seq = 0;
-                if (g_sent_seq - last_report_seq >= 25) {
-                    last_report_seq = g_sent_seq;
-                    report_due = true;
-                }
-            }
-
-            // Reported after the lock is released: never do blocking I/O while
-            // holding g_rtc_lock, which the signalling path also needs.
-            if (report_due) {
-                const DeltaEncoder& s = g_delta_encoder;
-                double e50 = 0, e95 = 0, emax = 0;
-                if (!s.enc_us.empty()) {
-                    std::vector<double> v = s.enc_us;
-                    std::sort(v.begin(), v.end());
-                    e50 = v[v.size() / 2];
-                    e95 = v[(size_t)std::min(v.size() - 1, (size_t)(v.size() * 0.95))];
-                    emax = v.back();
-                }
-                int64_t q50 = -1, q95 = -1, qmax = -1;
-                if (!g_queue_at_send.empty()) {
-                    std::vector<int64_t> q = g_queue_at_send;
-                    std::sort(q.begin(), q.end());
-                    q50 = q[q.size() / 2];
-                    q95 = q[(size_t)std::min(q.size() - 1, (size_t)(q.size() * 0.95))];
-                    qmax = q.back();
-                }
-                double s50 = -1, s95 = -1, smax = -1;
-                if (!g_stamp_ages_ms.empty()) {
-                    std::vector<int64_t> v = g_stamp_ages_ms;
-                    std::sort(v.begin(), v.end());
-                    s50 = (double)v[v.size() / 2];
-                    s95 = (double)v[(size_t)std::min(v.size() - 1, (size_t)(v.size() * 0.95))];
-                    smax = (double)v.back();
-                }
-                // The RAW_ fields are dormant unless DF_RAW_STREAM=1: RAW_on says
-                // whether the mode was asked for, RAW_conn whether the raw server
-                // is currently connected, and RAW_enc_us is the mean JPEG encode
-                // time per sent frame - the number that decides whether the 12ms
-                // capture cap is doing anything useful.
-                fprintf(stderr, "[FRAME_STATS] sent=%llu silent=%llu full=%llu delta=%llu avg_full=%lluB avg_delta=%lluB enc_calls=%llu enc_p50=%.0fus enc_p95=%.0fus enc_max=%.0fus STAMP_n=%llu STAMP_p50=%.0fms STAMP_p95=%.0fms STAMP_max=%.0fms QUEUE_p50=%lld QUEUE_p95=%lld QUEUE_max=%lld WIRE_kb=%llu WIRE_frames=%llu TEX_n=%llu TEX_kb=%llu TEX_new=%llu TEX_repeat=%llu DUMP_n=%llu DUMP_kb=%llu KA=%llu SKIP_n=%llu TEXQ_defer=%llu TEXQ_req=%llu TEXQ_resume=%llu TEXQ_pend=%u TEXQ_qmax=%lld TEX_ids=%u TEX_recycled=%llu TEX_kbheld=%llu DRAW_unknown=%llu DRAW_nopixels=%llu RAW_on=%d RAW_sent=%llu RAW_drop=%llu RAW_kb=%llu RAW_enc_us=%llu RAW_conn=%d\n",
-                        (unsigned long long)g_sent_seq,
-                        (unsigned long long)s.stat_nothing,
-                        (unsigned long long)s.stat_full,
-                        (unsigned long long)s.stat_delta,
-                        (unsigned long long)(s.stat_full ? s.stat_bytes_full / s.stat_full : 0),
-                        (unsigned long long)(s.stat_delta ? s.stat_bytes_delta / s.stat_delta : 0),
-                        (unsigned long long)s.stat_enc_calls,
-                        e50, e95, emax,
-                        (unsigned long long)g_stamp_seen, s50, s95, smax,
-                        (long long)q50, (long long)q95, (long long)qmax,
-                        (unsigned long long)(g_wire_bytes / 1024), (unsigned long long)g_wire_frames,
-                        (unsigned long long)g_tex_count, (unsigned long long)(g_tex_bytes / 1024),
-                        (unsigned long long)g_tex_new, (unsigned long long)g_tex_repeat,
-                        (unsigned long long)g_tex_dump_count, (unsigned long long)(g_tex_dump_bytes / 1024),
-                        (unsigned long long)g_keepalive_sent,
-                        (unsigned long long)g_frames_skipped,
-                        (unsigned long long)g_tex_deferred, (unsigned long long)g_tex_requested,
-                        (unsigned long long)g_tex_resumed,
-                        (unsigned)g_tex_queue_hint.load(std::memory_order_relaxed),
-                        (long long)g_queue_at_tex_max,
-                        (unsigned)g_texture_count,
-                        (unsigned long long)g_tex_recycled,
-                        (unsigned long long)(g_cached_bytes / 1024),
-                        (unsigned long long)g_draw_unknown,
-                        (unsigned long long)g_draw_nopixels,
-                        (int)(g_raw_on.load() ? 1 : 0),
-                        (unsigned long long)g_raw_sent.load(),
-                        (unsigned long long)g_raw_dropped.load(),
-                        (unsigned long long)(g_raw_bytes.load() / 1024),
-                        (unsigned long long)(g_raw_sent.load() ? g_raw_encode_us.load() / g_raw_sent.load() : 0),
-                        (int)g_raw_connected.load());
-                fflush(stderr);
+        std::lock_guard<std::mutex> send_lock(g_send_lock);
+        const uint32_t seq_before = g_sent_seq;
+        service_picture_send(g_frame_cmds, g_frame_cmd_count,
+                             g_need_keyframe.load(), g_pending_combined_base.exchange(0));
+        // Only meaningful if a frame actually went out: the hash must describe
+        // the screen the client has been told about.
+        if (g_sent_seq != seq_before) {
+            uint64_t h = 0;
+            if (sample_pixel_hash(renderer, h)) {
+                g_last_sent_pixel_hash = h;
+                g_last_sent_pixel_hash_valid = true;
             }
         }
+    }
+
+    // Remember what was just drawn - even when nobody is connected, because the
+    // point is to have it ready for whoever connects next, which may be long
+    // after this draw and with no further draw in between.
+    if (g_frame_cmd_count > 0) {
+        std::lock_guard<std::mutex> send_lock(g_send_lock);
+        g_last_picture.assign(g_frame_cmds, g_frame_cmds + g_frame_cmd_count);
+        g_last_picture_valid = true;
     }
 
     g_frame_cmd_count = 0;
@@ -2679,6 +3424,138 @@ void SDL_RenderPresent(void* renderer) {
     // the present also means the chunk copying happens while the renderer would
     // otherwise be idle waiting on vsync, instead of delaying the frame.
     drain_pending_textures();
+}
+
+// Everything the producer knows about what it sent, for the bench.
+//
+// All of it is counted at the send calls themselves. A byte total estimated
+// anywhere else - from the log, from the client, from a payload size - would be a
+// different number pretending to be the same one, and the whole point of the
+// comparison is that both sides count the same thing at the same point.
+// C++ linkage on purpose: the whole file is inside an extern "C" block, and a
+// std::string return type has no business claiming C linkage.
+static double median_of(std::vector<int64_t> v) {
+    if (v.empty()) return -1;
+    std::sort(v.begin(), v.end());
+    return (double)v[v.size() / 2];
+}
+
+// Every message this process put on a link, for the spike forensics. Separate
+// from /df-stats on purpose: the stats endpoint is polled several times a second
+// during a run and this is read once, at the end, so making the poll carry it
+// would put the measurement's own traffic on the link being measured.
+extern "C++" std::string df_wire_json() {
+    return g_wire_log.json(epoch_now_ms());
+}
+
+static int64_t max_of(std::vector<int64_t> v) {
+    if (v.empty()) return -1;
+    return *std::max_element(v.begin(), v.end());
+}
+
+extern "C++" std::string df_stats_json() {
+    double raw_stamp_p50;
+    {
+        std::lock_guard<std::mutex> lock(g_raw_stamp_lock);
+        raw_stamp_p50 = median_of(g_raw_stamp_ages_ms);
+    }
+    double stamp_p50;
+    {
+        std::lock_guard<std::mutex> lock(g_rtc_lock);
+        stamp_p50 = median_of(g_stamp_ages_ms);
+    }
+    // Bytes still sitting in the SCTP send queue when a frame was handed over,
+    // and how many clients are attached. The queue maximum is what makes a burst
+    // visible: a total and a mean rate can hide a 500 ms stall behind a healthy
+    // average. The client count is here so a run can prove it was measuring one
+    // client - both paths share one stamp slot, so a second attached client (or
+    // the raw path running while the smart path is measured) silently steals
+    // answers from the one being measured.
+    int64_t queue_max = -1;
+    size_t clients = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_rtc_lock);
+        queue_max = max_of(g_queue_at_send);
+        for (auto& dc : g_active_dcs) {
+            if (dc && dc->isOpen()) clients++;
+        }
+    }
+    char buf[2560];
+    snprintf(buf, sizeof(buf),
+             "{\"now\":%lld,"
+             "\"window\":{\"w\":%d,\"h\":%d},"
+             "\"wireBytes\":%llu,\"frames\":%llu,"
+             "\"textures\":%llu,\"textureBytes\":%llu,"
+             "\"textureNew\":%llu,\"textureRepeat\":%llu,"
+             "\"stampSamples\":%llu,\"stampExpired\":%llu,\"stampP50\":%.0f,"
+             "\"stampReceived\":%llu,\"stampOverwritten\":%llu,"
+             "\"queueMax\":%lld,\"clients\":%zu,\"presents\":%llu,\"presentsSilent\":%llu,\"presentsNoCmd\":%llu,\"encodeNothing\":%llu,\"nothingPixelsSame\":%llu,\"nothingPixelsChanged\":%llu,\"hookUsTotal\":%llu,\"hookCalls\":%llu,\"inputMsgs\":%llu,\"motionIn\":%llu,\"motionOut\":%llu,\"presentUsTotal\":%llu,\"presentUsMax\":%llu,\"presentCount\":%llu,\"sendBlockMaxUs\":%lld,\"presentMaxUs\":%lld,"
+             "\"dc\":{\"sendCalls\":%llu,\"queued\":%llu,\"threw\":%llu,"
+             "\"bytesOffered\":%llu,\"bufferedMax\":%lld,\"bufferedNow\":%lld,"
+             "\"unordered\":%d,\"maxRetransmits\":%d,\"maxPacketLifeTime\":%d},"
+             "\"probe\":{\"on\":%d,\"done\":%d,\"rate\":%d,\"size\":%d,"
+             "\"target\":%llu,\"sent\":%llu,\"bytes\":%llu},"
+             "\"raw\":{\"on\":%d,\"connected\":%d,\"sent\":%llu,\"changed\":%llu,"
+             "\"same\":%llu,\"bytes\":%llu,\"dropped\":%llu,\"stampExpired\":%llu,"
+             "\"stampAnswered\":%llu,\"stampP50\":%.0f}}",
+             (long long)epoch_now_ms(),
+             g_current_w, g_current_h,
+             (unsigned long long)g_wire_bytes,
+             (unsigned long long)g_wire_frames,
+             (unsigned long long)g_tex_count,
+             (unsigned long long)g_tex_bytes,
+             (unsigned long long)g_tex_new,
+             (unsigned long long)g_tex_repeat,
+             (unsigned long long)g_stamp_seen,
+             (unsigned long long)g_stamp_slot.expired,
+             stamp_p50,
+             (unsigned long long)g_stamp_slot.received,
+             (unsigned long long)g_stamp_slot.overwritten,
+             (long long)queue_max,
+             clients,
+             (unsigned long long)g_presents.load(),
+             (unsigned long long)g_presents_silent.load(),
+             (unsigned long long)g_presents_nocmd.load(),
+             (unsigned long long)g_delta_encoder.stat_nothing,
+             (unsigned long long)g_nothing_pixels_same.load(),
+             (unsigned long long)g_nothing_pixels_changed.load(),
+             (unsigned long long)(g_hook_ns.load() / 1000),
+             (unsigned long long)g_hook_calls.load(),
+             (unsigned long long)g_input_msgs.load(),
+             (unsigned long long)g_motion_superseded.load(),
+             (unsigned long long)g_motion_delivered.load(),
+             (unsigned long long)g_present_us_total.load(),
+             (unsigned long long)g_present_us_max.load(),
+             (unsigned long long)g_present_count.load(),
+             (long long)g_send_block_max_us.load(),
+             (long long)g_present_max_us.load(),
+             (unsigned long long)g_dc_send_calls.load(std::memory_order_relaxed),
+             (unsigned long long)g_dc_send_queued.load(std::memory_order_relaxed),
+             (unsigned long long)g_dc_send_threw.load(std::memory_order_relaxed),
+             (unsigned long long)g_dc_bytes_offered.load(std::memory_order_relaxed),
+             (long long)g_dc_buffered_max.load(std::memory_order_relaxed),
+             (long long)g_dc_buffered_now.load(std::memory_order_relaxed),
+             g_dc_rel_unordered.load(std::memory_order_relaxed),
+             g_dc_rel_max_retransmits.load(std::memory_order_relaxed),
+             g_dc_rel_max_lifetime.load(std::memory_order_relaxed),
+             g_probe_on.load(std::memory_order_relaxed),
+             g_probe_done.load(std::memory_order_relaxed),
+             g_probe_rate.load(std::memory_order_relaxed),
+             g_probe_size.load(std::memory_order_relaxed),
+             (unsigned long long)g_probe_target.load(std::memory_order_relaxed),
+             (unsigned long long)g_probe_sent.load(std::memory_order_relaxed),
+             (unsigned long long)g_probe_bytes.load(std::memory_order_relaxed),
+             (int)(g_raw_on.load() ? 1 : 0),
+             (int)g_raw_connected.load(),
+             (unsigned long long)g_raw_sent.load(),
+             (unsigned long long)g_raw_changed.load(),
+             (unsigned long long)g_raw_same.load(),
+             (unsigned long long)g_raw_bytes.load(),
+             (unsigned long long)g_raw_dropped.load(),
+             (unsigned long long)g_raw_stamp_expired.load(),
+             (unsigned long long)g_raw_stamp_answered.load(),
+             raw_stamp_p50);
+    return std::string(buf);
 }
 
 __attribute__((constructor))
@@ -2693,6 +3570,9 @@ static void init_interposer() {
     g_server->start(port, root);
     // Started last, so the raw mode is never the reason a stream fails to come up.
     raw_init();
+    // The controlled-load probe: idle until /tmp/df_load_probe appears, so it
+    // costs one thread that sleeps 200ms at a time when nobody is asking.
+    load_probe_start();
 }
 
 __attribute__((destructor))
@@ -2702,6 +3582,8 @@ static void cleanup_interposer() {
     // is tearing down the state that handler uses.
     g_raw_stop.store(true);
     if (g_raw_thread.joinable()) g_raw_thread.join();
+    g_probe_stop.store(true);
+    if (g_probe_thread.joinable()) g_probe_thread.join();
     if (g_server) { g_server->stop(); delete g_server; g_server = nullptr; }
 }
 

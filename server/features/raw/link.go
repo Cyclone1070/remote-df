@@ -100,10 +100,12 @@ func (l *LinkServer) serveConn(conn net.Conn) {
 		// The interposer prefixes every frame with a one-byte codec tag. An
 		// unknown tag means the two ends disagree about the protocol, so the frame
 		// is dropped rather than mislabelled as something it is not.
-		if len(frame) < 1 || !Codec(frame[0]).Known() {
+		if len(frame) < 2 || !Codec(frame[0]).Known() {
 			continue
 		}
-		l.holder.PublishCodec(Codec(frame[0]), frame[1:])
+		// Byte 0 is the codec, byte 1 the input stamp being echoed back (0 when
+		// none is waiting), and the rest is the picture.
+		l.holder.PublishStamped(Codec(frame[0]), frame[1], frame[2:])
 	}
 }
 

@@ -22,6 +22,20 @@ export class DFProtocol {
 
     static TEXTURE_HEADER_BYTES = 16;
 
+    // A message from the bench's controlled-load probe, not from the game: the
+    // host offers a chosen number of messages of a chosen size per second so the
+    // link's behaviour under a known load can be measured rather than inferred
+    // from whatever the scene happened to produce. 'D','P' matches neither a
+    // frame nor a picture, so a page without this method drops them harmlessly.
+    static PROBE_HEADER_BYTES = 8;
+
+    static decodeProbe(buffer) {
+        if (!buffer || buffer.byteLength < this.PROBE_HEADER_BYTES) return null;
+        const view = new DataView(buffer);
+        if (view.getUint8(0) !== 0x44 || view.getUint8(1) !== 0x50) return null; // 'D','P'
+        return { seq: view.getUint32(2, true), size: view.getUint32(6, true) };
+    }
+
     // Returns one texture CHUNK, not necessarily a whole texture. A DataChannel
     // refuses any message above the peer's advertised a=max-message-size
     // (Chrome: 262144), so a full-screen RGBA surface arrives as several
@@ -182,7 +196,21 @@ export class DFProtocol {
     //   bytes 1..4   : u32 frame seq the client is stuck on (diagnostics only)
     //   bytes 5..6   : u16 count of missing texture ids
     //   bytes 7..    : u16 missing texture ids
-    static encodeAssetBridgeRequest(seq, missingIds) {
+    /**
+     * Asks the host for pictures the client cannot draw yet.
+     *
+     * `missingChunks` optionally maps a picture id to the first chunk the client
+     * does not hold. Saying which chunk is missing is what makes a repair cheap:
+     * a picture is up to 37 chunks, and re-sending all of them to replace one
+     * floods the transport so that the last chunk queued - the one being repaired
+     * - is the chunk that gets dropped, over and over. One chunk in, one chunk
+     * out, and the picture completes.
+     *
+     * The chunk array is appended rather than folded into the id, so a host that
+     * predates it still reads the ids correctly: it sees a longer message and
+     * ignores the tail. Omitted entirely when no chunk information is available.
+     */
+    static encodeAssetBridgeRequest(seq, missingIds, missingChunks) {
         const ids = [];
         const seen = new Set();
         for (const id of missingIds || []) {
@@ -192,13 +220,24 @@ export class DFProtocol {
             ids.push(id);
         }
 
-        const buf = new ArrayBuffer(7 + ids.length * 2);
+        const withChunks = missingChunks instanceof Map && ids.length > 0;
+        const buf = new ArrayBuffer(7 + ids.length * 2 + (withChunks ? ids.length * 2 : 0));
         const view = new DataView(buf);
         view.setUint8(0, 8);
         view.setUint32(1, (seq || 0) >>> 0, true);
         view.setUint16(5, ids.length, true);
         for (let i = 0; i < ids.length; i++) {
             view.setUint16(7 + i * 2, ids[i], true);
+        }
+        if (withChunks) {
+            for (let i = 0; i < ids.length; i++) {
+                const c = missingChunks.get(ids[i]);
+                // An index that cannot be represented falls back to 0 (send the
+                // picture from the start) instead of wrapping to a chunk the
+                // client would then wait for and never receive.
+                const safe = Number.isInteger(c) && c >= 0 && c <= 0xFFFF ? c : 0;
+                view.setUint16(7 + ids.length * 2 + i * 2, safe, true);
+            }
         }
         return buf;
     }

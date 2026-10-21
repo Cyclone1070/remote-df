@@ -2,6 +2,7 @@ package raw
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -12,6 +13,21 @@ import (
 	"testing"
 	"time"
 )
+
+// getStats fetches one stats response and decodes it.
+func getStats(t *testing.T, url string) map[string]any {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("failed to fetch %s: %v", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("failed to decode %s: %v", url, err)
+	}
+	return body
+}
 
 // fakeSink stands in for the interposer link so route behaviour can be tested
 // without a live interposer.
@@ -341,5 +357,344 @@ func TestRawController_RejectsRequestWithoutUpgrade(t *testing.T) {
 
 	if response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", response.StatusCode)
+	}
+}
+
+// The bench needs the relay's own view of what it handed to a viewer: when each
+// part was written. Without it a gap in the browser has no attribution - the
+// producer could have stopped, or the link could have stalled, and the difference
+// decides which of the two is broken.
+func TestStats_ReportsTheTimelineOfPartsWritten(t *testing.T) {
+	holder := NewFrameHolder()
+	server := newRawTestServer(t, holder, &fakeSink{})
+
+	resp, err := http.Get(server.URL + "/raw.mjpg")
+	if err != nil {
+		t.Fatalf("failed to open the stream: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	reader := bufio.NewReader(resp.Body)
+	go func() {
+		for i := 0; i < 3; i++ {
+			holder.PublishCodec(CodecJPEG, []byte{0xff, 0xd8, byte(i), 0xff, 0xd9})
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+	for i := 0; i < 3; i++ {
+		readMJPEGPart(t, reader, mjpegBoundary)
+	}
+
+	statsResp, err := http.Get(server.URL + "/raw-stats")
+	if err != nil {
+		t.Fatalf("failed to read stats: %v", err)
+	}
+	defer func() { _ = statsResp.Body.Close() }()
+
+	var stats struct {
+		Parts uint64  `json:"parts"`
+		Times []int64 `json:"times"`
+	}
+	if err := json.NewDecoder(statsResp.Body).Decode(&stats); err != nil {
+		t.Fatalf("stats were not valid JSON: %v", err)
+	}
+	if stats.Parts < 3 {
+		t.Errorf("expected at least 3 parts written, got %d", stats.Parts)
+	}
+	if len(stats.Times) < 3 {
+		t.Errorf("expected a write time for each part, got %d", len(stats.Times))
+	}
+	for i := 1; i < len(stats.Times); i++ {
+		if stats.Times[i] < stats.Times[i-1] {
+			t.Fatalf("write times must not go backwards: %v", stats.Times)
+		}
+	}
+}
+
+// The page displays through an <img> fed by multipart/x-mixed-replace, and that
+// element gives the page no access to the part headers - so a frame that answers
+// an input has to be announced some other way or the page can only report that
+// the picture changed, never which input it answered.
+func TestInputSocket_EchoesTheStampOfTheFrameThatAnswersIt(t *testing.T) {
+	holder := NewFrameHolder()
+	server := newRawTestServer(t, holder, &fakeSink{})
+
+	client := dialWebSocket(t, wsURL(server))
+
+	resp, err := http.Get(server.URL + "/raw.mjpg")
+	if err != nil {
+		t.Fatalf("failed to open the stream: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	reader := bufio.NewReader(resp.Body)
+
+	// A completed handshake on this side does not mean the server has registered
+	// the socket yet, so the answering frame is offered repeatedly rather than
+	// assuming an order the protocol never promised.
+	found := false
+	for attempt := 0; attempt < 30 && !found; attempt++ {
+		holder.PublishStamped(CodecJPEG, 7, []byte{0xff, 0xd8, 0x07, 0xff, 0xd9})
+		readMJPEGPart(t, reader, mjpegBoundary)
+
+		for probe := 0; probe < 10 && !found; probe++ {
+			_, payload := client.readFrame(t)
+			var message map[string]any
+			if err := json.Unmarshal(payload, &message); err != nil {
+				continue
+			}
+			echo, ok := message["echo"]
+			if !ok {
+				continue
+			}
+			if number, isNumber := echo.(float64); !isNumber || uint8(number) != 7 {
+				t.Fatalf("echoed the wrong stamp: %v", echo)
+			}
+			found = true
+		}
+	}
+
+	if !found {
+		t.Fatal("a frame carrying an input's stamp was never echoed to the input socket")
+	}
+}
+
+// A frame that answers nothing must not produce an echo: one message per part
+// would be a per-frame tax on the very path the bench is measuring.
+func TestInputSocket_StaysSilentForFramesThatAnswerNothing(t *testing.T) {
+	holder := NewFrameHolder()
+	server := newRawTestServer(t, holder, &fakeSink{})
+
+	client := dialWebSocket(t, wsURL(server))
+
+	resp, err := http.Get(server.URL + "/raw.mjpg")
+	if err != nil {
+		t.Fatalf("failed to open the stream: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	reader := bufio.NewReader(resp.Body)
+
+	for i := 0; i < 5; i++ {
+		holder.PublishCodec(CodecJPEG, []byte{0xff, 0xd8, byte(i), 0xff, 0xd9})
+		readMJPEGPart(t, reader, mjpegBoundary)
+	}
+
+	for probe := 0; probe < 20; probe++ {
+		_, payload := client.readFrame(t)
+		var message map[string]any
+		if err := json.Unmarshal(payload, &message); err != nil {
+			continue
+		}
+		if _, ok := message["echo"]; ok {
+			t.Fatalf("a frame that answered nothing produced an echo: %s", payload)
+		}
+	}
+}
+
+// orderingWriter records how many times the picture stream has been flushed, so a
+// test can ask WHEN the stamp echo happened relative to the frame it names.
+type orderingWriter struct {
+	mu       sync.Mutex
+	header   http.Header
+	flushes  int
+	writtenN int
+}
+
+func (w *orderingWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+func (w *orderingWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	w.writtenN += len(p)
+	w.mu.Unlock()
+	return len(p), nil
+}
+func (w *orderingWriter) WriteHeader(int) {}
+func (w *orderingWriter) Flush() {
+	w.mu.Lock()
+	w.flushes++
+	w.mu.Unlock()
+}
+func (w *orderingWriter) flushCount() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.flushes
+}
+
+// recordingStampWriter stands in for a page's input socket and remembers how many
+// picture flushes had happened when each echo arrived.
+type recordingStampWriter struct {
+	stream      *orderingWriter
+	mu          sync.Mutex
+	echoes      []uint8
+	flushAtEcho []int
+}
+
+func (f *recordingStampWriter) SetWriteDeadline(time.Time) error { return nil }
+func (f *recordingStampWriter) WriteText(payload []byte) error {
+	var message map[string]any
+	if err := json.Unmarshal(payload, &message); err != nil {
+		return nil
+	}
+	if echo, ok := message["echo"].(float64); ok {
+		f.mu.Lock()
+		f.echoes = append(f.echoes, uint8(echo))
+		f.flushAtEcho = append(f.flushAtEcho, f.stream.flushCount())
+		f.mu.Unlock()
+	}
+	return nil
+}
+func (f *recordingStampWriter) snapshot() ([]uint8, []int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]uint8(nil), f.echoes...), append([]int(nil), f.flushAtEcho...)
+}
+
+// The latency the page reports is the time from the input to the change that
+// answered it, and the page learns which change that was from the echo. The echo
+// used to be written AFTER the frame was flushed, so it could arrive after the
+// browser had already decoded and displayed that frame - 19 of 226 echoes in the
+// measured run, each of which credited the NEXT frame and overstated that sample
+// by about 50ms (a tail metric would not have survived it).
+//
+// The order is now the other way round: the answering frame is announced before
+// its bytes are released. This test pins that down by counting flushes: the echo
+// for a stamped frame must arrive while the picture stream is still one part
+// behind it.
+func TestServeMJPEG_AnnouncesTheStampBeforeItFlushesTheFrame(t *testing.T) {
+	holder := NewFrameHolder()
+	controller := NewRawController(holder, &fakeSink{})
+	stream := &orderingWriter{}
+	writer := &recordingStampWriter{stream: stream}
+	controller.addInputConn(writer)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, "/raw.mjpg", nil).WithContext(ctx)
+	go controller.ServeMJPEG(stream, req)
+
+	// One unstamped frame, flushed before the answering one is published, so the
+	// baseline below counts the header flush and that part.
+	holder.PublishStamped(CodecJPEG, 0, []byte{0xff, 0xd8, 0x00, 0xff, 0xd9})
+	waitFor(t, "the first part to be flushed", func() bool { return stream.flushCount() >= 2 })
+	before := stream.flushCount()
+
+	holder.PublishStamped(CodecJPEG, 9, []byte{0xff, 0xd8, 0x09, 0xff, 0xd9})
+	waitFor(t, "the answering frame to be echoed", func() bool {
+		echoes, _ := writer.snapshot()
+		return len(echoes) > 0
+	})
+
+	echoes, flushesAtEcho := writer.snapshot()
+	if len(echoes) != 1 || echoes[0] != 9 {
+		t.Fatalf("echoed stamps = %v, want exactly one echo of stamp 9", echoes)
+	}
+	// This test is the only thing that pins the order, and it does so on the
+	// flush count the WRITER saw - an observation from outside the relay's own
+	// two write calls. The counters that used to sit here compared two timestamps
+	// the relay took around its own writes, which is why they reported 908
+	// "before" and 0 "after" on every live run and could never fail.
+	if flushesAtEcho[0] != before {
+		t.Fatalf("the echo arrived after %d picture flush(es), and the stream had flushed %d times before the "+
+			"answering frame was published; the echo must be sent BEFORE the frame it names is flushed, or the "+
+			"page can see that frame change before it learns which input it answered and credit the next one",
+			flushesAtEcho[0], before)
+	}
+	waitFor(t, "the answering frame itself to be flushed", func() bool { return stream.flushCount() > before })
+}
+
+// A bench that samples the byte total a few times a second to see bursts must
+// not be handed the whole part timeline with every sample: that is measurement
+// traffic on the link being measured.
+// The relay's egress counters cannot answer "is the game still reaching me?": with
+// no viewer attached they are all zero, and in the failure this exists for - the
+// interposer writing frames into a socket the relay never reads - the interposer's
+// own send counter keeps climbing. What distinguishes the two is whether the relay
+// is still RECEIVING frames, so the stats report that separately.
+func TestStats_ReportsHowManyFramesTheRelayHasReceived(t *testing.T) {
+	holder := NewFrameHolder()
+	server := newRawTestServer(t, holder, &fakeSink{})
+
+	holder.PublishStamped(CodecJPEG, 0, []byte("first"))
+	holder.PublishStamped(CodecJPEG, 0, []byte("second"))
+
+	stats := getStats(t, server.URL+"/raw-stats")
+	if got := stats["ingested"]; got != float64(2) {
+		t.Fatalf("ingested = %v, want 2: the relay received two frames", got)
+	}
+}
+
+func TestStats_BriefOmitsThePartTimeline(t *testing.T) {
+	holder := NewFrameHolder()
+	server := newRawTestServer(t, holder, &fakeSink{})
+	holder.Publish(encodeTestJPEG(t, 8, 8))
+
+	full := getStats(t, server.URL+"/raw-stats")
+	if _, ok := full["times"]; !ok {
+		t.Fatal("the full stats response no longer carries the part timeline")
+	}
+
+	brief := getStats(t, server.URL+"/raw-stats?brief=1")
+	if _, ok := brief["times"]; ok {
+		t.Error("brief stats still carry the part timeline")
+	}
+	if _, ok := brief["bytes"]; !ok {
+		t.Error("brief stats dropped the byte total the bench samples")
+	}
+	if _, ok := brief["echoes"]; !ok {
+		t.Error("brief stats dropped the echo counters")
+	}
+}
+
+// The raw path's wire has exactly one kind of message - a part - and a spike on
+// that path cannot be explained without the size of the parts around it and how
+// long the relay's write to the browser took. The part timeline has only
+// timestamps, which cannot say whether a gap was a quiet link or a 200kB picture
+// being pushed into a slow socket.
+func TestStats_PartLogCarriesTheSizeOfEveryPartAndItsWriteCost(t *testing.T) {
+	holder := NewFrameHolder()
+	server := newRawTestServer(t, holder, &fakeSink{})
+
+	stream, err := http.Get(server.URL + "/raw.mjpg")
+	if err != nil {
+		t.Fatalf("failed to open the stream: %v", err)
+	}
+	defer func() { _ = stream.Body.Close() }()
+	reader := bufio.NewReader(stream.Body)
+
+	image := encodeTestJPEG(t, 16, 16)
+	go func() {
+		for i := 0; i < 3; i++ {
+			holder.PublishStamped(CodecJPEG, uint8(i+1), image)
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+	for i := 0; i < 3; i++ {
+		readMJPEGPart(t, reader, mjpegBoundary)
+	}
+
+	stats := getStats(t, server.URL+"/raw-stats?parts=1")
+	log, ok := stats["partLog"].([]any)
+	if !ok {
+		t.Fatalf("stats carry no part log: %v", stats["partLog"])
+	}
+	if len(log) < 3 {
+		t.Fatalf("part log holds %d entries for 3 parts written", len(log))
+	}
+
+	entry, ok := log[0].([]any)
+	if !ok || len(entry) != 4 {
+		t.Fatalf("a part log entry must be [epochMs, bytes, stamp, writeUs], got %v", log[0])
+	}
+	if got := entry[1].(float64); got != float64(len(image)) {
+		t.Errorf("part size logged as %v, want %d - the bytes that went out", got, len(image))
+	}
+	if got := entry[2].(float64); got != 1 {
+		t.Errorf("the stamp the part answered was logged as %v, want 1", got)
+	}
+	if _, ok := entry[3].(float64); !ok {
+		t.Errorf("the write cost was not logged: %v", entry[3])
 	}
 }

@@ -7,13 +7,16 @@ import "sync"
 // frame rate from successive samples and can tell a fresh frame from a repeat
 // without comparing bytes.
 type Frame struct {
-	Image  []byte
-	Codec  Codec
+	Image []byte
+	Codec Codec
+	// Stamp is the client's own number for the input this frame answers, echoed
+	// back so the client can time its own round trip. Zero means the frame
+	// answers nothing in particular, which is most of them.
+	Stamp  uint8
 	Seq    uint64
 	Width  int
 	Height int
 }
-
 
 // Subscriber is one viewer of the frame stream. Its channel holds at most one
 // frame, so a viewer that cannot keep up loses intermediate frames instead of
@@ -77,6 +80,11 @@ func (h *FrameHolder) Publish(jpeg []byte) { h.PublishCodec(CodecJPEG, jpeg) }
 // type. The caller transfers ownership of the slice. Publishing never blocks,
 // which is what stops one slow browser from stalling the interposer's read loop.
 func (h *FrameHolder) PublishCodec(codec Codec, image []byte) {
+	h.PublishStamped(codec, 0, image)
+}
+
+// PublishStamped is PublishCodec with the input stamp the frame is answering.
+func (h *FrameHolder) PublishStamped(codec Codec, stamp uint8, image []byte) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -88,7 +96,7 @@ func (h *FrameHolder) PublishCodec(codec Codec, image []byte) {
 	} else {
 		width, height, _ = jpegDimensions(image)
 	}
-	h.latest = Frame{Image: image, Codec: codec, Seq: h.count, Width: width, Height: height}
+	h.latest = Frame{Image: image, Codec: codec, Stamp: stamp, Seq: h.count, Width: width, Height: height}
 	h.haveFrame = true
 
 	for sub := range h.subscribers {
@@ -132,6 +140,16 @@ func (h *FrameHolder) Unsubscribe(sub *Subscriber) {
 	}
 	delete(h.subscribers, sub)
 	close(sub.frames)
+}
+
+// Count reports how many frames have been published, which is how a caller tells
+// "the relay is still being fed" from "the relay has viewers but no frames" - two
+// states that look identical in every egress counter, because with no viewer
+// attached those are all zero.
+func (h *FrameHolder) Count() uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.count
 }
 
 // SubscriberCount reports how many viewers are attached.

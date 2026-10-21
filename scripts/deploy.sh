@@ -38,7 +38,7 @@ build_interposer() {
   # The headers are on this list because the compile below only sees $REMOTE_SRC:
   # a header that is not copied here fails the build with "file not found", and the
   # stale-artefact check turns that into a hard stop rather than a silent ship.
-  for f in interposer/df_streamer.cpp interposer/ws_server.hpp interposer/sha1_b64.hpp interposer/texture_queue.hpp interposer/raw_jpeg.hpp interposer/raw_png.hpp; do
+  for f in interposer/df_streamer.cpp interposer/ws_server.hpp interposer/stamp_slot.hpp interposer/wire_log.hpp interposer/sha1_b64.hpp interposer/texture_queue.hpp interposer/raw_jpeg.hpp interposer/raw_png.hpp; do
     cat "$f" | ssh "$HOST" "cat > $REMOTE_SRC/$(basename "$f")"
   done
   ssh "$HOST" "podman run --rm -v $REMOTE_SRC:/src:Z -w /src $BUILD_IMAGE sh -c '

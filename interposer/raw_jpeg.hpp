@@ -13,6 +13,7 @@
 // already in scope. Including it first fails with "unknown type name 'size_t'".
 #include <csetjmp>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

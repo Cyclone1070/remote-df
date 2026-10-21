@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { DFRenderer } from '../core/renderer.js';
 import { DFProtocol } from '../core/protocol.js';
+import { attributePending, WireRecorder, inputLog } from '../core/measure.js';
 import * as fzstd from 'fzstd';
 import { DFInput } from '../core/input.js';
 import { FrameSequencer } from '../core/frameSequencer.js';
@@ -8,6 +9,12 @@ import { FrameSequencer } from '../core/frameSequencer.js';
 export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange, isDebug, streamPort, onTerminate }) {
     const canvasRef = useRef(null);
     const [isWebRTCReady, setIsWebRTCReady] = useState(false);
+    // True once a frame has actually been drawn. The channel opening is not
+    // the picture arriving: between the two the overlay used to disappear
+    // and leave a bare black canvas, so the user saw the spinner stop and
+    // then nothing for as long as the pictures took to arrive. Waiting for
+    // a drawn frame means the screen goes from spinner to game.
+    const [hasDrawn, setHasDrawn] = useState(false);
 
     useEffect(() => {
         const canvas = canvasRef.current;
@@ -21,27 +28,128 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
         const renderer = new DFRenderer(canvas);
         window.renderer = renderer;
 
+        // The bench's view of this page. Everything the bench reports is read
+        // from here, so there is exactly one definition of each number.
+        //
+        //   display  - when the picture on the canvas became a different picture.
+        //              A redraw that resolves to the same instances is not in it,
+        //              which is the point: an artwork arrival the client already
+        //              holds changes nothing on screen and used to be counted as
+        //              a frame, hiding exactly the stalls this is for.
+        //   inputSent - every input this page sent, in order, with the stamp it
+        //              carried, so a latency sample is tied to its own input
+        //              instead of to a position in a list that one unanswered
+        //              key press shifts - and so the uplink can be paired from
+        //              the whole window rather than from its last 255 sends.
+        //   latency  - input sent -> the paint that showed the answer.
+        const bench = {
+            path: 'smart',
+            startedAt: performance.now(),
+            display: [],
+            changeMagnitude: [],
+            // The ordered log of the inputs this page sent, with the stamp
+            // lookup built from the same records. A Map keyed by the stamp alone
+            // cannot hold more inputs than the stamp space - a 20 s window sends
+            // 366-392 of them, so two thirds of the window was overwritten in the
+            // map before the bench could read it. See measure.js's inputLog.
+            inputSent: inputLog(),
+            latency: [],
+            missing: [],
+            bytesIn: { frames: 0, textures: 0 },
+            // The controlled-load probe's arrival counters. See probeArrivals.
+            probe: { count: 0, min: null, max: null, last: null, reordered: 0 },
+            webgl: renderer.isWebGL,
+            glRenderer: renderer.glRenderer,
+            stampedFrames: 0,
+            paints: 0,
+            paintsUnchanged: 0,
+            // Coverage. inputsSent is what this page asked the host to answer;
+            // stampFramesSeen is how many of those answers came back carrying a
+            // stamp at all. The host counts its own answers separately and the
+            // two numbers are printed side by side, never one as the other: a
+            // stamp is lost with its frame (the stream channel does not
+            // retransmit) and an input can be overwritten in the host's single
+            // stamp slot before any frame claims it.
+            inputsSent: 0,
+            stampFramesSeen: 0,
+            stampsUnknown: 0,
+        };
+        // Every message that comes off the wire, of every kind, with its size.
+        // Not just frames: pictures are ~99% of the bytes on this
+        // link, and a log that leaves them out reports an artwork burst as
+        // silence. See measure.js's WireRecorder.
+        const wire = new WireRecorder();
+        bench.wire = wire;
+        // The page's own main thread. A blocked page cannot receive a message or
+        // paint one, so a display gap during a block is not evidence about the
+        // link - and without this the two are indistinguishable from here.
+        bench.longTasks = [];
+        try {
+            new PerformanceObserver((list) => {
+                for (const entry of list.getEntries()) {
+                    bench.longTasks.push([+entry.startTime.toFixed(1), +entry.duration.toFixed(1)]);
+                }
+            }).observe({ type: 'longtask', buffered: true });
+        } catch (e) { /* not exposed here; the bench reports the gap as unattributed */ }
+        window.__dfBench = bench;
+
+        let lastMissingLogged = -1;
+        function noteMissing(n) {
+            if (n !== lastMissingLogged) {
+                lastMissingLogged = n;
+                bench.missing.push([performance.now(), n]);
+            }
+        }
+
         let ws = null;
         let pc = null;
         let dc = null;
         let inputDc = null;
+        let assetDc = null;
+        // Pictures waiting to be turned into textures. Bounded by the transport,
+        // not by this queue: the sender is back-pressured by the channel, and a
+        // queue here only reorders work that has already arrived.
+        const assetQueue = [];
+        // How long one frame may spend ingesting pictures. Small enough that the
+        // loop keeps its cadence, large enough that a steady trickle clears in
+        // one pass instead of being spread across frames.
+        const ASSET_INGEST_BUDGET_MS = 4;
+        let drawnOnce = false;
+        const markDrawn = () => {
+            if (drawnOnce) return;
+            drawnOnce = true;
+            setHasDrawn(true);
+        };
         let input = null;
         let isDestroyed = false;
 
         // Frame sequencing + loss recovery. Retries are driven by arriving
         // frames rather than a wall clock, so the cadence follows the stream
         // rate instead of a fixed interval. See core/frameSequencer.js.
+        // ── trace ────────────────────────────────────────────────────────────
+        // Every decision and every arrival, timestamped, into one array that can
+        // be dumped after the fact. Aggregates say a stream was slow; a trace
+        // says which frame was held, behind which gap, and for how long.
+        const trace = (window.__trace = window.__trace || []);
+        let deltaStatN = 0, deltaStatEmpty = 0, deltaStatCarry = 0;
+        let traceOn = true;
+        const T = (kind, data) => { if (traceOn && trace.length < 200000) trace.push([performance.now(), kind, data || 0]); };
+
+        renderer.onDeltaStat = (d) => { deltaStatN++; if (!d.changed) deltaStatEmpty++; deltaStatCarry += d.updates; };
         const sequencer = new FrameSequencer({
             applyFullFrame: cmds => {
                 renderer.applyFullFrame(cmds);
                 syncAssets();
+                if (renderer.missingTextureIds().size === 0) markDrawn();
                 window.__dfFrameCount = (window.__dfFrameCount || 0) + 1;
             },
             applyDelta: (totalCmdCount, updates) => {
                 renderer.applyDelta(totalCmdCount, updates);
                 syncAssets();
+                if (renderer.missingTextureIds().size === 0) markDrawn();
                 window.__dfFrameCount = (window.__dfFrameCount || 0) + 1;
             },
+            onEvent: T,
             requestBridgingDelta: lastSeq => sendInputBuffer(DFProtocol.encodeGapAck(lastSeq)),
             requestFullFrame: () => sendInputBuffer(DFProtocol.encodeKeyframeRequest()),
             onGapRequest: (lastSeq, frame) => {
@@ -92,6 +200,17 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
         let pictureArrivedSinceRequest = false;
 
         function syncAssets() {
+            const syncT0 = performance.now();
+            try { syncAssetsInner(); } finally {
+                // Accumulated, not thresholded. A cost small enough to pass a
+                // threshold is still a cost when it runs once per frame, and
+                // reporting only the outliers is how a per-frame cost hides.
+                syncTotalMs += performance.now() - syncT0;
+                syncCalls++;
+            }
+        }
+
+        function syncAssetsInner() {
             // A reclaimed atlas means the textures we gave up on are no longer
             // hopeless - there is simply an empty atlas to put them in now.
             // Forget the earlier verdict, or those ids would stay black forever.
@@ -114,6 +233,7 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
             renderer.assetsReady = missing.size === 0;
             window.__dfAssetsMissing = allMissing.size;
             window.__dfAssetsUnfetchable = unfetchable.size;
+            noteMissing(missing.size);
             if (missing.size === 0) {
                 assetBridgeKey = '';
                 if (isDebug && assetBridgeAt !== 0) {
@@ -171,11 +291,33 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
             const seq = sequencer.lastSeq;
             // Send the missing ids themselves, not the held set: the host then
             // resends exactly these, with no frame lookup that could disagree.
-            sendInputBuffer(DFProtocol.encodeAssetBridgeRequest(seq, missing));
+            sendInputBuffer(DFProtocol.encodeAssetBridgeRequest(seq, missing, missingChunksFor(missing)));
             if (isDebug) {
                 console.log(`[Assets] Holding frame ${seq}: ${missing.size} texture(s) missing [${key}], requesting bridge (opcode 0x08)`);
             }
         }
+
+        // One call, one instant, one answer. The load gate used to subtract a
+        // give-up count collected at one time from a missing count collected at
+        // another, which can go negative and pass the gate on a client that is
+        // missing everything - a gate that cannot fail is not a gate.
+        window.__dfBenchSnapshot = () => {
+            const allMissing = renderer.missingTextureIds();
+            let obtainable = 0;
+            for (const id of allMissing) {
+                if (!unfetchable.has(id)) obtainable++;
+            }
+            const t = performance.now();
+            return {
+                t,
+                missingTotal: allMissing.size,
+                obtainable,
+                displayEvents: bench.display.length,
+                webgl: renderer.isWebGL,
+                glRenderer: renderer.glRenderer,
+                seq: sequencer.lastSeq,
+            };
+        };
 
         // Rotating 1-byte debug stamp (1..255) for physical M2P latency
         let currentDebugStamp = 0;
@@ -184,10 +326,23 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
         const m2pSamples = [];
         window.__m2pSamples = m2pSamples;
 
+        // Frames that answered an input and have been applied but not yet shown.
+        // Cleared by the next paint rather than by the next frame: a frame the
+        // client is holding for missing artwork has not been seen yet, and the
+        // wait for that artwork is part of what the input cost the player.
+        const benchPendingStamps = [];
+        // A stamp older than this answers a question nobody asked any more. It
+        // is not attributed, so a lost frame cannot be reported as a very slow
+        // one.
+        const BENCH_STAMP_MAX_AGE_MS = 1500;
+
         function getNextDebugStamp() {
             if (!isDebug && !window.__enableM2P) return 0;
             currentDebugStamp = (currentDebugStamp % 255) + 1;
-            pendingStamps.set(currentDebugStamp, performance.now());
+            const at = performance.now();
+            bench.inputsSent++;
+            pendingStamps.set(currentDebugStamp, at);
+            bench.inputSent.record(currentDebugStamp, at);
             if (pendingStamps.size > 100) {
                 const oldestKey = pendingStamps.keys().next().value;
                 pendingStamps.delete(oldestKey);
@@ -240,16 +395,79 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
         }
 
         let animationFrameId = null;
+        let lastLoopAt = 0;
+        let pendingInputMs = 0;
+        let syncTotalMs = 0;
+        let syncCalls = 0;
+        let cmdsSeen = 0;
         function renderLoop() {
             if (isDestroyed) return;
 
             if (isDebug) renderFrameCount++;
 
+            // Pictures first, so a frame that is waiting on one can be drawn in
+            // this same frame rather than the next - but only for as long as the
+            // budget allows. Whatever is left waits; nothing is lost, because a
+            // picture is only ever held until it has been ingested once.
+            if (assetQueue.length > 0) {
+                const until = performance.now() + ASSET_INGEST_BUDGET_MS;
+                while (assetQueue.length > 0 && performance.now() < until) {
+                    ingestTextureChunk(assetQueue.shift());
+                }
+                syncAssets();
+            }
+
+            if (!renderer.assetsReady && renderer.dirty) {
+                T('held-back', { missing: renderer.missingTextureIds().size });
+            }
+            // How long the paint itself takes, and how long the loop took to come
+            // round again. A slow paint and a throttled loop produce the same
+            // stutter and need opposite fixes, so both are recorded.
+            const loopAt = performance.now();
+            if (pendingInputMs > 20) T('input-cost', { ms: Math.round(pendingInputMs) });
+            pendingInputMs = 0;
+            if (deltaStatN > 0) {
+                T('delta-stat', { n: deltaStatN, changedNothing: deltaStatEmpty, updates: deltaStatCarry });
+                deltaStatN = 0; deltaStatEmpty = 0; deltaStatCarry = 0;
+            }
+            if (syncTotalMs > 0) {
+                T('sync-total', { ms: Math.round(syncTotalMs), calls: syncCalls, cmds: renderer.commands ? renderer.commands.length : -1 });
+                syncTotalMs = 0; syncCalls = 0;
+            }
+            if (lastLoopAt) T('loop-gap', { ms: loopAt - lastLoopAt });
+            lastLoopAt = loopAt;
+            const paintT0 = performance.now();
             const didRender = renderer.render();
+            const paintMs = performance.now() - paintT0;
+            if (paintMs > 10) T('paint-cost', { ms: Math.round(paintMs), drew: didRender });
+            if (didRender) T('draw', { seq: sequencer.lastSeq });
 
             if (didRender) {
+                bench.paints++;
+                const now = performance.now();
+                // Counted only when the canvas now shows something it did not
+                // show before. This is the frame the player saw change.
+                if (renderer.paintChanged) {
+                    bench.display.push(now);
+                    // How much of the picture changed, for telling a response
+                    // apart from the animation the game does by itself.
+                    bench.changeMagnitude.push(renderer.paintMagnitude);
+                } else {
+                    bench.paintsUnchanged++;
+                }
+
+                {
+                    const { sample, remaining } = attributePending(benchPendingStamps, {
+                        now,
+                        paintChanged: renderer.paintChanged,
+                        maxAgeMs: BENCH_STAMP_MAX_AGE_MS,
+                    });
+                    benchPendingStamps.length = 0;
+                    for (let i = 0; i < remaining.length; i++) benchPendingStamps.push(remaining[i]);
+                    if (sample) bench.latency.push(sample);
+                }
+
                 if ((isDebug || window.__enableM2P) && pendingRenderStamps.length > 0) {
-                    const now = performance.now();
                     for (let i = 0; i < pendingRenderStamps.length; i++) {
                         const stamp = pendingRenderStamps[i];
                         const sentTime = pendingStamps.get(stamp);
@@ -305,6 +523,18 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
         window.addEventListener('resize', onWindowResize);
 
         function sendInputBuffer(buf) {
+            // Timed because the send is the only thing that runs per pointer move,
+            // and a pointer move is what a drag is made of. A blocking send here
+            // starves the frame loop directly.
+            const inT0 = performance.now();
+            try {
+                sendInputBufferInner(buf);
+            } finally {
+                pendingInputMs += performance.now() - inT0;
+            }
+        }
+
+        function sendInputBufferInner(buf) {
             if (inputDc && inputDc.readyState === 'open') {
                 inputDc.send(buf); // True Reliable Ordered WebRTC DataChannel!
             } else if (dc && dc.readyState === 'open') {
@@ -318,6 +548,28 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
 // renderer once every chunk has arrived; until then the frame that references
 // it stays gated.
 const pendingTextures = new Map();
+
+// Which chunk of each missing picture the client is actually waiting for.
+//
+// Without this the request can only say "I am missing picture 10", and the host
+// answers by sending all 37 chunks again. The transport is at its fullest when
+// the last chunk is queued, so the chunk that gets dropped is the last one -
+// the same chunk that was lost - and the pair repeats indefinitely while the
+// screen stays black. Naming the chunk makes the repair a single message.
+function missingChunksFor(ids) {
+    const out = new Map();
+    for (const id of ids) {
+        const p = pendingTextures.get(id);
+        if (!p || p.chunkCount <= 1) {
+            out.set(id, 0);
+            continue;
+        }
+        let at = 0;
+        while (at < p.chunkCount && p.chunks.has(at)) at++;
+        out.set(id, at < p.chunkCount ? at : 0);
+    }
+    return out;
+}
 
 function ingestTextureChunk(chunk) {
             // Any chunk arriving proves the picture pipeline is working, so it
@@ -406,20 +658,75 @@ function ingestTextureChunk(chunk) {
             if (isDestroyed) return;
             if (isDebug) bytesReceived += buffer.byteLength;
 
+            // The bench's controlled-load probe, counted before anything else
+            // looks at the message. This handler is the only place in the page
+            // that sees every message, so it is the only place a probe message
+            // can be counted as arriving, and the sequence number the message
+            // carries is what turns "fewer arrived than were sent" into "these
+            // messages did not".
+            const probe = DFProtocol.decodeProbe(buffer);
+            if (probe) {
+                // Counted in three numbers as well as logged. The wire log is
+                // capped and drops its oldest entries, so at the rates this probe
+                // reaches it stops describing the window - and a gap count read
+                // back from it would then be counting the log's own eviction. The
+                // channel is ordered, so the lowest number seen, the highest and
+                // the count say exactly what is missing (probeArrivals).
+                const p = bench.probe;
+                p.count++;
+                if (p.min === null || probe.seq < p.min) p.min = probe.seq;
+                if (p.max === null || probe.seq > p.max) p.max = probe.seq;
+                if (p.last !== null && probe.seq <= p.last) p.reordered++;
+                p.last = probe.seq;
+                wire.record('probe', buffer.byteLength, performance.now(), probe.seq);
+                return;
+            }
+
             const chunk = DFProtocol.decodeTexture(buffer);
             if (chunk) {
+                bench.bytesIn.textures += buffer.byteLength;
+                wire.record('artwork', buffer.byteLength, performance.now());
                 ingestTextureChunk(chunk);
                 // A held frame may now be displayable, or may still be waiting
                 // on others; re-check rather than assuming this one unblocked it.
                 syncAssets();
                 return;
             }
-
             if (isDebug) streamFrameCount++;
+            const handlerT0 = performance.now();
             const frame = DFProtocol.decodeFrame(buffer);
             if (frame) {
-                if ((isDebug || window.__enableM2P) && frame.stamp && pendingStamps.has(frame.stamp)) {
-                    pendingRenderStamps.push(frame.stamp);
+                T('frame-in', { seq: frame.seq, type: frame.type, bytes: buffer.byteLength });
+                bench.bytesIn.frames += buffer.byteLength;
+                // A keyframe and a delta are different things on the wire: one
+                // is a whole screen and one is a handful of changed cells, and a
+                // spike that turns out to be a keyframe is a different fault
+                // from one behind a burst of deltas.
+                wire.record(frame.type === 'full' ? 'keyframe' : 'frame', buffer.byteLength,
+                            performance.now(), frame.seq);
+                // This frame answers an input. Which paint shows it is decided
+                // by the paint itself, not by the arrival: if the client is
+                // holding this frame for artwork, the wait belongs to the answer.
+                if ((isDebug || window.__enableM2P) && frame.stamp) {
+                    if (pendingStamps.has(frame.stamp)) {
+                        pendingRenderStamps.push(frame.stamp);
+                        const sentAt = bench.inputSent.get(frame.stamp);
+                        if (sentAt !== undefined) {
+                            bench.stampedFrames++;
+                            bench.stampFramesSeen++;
+                            benchPendingStamps.push({ stamp: frame.stamp, sentAt });
+                        } else {
+                            // The answer outlived the record of the input it
+                            // belongs to, so it cannot be tied to one. Counted,
+                            // not credited.
+                            bench.stampsUnknown++;
+                        }
+                    } else {
+                        // A stamp this page never issued, or one it has already
+                        // forgotten: the same thing from the bench's side, and
+                        // not an answer the client can be said to have seen.
+                        bench.stampsUnknown++;
+                    }
                 }
 
                 if (isDebug) {
@@ -478,10 +785,49 @@ function ingestTextureChunk(chunk) {
                     // repaired by the bridging protocol rather than by a
                     // retransmit, which would stall and head-of-line block
                     // every later frame queued behind it.
+                    //
+                    // Making this reliable was measured and was worse: with the
+                    // link busy the retransmits queue behind the traffic they
+                    // were meant to protect, and draws fell from 3/s to 2/s.
                     ordered: true,
                     maxRetransmits: 0
                 });
                 dc.binaryType = 'arraybuffer';
+
+                // Pictures get their own reliable channel.
+                //
+                // They shared the unreliable stream channel, and that channel is
+                // right for frames: a frame is small and one that is lost is
+                // replaced by asking again, so retransmitting it - and blocking
+                // every frame queued behind it - would make the display late in
+                // order to fix something it can already replace. A picture chunk
+                // is different: it cannot be replaced by a later chunk, it has to
+                // be resent, and no frame that names the picture can be drawn
+                // until the last chunk lands. One channel for both means choosing
+                // between a display that is late and a display that is black.
+                assetDc = pc.createDataChannel('df-assets', {
+                    ordered: true
+                });
+                assetDc.binaryType = 'arraybuffer';
+                // Received here, ingested in the render loop.
+                //
+                // Decoding and uploading a picture is the most expensive thing
+                // this page does - a full-screen picture is several megabytes
+                // that has to be decompressed and copied into the atlas - and
+                // doing it inside the message callback gives the browser no
+                // chance to paint until the whole backlog is consumed. Measured
+                // while panning: pictures arriving at 124 a second, frames at 29,
+                // and only 2 draws, because the render loop was starving behind
+                // the pictures it was waiting for. Queuing them moves the work
+                // into the frame loop, where it can be given a time budget.
+                assetDc.onmessage = ev => {
+                    const chunk = DFProtocol.decodeTexture(ev.data);
+                    if (!chunk) return;
+                    bench.bytesIn.textures += ev.data.byteLength;
+                    wire.record('artwork', ev.data.byteLength, performance.now());
+                    T('pic-in', { id: chunk.texId, idx: chunk.chunkIndex, of: chunk.chunkCount, bytes: ev.data.byteLength });
+                    assetQueue.push(chunk);
+                };
 
                 inputDc = pc.createDataChannel('df-input', {
                     ordered: true
@@ -519,6 +865,45 @@ function ingestTextureChunk(chunk) {
                     if (event.data instanceof ArrayBuffer) {
                         handleFrameBinary(event.data);
                     }
+                };
+
+                // The bench's view of the transport itself. Every other counter
+                // in this page counts what the JavaScript handler ran; this one
+                // counts what the browser's own data channel took in, and the
+                // difference between the two is where a message was discarded if
+                // it was discarded above this code rather than in it. Exposed as
+                // a function because getStats() is async and a snapshot has to be
+                // taken at a moment the bench chooses.
+                window.__dfTransportStats = async () => {
+                    if (!pc) return null;
+                    const report = await pc.getStats();
+                    const out = { dataChannels: {}, transport: null, candidatePairs: [] };
+                    report.forEach((s) => {
+                        if (s.type === 'data-channel') {
+                            out.dataChannels[s.label || s.id] = {
+                                id: s.id, label: s.label ?? null, state: s.state ?? null,
+                                messagesSent: s.messagesSent ?? null, bytesSent: s.bytesSent ?? null,
+                                messagesReceived: s.messagesReceived ?? null,
+                                bytesReceived: s.bytesReceived ?? null,
+                            };
+                        } else if (s.type === 'transport') {
+                            out.transport = {
+                                bytesSent: s.bytesSent ?? null, bytesReceived: s.bytesReceived ?? null,
+                                packetsSent: s.packetsSent ?? null, packetsReceived: s.packetsReceived ?? null,
+                            };
+                        } else if (s.type === 'candidate-pair' && (s.selected || s.state === 'succeeded')) {
+                            out.candidatePairs.push({
+                                id: s.id, selected: !!s.selected, state: s.state ?? null,
+                                bytesSent: s.bytesSent ?? null, bytesReceived: s.bytesReceived ?? null,
+                                packetsSent: s.packetsSent ?? null, packetsReceived: s.packetsReceived ?? null,
+                            });
+                        }
+                    });
+                    out.iceConnectionState = pc.iceConnectionState;
+                    out.connectionState = pc.connectionState;
+                    out.streamChannelState = dc ? dc.readyState : null;
+                    out.streamBufferedAmount = dc ? dc.bufferedAmount : null;
+                    return out;
                 };
 
                 pc.onicecandidate = (event) => {
@@ -690,11 +1075,11 @@ function ingestTextureChunk(chunk) {
                 ref={canvasRef}
                 className="block w-full h-full cursor-default [image-rendering:pixelated] [image-rendering:crisp-edges]"
             />
-            {!isWebRTCReady && (
-                <div className="absolute inset-0 flex items-center justify-center bg-black/60 z-10 backdrop-blur-sm pointer-events-none transition-opacity duration-300">
+            {(!isWebRTCReady || !hasDrawn) && (
+                <div data-df-overlay className="absolute inset-0 flex items-center justify-center bg-black/60 z-10 backdrop-blur-sm pointer-events-none transition-opacity duration-300">
                     <div className="flex flex-col items-center gap-3 text-slate-200">
                         <div className="w-8 h-8 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin"></div>
-                        <span className="text-xs font-mono uppercase tracking-widest text-slate-400">Connecting WebRTC P2P...</span>
+                        <span className="text-xs font-mono uppercase tracking-widest text-slate-400">{isWebRTCReady ? 'Loading picture...' : 'Connecting WebRTC P2P...'}</span>
                     </div>
                 </div>
             )}

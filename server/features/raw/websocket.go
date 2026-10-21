@@ -262,6 +262,14 @@ func (c *wsConn) WritePing(payload []byte) error {
 	return c.write(wsOpcodePing, payload)
 }
 
+// SetWriteDeadline bounds how long a write may block on a browser that has
+// stopped draining its socket. Used by the stamp echo, which has to be written
+// before the frame it names is released and therefore cannot be handed to a
+// goroutine of its own.
+func (c *wsConn) SetWriteDeadline(deadline time.Time) error {
+	return c.conn.SetWriteDeadline(deadline)
+}
+
 // SetReadDeadline bounds how long a read waits for the browser.
 func (c *wsConn) SetReadDeadline(deadline time.Time) error {
 	return c.conn.SetReadDeadline(deadline)

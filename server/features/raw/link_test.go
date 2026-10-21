@@ -203,7 +203,13 @@ func TestLinkServer_DropsConnectionOnOversizedFrame(t *testing.T) {
 // one-byte codec tag, then the picture. The tag is part of the format, so a test
 // that omits it is testing a format nothing speaks.
 func encodeCodecFrame(codec Codec, image []byte) []byte {
-	return encodeFrame(append([]byte{byte(codec)}, image...))
+	return encodeStampedFrame(codec, 0, image)
+}
+
+// encodeStampedFrame matches what the interposer writes: a codec byte, then the
+// stamp of the input this frame answers (0 when none is waiting), then the picture.
+func encodeStampedFrame(codec Codec, stamp uint8, image []byte) []byte {
+	return encodeFrame(append([]byte{byte(codec), stamp}, image...))
 }
 
 // A lossless frame must survive the link with its codec and its size intact. The
@@ -235,5 +241,50 @@ func TestLinkServer_PublishesLosslessFramesWithDimensions(t *testing.T) {
 	}
 	if frame.Codec.ContentType() != "image/png" {
 		t.Errorf("content type is %q, want image/png", frame.Codec.ContentType())
+	}
+}
+
+// A frame answering an input must carry that input's number back, because the
+// client has nothing else to match its own round trip against.
+func TestLinkServer_PublishesTheInputStamp(t *testing.T) {
+	_, holder, listener := startLinkServer(t)
+	conn := dialInterposer(t, listener)
+	defer conn.Close()
+
+	png := buildTestPNG(16, 16)
+	if _, err := conn.Write(encodeStampedFrame(CodecPNG, 42, png)); err != nil {
+		t.Fatalf("failed to write frame: %v", err)
+	}
+	waitFor(t, "the stamped frame to arrive", func() bool {
+		_, ok := holder.Latest()
+		return ok
+	})
+
+	frame, _ := holder.Latest()
+	if frame.Stamp != 42 {
+		t.Errorf("stamp is %d, want 42", frame.Stamp)
+	}
+	if !bytes.Equal(frame.Image, png) {
+		t.Errorf("the stamp byte was not stripped from the picture")
+	}
+}
+
+// A frame answering nothing must say so, rather than echoing a stale number that
+// the client would then time against the wrong input.
+func TestLinkServer_UnstampedFrameReadsZero(t *testing.T) {
+	_, holder, listener := startLinkServer(t)
+	conn := dialInterposer(t, listener)
+	defer conn.Close()
+
+	png := buildTestPNG(16, 16)
+	if _, err := conn.Write(encodeStampedFrame(CodecPNG, 0, png)); err != nil {
+		t.Fatalf("failed to write frame: %v", err)
+	}
+	waitFor(t, "the frame to arrive", func() bool {
+		_, ok := holder.Latest()
+		return ok
+	})
+	if frame, _ := holder.Latest(); frame.Stamp != 0 {
+		t.Errorf("stamp is %d, want 0", frame.Stamp)
 	}
 }

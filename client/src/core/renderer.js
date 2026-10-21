@@ -1,3 +1,5 @@
+import { paintHash, changeMagnitude } from './measure.js';
+
 // High-performance WebGL2 Instanced Sprite Renderer with 2D Canvas Fallback
 export class DFRenderer {
     constructor(canvas) {
@@ -24,6 +26,33 @@ export class DFRenderer {
 
         this.lastDrawCalls = 0;
         this.lastSprites = 0;
+
+        // What the canvas currently shows, and whether the last paint changed it.
+        // The bench needs both: a redraw that resolves to the same instances is
+        // the same picture, and counting it as a frame the player saw is how the
+        // old measurement hid the stalls it existed to find.
+        this.lastPaintHash = null;
+        this.paintChanged = false;
+        this.isWebGL = !!this.gl;
+        // Which renderer is actually behind the canvas. Not a diagnostic: a
+        // headless Chromium that fell back to SwiftShader paints the same
+        // picture through a software rasteriser that blocks the main thread for
+        // seconds, and every latency number taken through it belongs to the
+        // rasteriser rather than to the path. The bench reads this to refuse
+        // such a run.
+        this.glRenderer = null;
+        if (this.gl) {
+            const dbg = this.gl.getExtension('WEBGL_debug_renderer_info');
+            this.glRenderer = dbg
+                ? this.gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)
+                : this.gl.getParameter(this.gl.RENDERER);
+            console.log('[DFRenderer] GL renderer:', this.glRenderer);
+        }
+        // The draw state behind the picture currently on screen, kept so the
+        // next paint can be measured against it rather than merely compared with
+        // it: how much of the picture changed is what separates a response from
+        // the animation the game does on its own.
+        this.lastInstances = null;
 
         if (this.gl) {
             console.log('[DFRenderer] Initialized WebGL2 Instanced Renderer');
@@ -315,6 +344,12 @@ export class DFRenderer {
             }
         }
 
+        // What the delta actually carried, for the trace: a frame that arrives
+        // with no updates and the same count changes nothing, so it can be
+        // applied perfectly and still leave the display showing an old picture.
+        if (this.onDeltaStat) {
+            this.onDeltaStat({ updates: updates ? updates.length : 0, total: totalCmdCount, len: this.commands.length, changed });
+        }
         if (changed) this.dirty = true;
     }
 
@@ -356,15 +391,42 @@ export class DFRenderer {
     render() {
         // Hold the last good frame until its assets arrive. Drawing now would
         // put a frame with holes in it on screen.
+        //
+        // This is a correctness rule, not a smoothness one: a frame drawn with a
+        // tile missing is a frame that shows something the game never drew, and
+        // holding the previous complete picture instead is the only way to keep
+        // what is on screen true. The cost is that the display stops while a
+        // picture is outstanding - so the answer to a stalled display is to make
+        // the pictures arrive, never to relax this.
         if (!this.assetsReady) return false;
         if (!this.dirty) return false;
 
+        const before = this.lastPaintHash;
         if (this.gl) {
             this.renderWebGL();
         } else {
             this.renderCanvas2D();
         }
+        this.paintChanged = this.lastPaintHash !== null && this.lastPaintHash !== before;
         return true;
+    }
+
+    /** Records what is on the canvas now. Called by both render paths. */
+    notePaint(instances, count) {
+        this.lastPaintHash = paintHash(instances, count, {
+            width: this.canvas.width,
+            height: this.canvas.height,
+            atlasGeneration: this.atlasGeneration || 0,
+        });
+
+        const floats = Math.max(0, Math.min(count, (instances.length / 12) | 0)) * 12;
+        const current = instances.subarray(0, floats);
+        this.paintMagnitude = this.lastInstances ? changeMagnitude(this.lastInstances, current) : 0;
+        if (!this.lastInstances || this.lastInstances.length !== current.length) {
+            this.lastInstances = current.slice();
+        } else {
+            this.lastInstances.set(current);
+        }
     }
 
     renderWebGL() {
@@ -377,6 +439,9 @@ export class DFRenderer {
         if (count === 0) {
             this.lastDrawCalls = 0;
             this.lastSprites = 0;
+            // The canvas is now black. Identified through the renderer's own
+            // buffer rather than the local one, which is not in scope yet here.
+            this.notePaint(this.instanceData, 0);
             this.dirty = false;
             return;
         }
@@ -440,10 +505,14 @@ export class DFRenderer {
 
         this.lastDrawCalls = validInstances > 0 ? 1 : 0;
         this.lastSprites = validInstances;
+        this.notePaint(data, validInstances);
         this.dirty = false;
     }
 
     renderCanvas2D() {
+        // No instance buffer to identify the picture by. Leaving the hash alone
+        // makes the bench fail its sampler-liveness check instead of quietly
+        // reporting a timeline built from nothing.
         const ctx = this.ctx;
         ctx.fillStyle = '#000';
         ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);

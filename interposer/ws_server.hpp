@@ -33,6 +33,12 @@ static void ws_log(const char* fmt, ...) {
 
 // Forward declaration
 void handle_client_input_event(const uint8_t* data, size_t len);
+// The producer's own counters, as JSON. Served here rather than scraped from the
+// log so a bench can read the byte total and the window size it was taken at,
+// without parsing stderr and without a second source of truth.
+std::string df_stats_json();
+// The host-side wire log, read once per run by the spike forensics.
+std::string df_wire_json();
 void sync_client_textures(int fd);
 void handle_client_text_message(int fd, const std::string& msg);
 void handle_client_disconnected(int fd);
@@ -120,6 +126,24 @@ private:
 
             std::string init_json = "{\"type\":\"init\",\"grid_w\":160,\"grid_h\":60,\"font_w\":8,\"font_h\":12}";
             send_ws_text(client.fd, init_json);
+            return;
+        }
+
+        // The producer's counters, before static serving so a request for them
+        // can never be answered by a file that happens to share the name.
+        if (path == "/df-stats" || path == "/df-wire") {
+            std::string body = (path == "/df-wire") ? df_wire_json() : df_stats_json();
+            std::ostringstream oss;
+            oss << "HTTP/1.1 200 OK\r\n"
+                << "Content-Type: application/json\r\n"
+                << "Content-Length: " << body.size() << "\r\n"
+                << "Connection: close\r\n"
+                << "Cache-Control: no-store\r\n"
+                << "Access-Control-Allow-Origin: *\r\n\r\n";
+            std::string header_str = oss.str();
+            send_raw(client.fd, header_str.data(), header_str.size());
+            if (!body.empty()) send_raw(client.fd, body.data(), body.size());
+            client.state = STATE_DEAD;
             return;
         }
 

@@ -1,6 +1,21 @@
 package raw
 
-import "net/http"
+import (
+	_ "embed"
+	"net/http"
+	"strings"
+)
+
+// The page's measurement primitives are the client's, not a second copy of them.
+// measure.js is embedded here and spliced into the page's module at serve time,
+// and a test fails if the two files ever differ - a bench whose two paths
+// disagree about what a freeze is would be worse than no bench.
+//
+//go:embed measure.js
+var measureModule string
+
+// measureMarker is where the embedded module is spliced into the page.
+const measureMarker = "//__DF_MEASURE__"
 
 // rawPage is the entire browser side of the raw baseline: one image fed by the
 // MJPEG endpoint, one WebSocket for input, and a small overlay so a human can
@@ -56,7 +71,8 @@ const rawPage = `<!doctype html>
 <body>
 <img id="screen" src="/raw.mjpg" alt="raw frame stream" draggable="false">
 <div id="hud" class="idle">waiting for the stream...</div>
-<script>
+<script type="module">
+//__DF_MEASURE__
 (function () {
   'use strict';
 
@@ -68,6 +84,72 @@ const rawPage = `<!doctype html>
   var socket = null;
   var socketOpen = false;
   var status = { fps: 0, w: 0, h: 0, frames: 0, viewers: 0, link: false };
+
+  // What the bench reads. One definition of every number it reports.
+  //
+  //   display  - when the picture on screen became a different picture. There is
+  //              no second subscription to the stream here and no timeline taken
+  //              from the server: the element that shows the picture is looked
+  //              at, and a sample is recorded only when what it shows has
+  //              changed. An image fed by multipart/x-mixed-replace fires exactly
+  //              one load event, for the first part, and reports neither how many
+  //              parts it drew nor when - so looking at it is the only honest
+  //              reading available.
+  //   latency  - input sent -> the visible change that answered it, tied to the
+  //              input's own stamp rather than to a position in a list.
+  var bench = {
+    path: 'raw',
+    startedAt: performance.now(),
+    display: [],
+    changeMagnitude: [],
+    // The ordered log of the inputs this page sent, with a lookup by stamp built
+    // from the same records. A Map keyed by the stamp alone cannot hold more
+    // inputs than the stamp space - a 20 s window sends ~380 of them, so two
+    // thirds of the window was overwritten before the bench read it. See
+    // measure.js's inputLog.
+    inputSent: inputLog(),
+    latency: [],
+    echoes: 0,
+    sampled: 0,
+    // Coverage: what the page sent, and what came back stamped. The host's own
+    // count of the inputs it answered is a different number and is reported
+    // next to this one rather than subtracted from it.
+    inputsSent: 0,
+    stampFramesSeen: 0,
+    stampsUnknown: 0,
+    // A second echo arriving before the first one was credited: two stamped
+    // frames were written inside one display interval, so the display merged
+    // them and only the newer one can be credited. Counted because it is the
+    // residual ambiguity of pairing an out-of-band announcement with what the
+    // element displays.
+    echoesOvertaken: 0,
+    // The full-resolution verification timeline. See sampleDisplay.
+    nativeChanges: [],
+    nativeTimes: [],
+    nativeSamples: 0,
+    nativeCostMs: 0,
+    // Which GL stack this browser is actually rendering through. The raw page
+    // has no WebGL context of its own, so it asks for a throwaway one: without
+    // it the run carries no renderer record at all, and a run with no renderer
+    // record cannot be shown to have been taken on hardware GL. Current raw
+    // numbers were measured to be renderer-insensitive (86.0 ms SwiftShader
+    // against 85.8 ms Metal), so this is record-keeping and future safety rather
+    // than a correction of them - see docs/bench.md.
+    glRenderer: glRendererReport(),
+  };
+  // The page's own main thread, as long tasks. A blocked page cannot receive a
+  // part or repaint, so a display gap during one is not evidence about the link
+  // - and from the page alone the two are indistinguishable.
+  bench.longTasks = [];
+  try {
+    new PerformanceObserver(function (list) {
+      var entries = list.getEntries();
+      for (var i = 0; i < entries.length; i++) {
+        bench.longTasks.push([+entries[i].startTime.toFixed(1), +entries[i].duration.toFixed(1)]);
+      }
+    }).observe({ type: 'longtask', buffered: true });
+  } catch (e) { /* not exposed here; the bench then reports the gap unattributed */ }
+  window.__dfBench = bench;
 
   function renderHud() {
     var size = (status.w > 0 && status.h > 0) ? status.w + 'x' + status.h : 'no frames';
@@ -120,7 +202,33 @@ const rawPage = `<!doctype html>
       if (typeof update.viewers === 'number') { status.viewers = update.viewers; }
       if (typeof update.w === 'number') { status.w = update.w; }
       if (typeof update.h === 'number') { status.h = update.h; }
+      // The size the frames really are, so the bench can check the window pin
+      // instead of assuming it. Two pages that ask for different sizes encode
+      // different numbers of pixels, and a comparison between them is then
+      // between two different pictures.
+      if (status.w > 0 && status.h > 0) { bench.frameSize = { w: status.w, h: status.h }; }
       status.link = !!update.link;
+
+      // "The frame that answers your input has just been written to you."
+      // The stamp itself rides the picture stream as a part header, which the
+      // element displaying that stream cannot read, so the relay announces it
+      // here instead. Only frames whose pixels differ from the previous frame
+      // carry a stamp, so this is at most one message per input that visibly
+      // did something.
+      if (typeof update.echo === 'number') {
+        bench.echoes++;
+        if (pendingEcho !== null) { bench.echoesOvertaken++; }
+        var sentAt = bench.inputSent.get(update.echo);
+        if (sentAt !== undefined) {
+          bench.stampFramesSeen++;
+          pendingEcho = { stamp: update.echo, sentAt: sentAt, at: performance.now(), relayMs: update.t };
+        } else {
+          // A stamp this page never issued, or one it has already forgotten.
+          // Either way it cannot be tied to an input, so it produces no sample.
+          bench.stampsUnknown++;
+        }
+      }
+
       renderHud();
     };
   }
@@ -134,8 +242,29 @@ const rawPage = `<!doctype html>
   // Same 16 byte layout as DFProtocol.encodeInput: type, int16 x, int16 y,
   // uint8 button, uint32 sym, uint32 scancode, uint16 modifiers, all little
   // endian inside the fields.
+  // Round-trip timing. A frame that answers an input carries that input's number
+  // back, and the interposer only attaches a number to the first frame captured
+  // after the input arrived, so a measurement exists only when the input really
+  // did cause a redraw. Inputs that change nothing produce no sample at all.
+  var nextStamp = 1;
+  var pendingStamps = new Map();
+  window.__m2pHistory = [];
+
+  // Which messages count as an input the player made. RESIZE is a protocol
+  // message from the page, not something the player did, and nothing about it can
+  // be answered by a picture, so it is not part of the coverage count.
+  function stampWanted(type) {
+    return type !== RESIZE;
+  }
+
   function encodeInput(type, x, y, button, keycode, scancode, mod) {
-    var buffer = new ArrayBuffer(16);
+    if (stampWanted(type)) { bench.inputsSent++; }
+    var stamp = nextStamp;
+    nextStamp = nextStamp >= 255 ? 1 : nextStamp + 1;
+    var sentAt = performance.now();
+    pendingStamps.set(stamp, sentAt);
+    bench.inputSent.record(stamp, sentAt);
+    var buffer = new ArrayBuffer(17);
     var view = new DataView(buffer);
     view.setUint8(0, type);
     view.setInt16(1, x, true);
@@ -144,8 +273,160 @@ const rawPage = `<!doctype html>
     view.setUint32(6, (keycode || 0) >>> 0, true);
     view.setUint32(10, (scancode || 0) >>> 0, true);
     view.setUint16(14, (mod || 0) >>> 0, true);
+    view.setUint8(16, stamp);
     return buffer;
   }
+
+  // When the picture on screen became a different picture.
+  //
+  // There is no second subscription to the stream and no timeline taken from the
+  // server. The element that displays the stream reports nothing: it fires one
+  // load event for the first part and gives no access to the headers of the
+  // parts that follow. So the picture is read back through the element itself at
+  // every frame callback and compared with the last reading. A sample is
+  // recorded only when the picture really is different, which is the same rule
+  // the draw-command path uses.
+  //
+  // The sample is downscaled: reading 1280x720 back every frame would cost more
+  // than the thing being measured. Averaging rather than nearest-neighbour is
+  // deliberate - a change smaller than one sample cell still moves the average,
+  // so a moving cursor cannot be missed.
+  var SAMPLE_W = 256, SAMPLE_H = 144;
+  var sampleCanvas = document.createElement('canvas');
+  sampleCanvas.width = SAMPLE_W;
+  sampleCanvas.height = SAMPLE_H;
+  var sampleCtx = sampleCanvas.getContext('2d', { willReadFrequently: true });
+  var detector = new ChangeDetector();
+  var previousSample = null;
+  var pendingEcho = null;
+  var ECHO_MAX_AGE_MS = 1500;
+
+  // The verification pass: the same picture, read back at full resolution, while
+  // a stall is suspected.
+  //
+  // The downscale above is blind to anything smaller than one sample cell - a
+  // one-pixel change is lost in the average wherever it lands inside a 5x5 cell,
+  // measured at 96% of positions - and a missed change can only lengthen an
+  // apparent gap, so it inflates the freeze counts that this bench exists to
+  // report. Reading the whole picture back on every frame callback is not an
+  // option: measured in this browser, a full-resolution readback plus a hash of
+  // it costs 10.4ms, over half a display frame, which would be a bigger
+  // perturbation than the error it removes.
+  //
+  // So it runs when it can matter and not otherwise. The cheap sampler has just
+  // failed to see a change for SUSPECT_AFTER_MS, which is the only situation in
+  // which its blindness affects a reported number; then the picture is read back
+  // at full resolution every NATIVE_EVERY_MS for as long as the suspicion lasts,
+  // and any change found is recorded where the bench can reconcile it. On a
+  // stream that is moving, this costs nothing at all: at the ~25 changes a second
+  // these paths produce, the suspicion never starts.
+  //
+  // The residual cost is bounded and disclosed rather than assumed away. A
+  // readback costs about 11ms on this host and runs at most five times a second
+  // while a gap is forming, so it can delay the observation that ENDS a gap by
+  // one readback - inside the one-frame bound already quoted with the gap
+  // lengths - and it cannot accumulate, because the first change the cheap
+  // sampler sees ends the suspicion. The page reports its own total, and the
+  // bench prints it with the run.
+  //
+  // The comparison is exact - the whole buffer, with an early exit - rather than
+  // a hash: 3.7M byte comparisons that stop at the first difference, which is
+  // cheaper than hashing every byte and cannot miss anything the readback saw.
+  // What it still cannot see is a change that appears and is reversed between
+  // two checks: that limit is stated wherever the withheld-gap count is printed.
+  var SUSPECT_AFTER_MS = 100;
+  var NATIVE_EVERY_MS = 200;
+  var nativeCanvas = document.createElement('canvas');
+  var nativeCtx = nativeCanvas.getContext('2d', { willReadFrequently: true });
+  var nativePrev = null;
+  var nativeAt = 0;
+  var lastCheapChangeAt = 0;
+
+  // Called when the bench starts a measured window, so the first verification
+  // sample after it establishes a new baseline instead of comparing against a
+  // picture from before the window.
+  bench.nativeReset = function () {
+    nativePrev = null;
+  };
+
+  function nativeSample(at) {
+    var w = screen.naturalWidth, h = screen.naturalHeight;
+    if (nativeCanvas.width !== w || nativeCanvas.height !== h) {
+      nativeCanvas.width = w;
+      nativeCanvas.height = h;
+      nativePrev = null;
+    }
+    var started = performance.now();
+    nativeCtx.drawImage(screen, 0, 0);
+    var data = nativeCtx.getImageData(0, 0, w, h).data;
+    var changed = false;
+    if (nativePrev === null || nativePrev.length !== data.length) {
+      // The first look has nothing to be different from.
+      nativePrev = data;
+    } else {
+      for (var i = 0; i < data.length; i++) {
+        if (data[i] !== nativePrev[i]) { changed = true; break; }
+      }
+      nativePrev = data;
+    }
+    if (changed) { bench.nativeChanges.push(at); }
+    bench.nativeTimes.push(at);
+    bench.nativeSamples++;
+    bench.nativeCostMs += performance.now() - started;
+  }
+
+  function sampleDisplay() {
+    if (screen.naturalWidth > 0 && screen.naturalHeight > 0) {
+      try {
+        sampleCtx.drawImage(screen, 0, 0, SAMPLE_W, SAMPLE_H);
+        var pixels = sampleCtx.getImageData(0, 0, SAMPLE_W, SAMPLE_H).data;
+        var hash = viewHash(pixels);
+        bench.sampled++;
+        var at = performance.now();
+        // Verify only while the cheap sampler is in the situation where its
+        // blindness could matter: it has not seen a change for a while, so any
+        // gap now forming is one the bench would report.
+        if (at - lastCheapChangeAt >= SUSPECT_AFTER_MS && at - nativeAt >= NATIVE_EVERY_MS) {
+          nativeAt = at;
+          nativeSample(at);
+        }
+        if (detector.observe(hash, at)) {
+          lastCheapChangeAt = at;
+          bench.display.push(at);
+          // How much of the picture changed, not just whether it did. Water
+          // animates in this game without anyone touching it, so "something
+          // changed" is not evidence that an input did something - the size of
+          // the change is.
+          bench.changeMagnitude.push(previousSample ? changeMagnitude(previousSample, pixels) : 0);
+          previousSample = new Uint8ClampedArray(pixels);
+          // The answering frame is the first thing this stream shows after the
+          // relay announced it. That is only true because the relay writes the
+          // announcement BEFORE it releases the frame's bytes: announced first,
+          // the frame cannot be displayed before the page knows which input it
+          // answered - which is what used to happen, and what credited the next
+          // frame instead (19 of 226 echoes in the measured run, each sample
+          // overstated by about one frame interval).
+          //
+          // An echo that has aged out is dropped rather than credited: a stamp
+          // that old is a missing answer, not a slow one.
+          if (pendingEcho !== null && at - pendingEcho.at > ECHO_MAX_AGE_MS) { pendingEcho = null; }
+          if (pendingEcho !== null && at >= pendingEcho.at) {
+            var sample = attributePaint({
+              stamp: pendingEcho.stamp,
+              sentAt: pendingEcho.sentAt,
+              now: at,
+              paintChanged: true,
+              maxAgeMs: ECHO_MAX_AGE_MS,
+            });
+            if (sample) bench.latency.push(sample);
+            pendingEcho = null;
+          }
+        }
+      } catch (error) { /* an unreadable surface is not a measurement */ }
+    }
+    window.requestAnimationFrame(sampleDisplay);
+  }
+  window.requestAnimationFrame(sampleDisplay);
 
   function modMask(event) {
     var mod = 0;
@@ -408,7 +689,12 @@ func (c *RawController) ServePage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The measurement module is spliced in rather than fetched, so the page stays
+	// a single response with no import graph and so both paths provably compute a
+	// freeze the same way.
+	page := strings.Replace(rawPage, measureMarker, measureModule, 1)
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	_, _ = w.Write([]byte(rawPage))
+	_, _ = w.Write([]byte(page))
 }

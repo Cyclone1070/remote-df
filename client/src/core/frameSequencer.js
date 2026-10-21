@@ -14,6 +14,11 @@ export class FrameSequencer {
         onGapRequest,
         onKeyframeRequest,
         onRecovered,
+        // Every decision this makes, for a trace that can be read afterwards.
+        // The recovery cadence is frame-driven, so without a record of which
+        // frames were held and when they were released, a stalled display can
+        // only be described, not explained.
+        onEvent,
         gapRetryFrames = 4,
         keyframeRetryFrames = 15,
         maxPending = 30
@@ -25,6 +30,7 @@ export class FrameSequencer {
         this.onGapRequest = onGapRequest || (() => {});
         this.onKeyframeRequest = onKeyframeRequest || (() => {});
         this.onRecovered = onRecovered || (() => {});
+        this.onEvent = onEvent || (() => {});
         this.gapRetryFrames = gapRetryFrames;
         this.keyframeRetryFrames = keyframeRetryFrames;
         this.maxPending = maxPending;
@@ -109,9 +115,14 @@ export class FrameSequencer {
             this.pending.delete(Math.min(...this.pending.keys()));
         }
 
+        this.onEvent('hold', {
+            seq: frame.seq, afterSeq: this.lastSeq, pending: this.pending.size,
+        });
+
         if (!this.awaitingBridge || ++this.gapFrames >= this.gapRetryFrames) {
             this.awaitingBridge = true;
             this.gapFrames = 0;
+            this.onEvent('bridge-request', { afterSeq: this.lastSeq, forSeq: frame.seq });
             this.onGapRequest(this.lastSeq, frame);
             this.requestBridgingDelta(this.lastSeq);
         }
@@ -120,6 +131,7 @@ export class FrameSequencer {
     // Applies a frame, drops anything it supersedes, then replays whatever
     // buffered frames now sit contiguously on top of it.
     applyAt(frame) {
+        this.onEvent('apply', { seq: frame.seq, wasHeld: this.pending.has(frame.seq) });
         this.lastSeq = frame.seq;
         this.applyDelta(frame.totalCmdCount, frame.updates);
 
