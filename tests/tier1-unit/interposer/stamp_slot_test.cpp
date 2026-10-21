@@ -29,31 +29,31 @@ using stamp_slot::State;
 static void test_every_input_is_accounted_for() {
     State s;
     s.receive(1, 0);
-    s.receive(2, 10);            // overwrites 1 before any frame claimed it
-    CHECK(s.overwritten == 1, "an input replaced before being claimed must be counted as overwritten");
+    s.receive(2, 10);            // waits behind the first, not an overwrite
+    CHECK(s.overwritten == 0, "a second input waits its turn instead of replacing the first");
+    CHECK(s.waiting_count == 2, "both inputs are waiting (got %d)", s.waiting_count);
 
     uint8_t claimed = 0;
-    CHECK(s.claim(20, 1000, claimed) && claimed == 2, "the surviving stamp must be the newest input");
+    CHECK(s.claim(20, 1000, claimed) && claimed == 1, "the oldest waiting input is claimed first");
     int64_t age = -1;
-    s.settle(Packet::Frame, 30, claimed, &age);
-    CHECK(s.answered == 1, "the frame answers one input");
+    CHECK(s.settle(Packet::Frame, 30, claimed, &age), "the frame answers it");
+    CHECK(age == 30, "its age runs from its own arrival (got %lld)", (long long)age);
 
     // A stamp that has waited past the limit can be dropped without claiming it,
     // and one inside the limit survives the same check.
-    s.receive(3, 100);
-    CHECK(!s.expire_if_stale(1100, 1000), "a stamp inside the age limit must survive the check");
-    CHECK(s.has && s.stamp == 3, "a stamp inside the age limit stays in the slot");
-    CHECK(s.expire_if_stale(1200, 1000), "a stamp older than the age limit must be droppable without claiming it");
+    CHECK(!s.expire_if_stale(1000, 1000), "a stamp inside the age limit must survive the check");
+    CHECK(s.has && s.stamp == 2, "a stamp inside the age limit stays in the queue");
+    CHECK(s.expire_if_stale(1100, 1000), "a stamp older than the age limit must be droppable without claiming it");
     CHECK(s.expired == 1, "an aged-out stamp must be counted as expired");
 
     // A fresh input after that is claimable again, and a claim whose present
-    // sends nothing returns to the slot rather than being spent.
+    // sends nothing returns to the queue rather than being spent.
     s.receive(4, 1201);
     CHECK(s.claim(1201, 1000, claimed) && claimed == 4, "a fresh input is claimable after an expiry");
     CHECK(!s.settle(Packet::Nothing, 1210, claimed, &age), "a present that sent nothing answered nothing");
-    CHECK(s.has && s.stamp == 4, "an unsettled claim returns to the slot");
+    CHECK(s.has && s.stamp == 4, "an unsettled claim returns to the queue");
 
-    CHECK(s.received == 4, "four inputs arrived (got %llu)", (unsigned long long)s.received);
+    CHECK(s.received == 3, "three inputs arrived (got %llu)", (unsigned long long)s.received);
     CHECK(s.received == s.answered + s.overwritten + s.expired + (s.has ? 1 : 0),
           "received (%llu) must equal answered (%llu) + overwritten (%llu) + expired (%llu) + waiting",
           (unsigned long long)s.received, (unsigned long long)s.answered,
@@ -99,33 +99,96 @@ static void test_input_during_a_claim_is_not_an_overwrite() {
 // (received = answered + overwritten + expired + waiting) the sum was one short,
 // because a claim settled while a newer input was already waiting overwrote that
 // newer stamp and said nothing about it.
-static void test_handback_into_an_occupied_slot_is_counted() {
+static void test_handback_keeps_the_older_input_ahead() {
     State s;
     s.receive(1, 0);
     uint8_t claimed = 0;
     CHECK(s.claim(0, 1000, claimed), "claim the first input");
 
     s.receive(2, 5);                       // arrives while the claim is in flight
-    CHECK(s.has && s.stamp == 2, "the newer input waits in the slot");
+    CHECK(s.has && s.stamp == 2, "the newer input waits in the queue");
 
     int64_t age = -1;
     CHECK(!s.settle(Packet::Nothing, 10, claimed, &age), "a present that sent nothing answered nothing");
-    CHECK(s.has && s.stamp == 2, "the newer input must not be displaced by the older stamp");
-    CHECK(s.overwritten == 1, "the older input, superseded while in flight, is recorded as replaced");
-    CHECK(s.received == s.answered + s.overwritten + s.expired + (s.has ? 1 : 0),
-          "the counts must still close: received %llu = answered %llu + overwritten %llu + waiting",
+    CHECK(s.waiting_count == 2, "both inputs are waiting (got %d)", s.waiting_count);
+    CHECK(s.stamp == 1, "the older input is answered first, because it has waited longer");
+    CHECK(s.overwritten == 0, "nothing was lost: both inputs are queued");
+    CHECK(s.received == s.answered + s.overwritten + s.expired + s.waiting_count,
+          "the counts still close: received %llu = answered %llu + overwritten %llu + expired %llu + waiting %d",
           (unsigned long long)s.received, (unsigned long long)s.answered,
-          (unsigned long long)s.overwritten);
+          (unsigned long long)s.overwritten, (unsigned long long)s.expired, s.waiting_count);
 }
 
+
 // A zero stamp is not a stamp. This never reaches the slot from the wire (the
-// input handler ignores byte 16 == 0), but the rule is stated where it is
-// enforced rather than only where it is checked.
+// input handler ignores byte 16 == 0), and the slot refuses it too: a signal that
+// cannot be answered must not occupy the queue and block real inputs behind it.
 static void test_zero_stamp_is_not_claimable() {
     State s;
     s.receive(0, 0);
     uint8_t claimed = 0;
     CHECK(!s.claim(0, 1000, claimed), "a zero stamp is not claimable");
+    CHECK(s.received == 0, "a zero stamp is not an input and is not counted (got %llu)",
+          (unsigned long long)s.received);
+}
+
+// Inputs arrive faster than frames. A player holding a key produces several
+// inputs between two frames, and the single slot threw all but the newest away -
+// which is why a live session measured 2,824 inputs received and 1,282 of them
+// overwritten, with most of the rest never attributable to a picture.
+//
+// A frame answers the OLDEST waiting input - it was drawn with that input already
+// applied - and the next frame answers the next one, until the queue drains. The
+// counts still close, because every input ends answered, expired, or waiting.
+static void test_inputs_faster_than_frames_are_all_answerable() {
+    State s;
+    s.receive(1, 0);
+    s.receive(2, 10);
+    s.receive(3, 20);
+    CHECK(s.overwritten == 0, "inputs waiting behind each other are not overwrites (got %llu)",
+          (unsigned long long)s.overwritten);
+
+    uint8_t claimed = 0;
+    int64_t age = -1;
+    CHECK(s.claim(30, 1000, claimed) && claimed == 1, "the oldest waiting input is claimed first");
+    CHECK(s.settle(Packet::Frame, 40, claimed, &age), "the frame answers it");
+    CHECK(age == 40, "its age runs from its own arrival (got %lld)", (long long)age);
+
+    CHECK(s.claim(50, 1000, claimed) && claimed == 2, "the next frame answers the next input");
+    CHECK(s.settle(Packet::Frame, 60, claimed, &age), "answered");
+    CHECK(age == 50, "its age runs from its own arrival (got %lld)", (long long)age);
+
+    CHECK(s.claim(70, 1000, claimed) && claimed == 3, "and the third");
+    CHECK(s.settle(Packet::Frame, 80, claimed, &age), "answered");
+
+    CHECK(s.answered == 3, "three inputs, three answers (got %llu)", (unsigned long long)s.answered);
+    CHECK(s.received == s.answered + s.overwritten + s.expired + (s.has ? 1 : 0),
+          "the counts still close: received %llu = answered %llu + overwritten %llu + expired %llu + waiting",
+          (unsigned long long)s.received, (unsigned long long)s.answered,
+          (unsigned long long)s.overwritten, (unsigned long long)s.expired);
+}
+
+// The queue is bounded, so a stalled host cannot grow it without limit. Overflow
+// is the only way an input is now lost, and it is counted: the counts must close,
+// or the bench reports a rate it cannot defend.
+static void test_overflow_drops_the_oldest_and_counts_it() {
+    State s;
+    for (int i = 1; i <= State::kCapacity; i++) s.receive((uint8_t)i, i);
+    CHECK(s.waiting_count == State::kCapacity, "the queue fills to its bound (got %d)", s.waiting_count);
+    CHECK(s.overwritten == 0, "filling exactly to the bound loses nothing");
+
+    s.receive(99, 100);
+    CHECK(s.waiting_count == State::kCapacity, "the queue never exceeds its bound");
+    CHECK(s.overwritten == 1, "the dropped input is counted as overwritten (got %llu)",
+          (unsigned long long)s.overwritten);
+    CHECK(s.stamp == 2, "the OLDEST input is the one dropped, so the head moves on (got %u)", (unsigned)s.stamp);
+
+    CHECK(s.received == (uint64_t)State::kCapacity + 1, "every input was received (got %llu)",
+          (unsigned long long)s.received);
+    CHECK(s.received == s.answered + s.overwritten + s.expired + s.waiting_count,
+          "the counts close: received %llu = answered %llu + overwritten %llu + expired %llu + %d waiting",
+          (unsigned long long)s.received, (unsigned long long)s.answered,
+          (unsigned long long)s.overwritten, (unsigned long long)s.expired, s.waiting_count);
 }
 
 int main() {
@@ -133,7 +196,9 @@ int main() {
     test_nothing_sent_hands_the_stamp_back_silently();
     test_input_during_a_claim_is_not_an_overwrite();
     test_zero_stamp_is_not_claimable();
-    test_handback_into_an_occupied_slot_is_counted();
+    test_handback_keeps_the_older_input_ahead();
+    test_inputs_faster_than_frames_are_all_answerable();
+    test_overflow_drops_the_oldest_and_counts_it();
 
     if (failures) {
         std::printf("%d assertion(s) failed\n", failures);

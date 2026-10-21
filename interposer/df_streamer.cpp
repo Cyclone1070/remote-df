@@ -1,5 +1,6 @@
 #include <iostream>
 #include <vector>
+#include <unordered_set>
 #include <deque>
 #include <string>
 #include <mutex>
@@ -595,6 +596,13 @@ static std::atomic<uint64_t> g_presents_nocmd{0};
 // present, so a microsecond here is a second per frame at these call counts.
 static std::atomic<uint64_t> g_hook_ns{0};
 static std::atomic<uint64_t> g_hook_calls{0};
+// How many DISTINCT pictures the game produces, against how many pictures it
+// creates. If a session builds thousands of images but only a few dozen distinct
+// ones, the artwork is a tileset being rebuilt over and over and it only needs to
+// be sent once. If the distinct count tracks the total, the game really is
+// producing new artwork and de-duplication cannot help.
+static std::atomic<uint64_t> g_pic_created{0};
+static std::atomic<uint64_t> g_pic_distinct{0};
 // Time the game is stuck inside the present hook: delta encoding, the send, and
 // any socket wait. This is the number that says whether the interposer is what
 // makes the game slow, and it has been declared-but-never-written for a while.
@@ -706,6 +714,12 @@ extern "C" void _ZN15enabler_inputst9add_inputER9SDL_Eventj(void* self, void* ev
 // the interposer's dependencies (tests/stamp_slot_test.cpp) - a rule this
 // central is not allowed to exist only as inline code in a 3000-line file.
 static stamp_slot::State g_stamp_slot;
+// The raw pixel path needs its OWN slot. Both transports answer inputs, and when
+// they shared one slot the raw path - which captures, claims and settles on every
+// present - claimed every stamp before the instruction path could reach it. That
+// is why instruction-path latency samples were zero for entire runs while the host
+// reported hundreds of answers: the answers belonged to the other transport.
+static stamp_slot::State g_raw_stamp_slot;
 
 // A stamp only describes latency while the input that produced it is still
 // recent. Frames are emitted only when the scene changes, so a stamp from an
@@ -1048,6 +1062,9 @@ void handle_client_input_event(const uint8_t* data, size_t len) {
         // counted rather than smoothed over.
         g_wire_log.note(epoch_now_ms(), wire_log::Input, (uint32_t)len, -1, 0, data[16]);
         g_stamp_slot.receive(data[16], steady_now_ms());
+        // Same input, offered to both transports: whichever one is on screen gets
+        // to answer it, and each one's counters describe only its own answers.
+        g_raw_stamp_slot.receive(data[16], steady_now_ms());
     }
 
     ensure_mouse_focus();
@@ -2677,17 +2694,17 @@ static RawSendResult raw_send_staged(int fd, std::vector<uint8_t>& jpeg) {
     // never comes - a stamp that outlives its input would otherwise ride on some
     // unrelated later frame and report a latency that never happened.
     uint8_t stamp = 0;
-    if (g_stamp_slot.expire_if_stale(steady_now_ms(), g_stamp_max_age_ms)) {
+    if (g_raw_stamp_slot.expire_if_stale(steady_now_ms(), g_stamp_max_age_ms)) {
         g_raw_stamp_expired++;
     }
     // Only a frame whose pixels changed can answer an input, so the stamp is
     // claimed only when this capture differs from the last one; otherwise it
     // waits in the slot for the capture that does.
-    if (changed && g_stamp_slot.claim(steady_now_ms(), g_stamp_max_age_ms, stamp)) {
+    if (changed && g_raw_stamp_slot.claim(steady_now_ms(), g_stamp_max_age_ms, stamp)) {
         int64_t age = -1;
         // The capture path sends every frame it takes, so the claim is answered
         // by this very frame.
-        if (g_stamp_slot.settle(stamp_slot::Packet::Frame, steady_now_ms(), stamp, &age)) {
+        if (g_raw_stamp_slot.settle(stamp_slot::Packet::Frame, steady_now_ms(), stamp, &age)) {
             g_raw_stamp_answered++;
             std::lock_guard<std::mutex> lock(g_raw_stamp_lock);
             g_raw_stamp_ages_ms.push_back(age);
@@ -3010,6 +3027,18 @@ void* SDL_CreateTextureFromSurface(void* renderer, void* surface) {
             const uint8_t* src = (const uint8_t*)s->pixels;
             for (int y = 0; y < s->h; y++) {
                 memcpy(ct.rgba.data() + y * ct.w * 4, src + y * s->pitch, std::min((int)(ct.w * 4), s->pitch));
+            }
+        }
+        g_pic_created.fetch_add(1, std::memory_order_relaxed);
+        {
+            uint64_t h = 1469598103934665603ull;
+            for (size_t i = 0; i < ct.rgba.size(); i += 13) { h ^= ct.rgba[i]; h *= 1099511628211ull; }
+            h ^= (uint64_t)ct.w << 32; h *= 1099511628211ull; h ^= ct.h;
+            static std::mutex distinct_lock;
+            static std::unordered_set<uint64_t> distinct;
+            std::lock_guard<std::mutex> dl(distinct_lock);
+            if (distinct.size() < 200000 && distinct.insert(h).second) {
+                g_pic_distinct.fetch_add(1, std::memory_order_relaxed);
             }
         }
         {
@@ -3489,7 +3518,7 @@ extern "C++" std::string df_stats_json() {
              "\"textureNew\":%llu,\"textureRepeat\":%llu,"
              "\"stampSamples\":%llu,\"stampExpired\":%llu,\"stampP50\":%.0f,"
              "\"stampReceived\":%llu,\"stampOverwritten\":%llu,"
-             "\"queueMax\":%lld,\"clients\":%zu,\"presents\":%llu,\"presentsSilent\":%llu,\"presentsNoCmd\":%llu,\"encodeNothing\":%llu,\"nothingPixelsSame\":%llu,\"nothingPixelsChanged\":%llu,\"hookUsTotal\":%llu,\"hookCalls\":%llu,\"inputMsgs\":%llu,\"motionIn\":%llu,\"motionOut\":%llu,\"presentUsTotal\":%llu,\"presentUsMax\":%llu,\"presentCount\":%llu,\"sendBlockMaxUs\":%lld,\"presentMaxUs\":%lld,"
+             "\"queueMax\":%lld,\"clients\":%zu,\"presents\":%llu,\"presentsSilent\":%llu,\"presentsNoCmd\":%llu,\"encodeNothing\":%llu,\"nothingPixelsSame\":%llu,\"nothingPixelsChanged\":%llu,\"hookUsTotal\":%llu,\"hookCalls\":%llu,\"inputMsgs\":%llu,\"motionIn\":%llu,\"motionOut\":%llu,\"presentUsTotal\":%llu,\"presentUsMax\":%llu,\"presentCount\":%llu,\"picCreated\":%llu,\"picDistinct\":%llu,\"sendBlockMaxUs\":%lld,\"presentMaxUs\":%lld,"
              "\"dc\":{\"sendCalls\":%llu,\"queued\":%llu,\"threw\":%llu,"
              "\"bytesOffered\":%llu,\"bufferedMax\":%lld,\"bufferedNow\":%lld,"
              "\"unordered\":%d,\"maxRetransmits\":%d,\"maxPacketLifeTime\":%d},"
@@ -3506,7 +3535,7 @@ extern "C++" std::string df_stats_json() {
              (unsigned long long)g_tex_bytes,
              (unsigned long long)g_tex_new,
              (unsigned long long)g_tex_repeat,
-             (unsigned long long)g_stamp_seen,
+             (unsigned long long)g_stamp_slot.answered,
              (unsigned long long)g_stamp_slot.expired,
              stamp_p50,
              (unsigned long long)g_stamp_slot.received,
@@ -3527,6 +3556,8 @@ extern "C++" std::string df_stats_json() {
              (unsigned long long)g_present_us_total.load(),
              (unsigned long long)g_present_us_max.load(),
              (unsigned long long)g_present_count.load(),
+             (unsigned long long)g_pic_created.load(),
+             (unsigned long long)g_pic_distinct.load(),
              (long long)g_send_block_max_us.load(),
              (long long)g_present_max_us.load(),
              (unsigned long long)g_dc_send_calls.load(std::memory_order_relaxed),

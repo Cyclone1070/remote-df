@@ -20,3 +20,4 @@ tests/*.png
 # scripts/qa_parity_walk.mjs — not source, and large. issue.md links into
 # ./qa/, so those images resolve locally but are intentionally not committed.
 qa/
+.tdd

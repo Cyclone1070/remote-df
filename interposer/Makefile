@@ -7,7 +7,7 @@ SRCS = df_streamer.cpp
 
 all: $(TARGET)
 
-$(TARGET): $(SRCS) sha1_b64.hpp ws_server.hpp texture_queue.hpp raw_jpeg.hpp
+$(TARGET): $(SRCS) sha1_b64.hpp ws_server.hpp texture_queue.hpp raw_jpeg.hpp stamp_slot.hpp wire_log.hpp
 	$(CXX) $(CXXFLAGS) $(SRCS) -o $(TARGET) $(LDFLAGS)
 
 clean:

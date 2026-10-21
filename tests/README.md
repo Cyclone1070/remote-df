@@ -26,6 +26,41 @@ a warm game, because "a client joins a game that is already running" fails
 differently from "a client joins a cold one" and only the warm case reproduces
 the bug that started this.
 
+## The bench
+
+The bench is not a tier: it does not pass or fail, it answers "how fast, and for
+whom". It lives here because it is built from the same measurement primitives as
+the integration tier, so a freeze means the same thing in both.
+
+```sh
+npm run bench                                  # both transports, real network
+DF_SHAPE_HOST=cyc@192.168.1.111 npm run bench  # plus the shaped network
+npm run bench:summary                          # the newest run of each network
+```
+
+It drives five interactions — pan, zoom, elevation, spawn creature, unpause time
+— on both transports, and records payload, latency and smoothness for each. Every
+result is checked first by making sure the input actually moved the picture: the
+bench that came before this one panned with a mouse drag that moved only a
+tooltip, on a title screen, and passed every threshold.
+
+Each pass writes `evidence/bench/interaction-matrix/<network>-<time>/`:
+
+| file | what it is |
+|---|---|
+| `results.json` | one row per interaction and transport: payload, bytes per picture, pictures/s, latency percentiles, gap percentiles, health counters |
+| `steps.ndjson` | every step with a timestamp — server counters sampled every 500 ms during each run, plus ready / verified / start / done markers |
+
+The step log is the point of the exercise: a single smoothness number cannot say
+which link was slow, but a timestamped log can be read back, without re-running,
+and attributed after the fact.
+
+Numbers taken on a bare LAN cannot say anything about a real connection, which is
+why the shaped network exists. `tests/net/simulate.sh` gives it a bandwidth
+ceiling and a fixed, repeating delay pattern so two runs can be compared; it
+scopes itself to the game's ports so a mistake cannot cost you SSH, and it removes
+itself when its window expires.
+
 ## Tier 1 — unit
 
 `tier1-unit/interposer/` holds the C++ tests. They include the **shipping

@@ -13,7 +13,12 @@
     "test:contract": "node --test tests/tier2-contract/*.mjs",
     "test:integration": "node tests/tier3-integration/run.mjs",
     "test:diagnose": "node tests/diagnostics/full-state.mjs",
-    "gate": "npm test && npm run test:integration"
+    "gate": "npm test && npm run test:integration",
+    "bench": "bash tests/bench/matrix.sh",
+    "bench:matrix": "node tests/diagnostics/interaction-matrix.mjs",
+    "bench:summary": "node tests/bench/summarise.mjs",
+    "net:shape": "ssh \"$DF_SHAPE_HOST\" \"cat > /tmp/df-simulate.sh && chmod +x /tmp/df-simulate.sh\" < tests/net/simulate.sh && ssh \"$DF_SHAPE_HOST\" \"sudo -n /tmp/df-simulate.sh apply 1500\"",
+    "net:clear": "ssh \"$DF_SHAPE_HOST\" \"sudo -n /tmp/df-simulate.sh clear\""
   },
   "repository": {
     "type": "git",
