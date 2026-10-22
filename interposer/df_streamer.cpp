@@ -521,6 +521,46 @@ static uint32_t g_frame_seq = 0;
 // Wire sequence: advances only when a frame packet is actually sent, so silent
 // frames leave no gap in the numbering the client sees.
 static uint32_t g_sent_seq = 0;
+
+// What the client is modelled as holding, and the only thing that decides what gets
+// sent.
+//
+// Artwork used to be broadcast from SDL_CreateTextureFromSurface, i.e. every picture
+// the game created went on the wire whether or not any frame referenced it. Measured
+// over 8s of panning: 5,383 pictures sent, 747 referenced by draw commands, 5,381
+// never referenced at all. That flood shared the ordered frame channel, so frames
+// queued behind it - 12.8 MB crossed the wire during a single 4.6s gap.
+//
+// The model is an insertion-ordered ring, not LRU, because it has to be reproducible:
+// insertion order is exactly the order the host chose, so the client ends up with the
+// same set without either side sending a sync message. Recency cannot be mirrored -
+// the two sides observe accesses differently - so it is deliberately not used.
+static std::deque<uint16_t> g_client_cache_order;
+static std::unordered_set<uint16_t> g_client_cache_set;
+static std::atomic<size_t> g_client_cache_cap{8192};
+static std::atomic<uint64_t> g_pic_sent_referenced{0};
+static std::atomic<uint64_t> g_pic_skipped_unreferenced{0};
+
+// Caller holds g_tex_lock (or is single-threaded at connect).
+static bool client_cache_has(uint16_t id) {
+    return g_client_cache_set.find(id) != g_client_cache_set.end();
+}
+
+static void client_cache_push(uint16_t id) {
+    if (!g_client_cache_set.insert(id).second) return;
+    g_client_cache_order.push_back(id);
+    const size_t cap = g_client_cache_cap.load(std::memory_order_relaxed);
+    while (g_client_cache_order.size() > cap && !g_client_cache_order.empty()) {
+        const uint16_t old = g_client_cache_order.front();
+        g_client_cache_order.pop_front();
+        g_client_cache_set.erase(old);
+    }
+}
+
+static void client_cache_reset() {
+    g_client_cache_order.clear();
+    g_client_cache_set.clear();
+}
 static std::atomic<bool> g_need_keyframe{true};
 static std::atomic<uint32_t> g_pending_combined_base{0};
 
@@ -2137,6 +2177,8 @@ void handle_client_text_message(int fd, const std::string& msg) {
                         {
                             std::lock_guard<std::mutex> lock(g_rtc_lock);
                             g_active_dcs.push_back(dc);
+                            std::lock_guard<std::mutex> tlock(g_tex_lock);
+                            client_cache_reset();
                         }
                         // Send all cached textures directly over df-stream DataChannel!
                         {
@@ -3041,14 +3083,14 @@ void* SDL_CreateTextureFromSurface(void* renderer, void* surface) {
                 g_pic_distinct.fetch_add(1, std::memory_order_relaxed);
             }
         }
-        {
-            std::lock_guard<std::mutex> lock(g_rtc_lock);
-            for (auto& dc : g_active_dcs) {
-                if (dc && dc->isOpen()) {
-                    send_texture_all_chunks_dc(dc, ct);
-                }
-            }
-        }
+        // Deliberately nothing here.
+        //
+        // This is where every created picture used to be broadcast. A picture is now
+        // sent only when a frame that is actually going out references it and the
+        // client does not already hold it - see the send path in the present hook.
+        // Sending on creation meant the game's own texture churn (5,383 pictures in
+        // 8s of panning) became wire traffic regardless of what was on screen.
+        g_pic_skipped_unreferenced.fetch_add(1, std::memory_order_relaxed);
     }
     return tex;
 }
@@ -3203,6 +3245,34 @@ static bool service_picture_send(const DrawCommand* cmds, uint16_t count,
     // The encoder built something, so it goes out. Nothing else is ever sent:
     // a present whose picture did not change produces no packet at all.
     if (!frame_packet.empty()) {
+        // Pictures first, then the frame that names them.
+        //
+        // The client will not draw a frame until every picture it references is in
+        // its atlas, so these have to be queued ahead of it. Sending the frame first
+        // means the client's completeness gate fires an asset-bridge request, which
+        // costs a round trip and a forced keyframe - the stall this is meant to
+        // remove.
+        //
+        // Only pictures this frame references AND this client does not already hold.
+        // `g_active_dcs` is stable here: the frame path already holds g_send_lock.
+        {
+            std::lock_guard<std::mutex> rlock(g_rtc_lock);
+            if (!g_active_dcs.empty()) {
+                std::lock_guard<std::mutex> tlock(g_tex_lock);
+                for (uint16_t i = 0; i < count; i++) {
+                    const uint16_t id = cmds[i].tex_id;
+                    if (id == 0 || id > g_texture_count) continue;
+                    if (client_cache_has(id)) continue;
+                    CachedTexture& ct = g_cached_textures[id - 1];
+                    if (ct.rgba.empty()) continue;
+                    for (auto& dc : g_active_dcs) {
+                        if (dc && dc->isOpen()) send_texture_all_chunks_dc(dc, ct);
+                    }
+                    client_cache_push(id);
+                    g_pic_sent_referenced.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
         {
             std::lock_guard<std::mutex> lock(g_rtc_lock);
             for (auto& dc : g_active_dcs) {
