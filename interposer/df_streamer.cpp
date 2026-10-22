@@ -226,6 +226,7 @@ static int (*real_SDL_UpdateTexture)(void*, const void*, const void*, int) = nul
 // sees an identical frame and stays silent while the screen changes underneath -
 // measured at 4,919 changed pixels against zero command updates. Counting only:
 // pass-through, no lock, no capture.
+static std::atomic<uint64_t> g_rc_copy_calls{0};
 static std::atomic<uint64_t> g_rc_fillrect{0};
 static std::atomic<uint64_t> g_rc_fillrects{0};
 static std::atomic<uint64_t> g_rc_drawline{0};
@@ -242,17 +243,7 @@ static int (*real_SDL_RenderDrawPoint)(void*, int, int) = nullptr;
 static int (*real_SDL_RenderGeometry)(void*, void*, const void*, int, const void*, int) = nullptr;
 static int (*real_SDL_RenderSetClipRect)(void*, const void*) = nullptr;
 static int (*real_SDL_SetRenderDrawColor)(void*, uint8_t, uint8_t, uint8_t, uint8_t) = nullptr;
-static void dump_render_call_counts() {
-    FILE* f = fopen("/tmp/df_render_calls", "w");
-    if (!f) return;
-    fprintf(f, "fillRect=%llu fillRects=%llu drawLine=%llu drawLines=%llu drawPoint=%llu geometry=%llu setClipRect=%llu setDrawColor=%llu\n",
-            (unsigned long long)g_rc_fillrect.load(), (unsigned long long)g_rc_fillrects.load(),
-            (unsigned long long)g_rc_drawline.load(), (unsigned long long)g_rc_drawlines.load(),
-            (unsigned long long)g_rc_drawpoint.load(), (unsigned long long)g_rc_geometry.load(),
-            (unsigned long long)g_rc_setclip.load(), (unsigned long long)g_rc_setcolor.load());
-    fclose(f);
-}
-
+static void dump_render_call_counts();
 static int (*real_SDL_LockTexture)(void*, const void*, void**, int*) = nullptr;
 static void (*real_SDL_UnlockTexture)(void*) = nullptr;
 // What SDL_UpdateTexture actually looks like. Capturing its pixels is only worth
@@ -867,6 +858,19 @@ static uint64_t g_wire_frames = 0;
 // the stream, which shows up as a correct-looking frame with something missing.
 static uint64_t g_draw_unknown = 0;
 static uint64_t g_draw_nopixels = 0;
+static void dump_render_call_counts() {
+    FILE* f = fopen("/tmp/df_render_calls", "w");
+    if (!f) return;
+    fprintf(f, "renderCopyCalls=%llu drawUnknown=%llu drawNoPixels=%llu capturedCmds=%llu fillRect=%llu fillRects=%llu drawLine=%llu drawLines=%llu drawPoint=%llu geometry=%llu setClipRect=%llu setDrawColor=%llu\n",
+            (unsigned long long)g_rc_copy_calls.load(), (unsigned long long)g_draw_unknown, (unsigned long long)g_draw_nopixels,
+            (unsigned long long)g_frame_cmd_count,
+            (unsigned long long)g_rc_fillrect.load(), (unsigned long long)g_rc_fillrects.load(),
+            (unsigned long long)g_rc_drawline.load(), (unsigned long long)g_rc_drawlines.load(),
+            (unsigned long long)g_rc_drawpoint.load(), (unsigned long long)g_rc_geometry.load(),
+            (unsigned long long)g_rc_setclip.load(), (unsigned long long)g_rc_setcolor.load());
+    fclose(f);
+}
+
 static uint64_t g_tex_bytes = 0;
 static int64_t steady_now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -3229,6 +3233,7 @@ int SDL_RenderCopy(void* renderer, void* texture, const SDL_Rect* srcrect, const
     maybe_drain_textures();
     int res = real_SDL_RenderCopy ? real_SDL_RenderCopy(renderer, texture, srcrect, dstrect) : 0;
     if (res != 0) return res;
+    g_rc_copy_calls.fetch_add(1, std::memory_order_relaxed);
 
     // A picture the client can never be sent must not be named in a frame. If it
     // is, the client holds that whole frame waiting for it, spends its retries
@@ -3250,6 +3255,7 @@ int SDL_RenderCopy(void* renderer, void* texture, const SDL_Rect* srcrect, const
     }
     if (tid == 0 || !texture_pixels_available(tid)) {
         g_draw_nopixels++;
+        dump_render_call_counts();
         return res;
     }
 
@@ -3519,6 +3525,7 @@ void SDL_RenderPresent(void* renderer) {
         while (us > prev && !g_present_us_max.compare_exchange_weak(prev, us)) {}
     } } present_time{present_t0};
     if (!real_SDL_RenderPresent) resolve_symbols();
+    if ((g_presents.load(std::memory_order_relaxed) & 63) == 0) dump_render_call_counts();
     g_presents.fetch_add(1, std::memory_order_relaxed);
     g_frame_seq++;
 
