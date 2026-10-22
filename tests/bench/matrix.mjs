@@ -200,22 +200,27 @@ const INTERACTIONS = {
   // a few times and stops. A key is always released before the next press so each
   // input is a distinct event, and the pairs alternate so the camera cannot run out
   // of room and stop for a reason that is not a fault.
+  // Every driver steps once each way and ends where it started.
+  //
+  // Holding a key for a quarter second scrolls many tiles, so a pan that was
+  // meant to be one step off centre ended up several off centre and then ran out
+  // of map. One press out, one press back: the camera never moves more than a
+  // single tile from where it began, so no interaction can fail because the map
+  // ended rather than because the transport was slow.
   pan: async (page) => {
-    for (const k of ['a', 'd', 'a']) {
-      await page.keyboard.down(k);
-      await settle(250);
-      await page.keyboard.up(k);
-      await settle(150);
+    for (const k of ['d', 'a']) {
+      await page.keyboard.press(k);
+      await settle(300);
     }
   },
   zoom: async (page) => {
-    for (const k of [']', '[', ']']) {
+    for (const k of [']', '[']) {
       await page.keyboard.press(k);
       await settle(350);
     }
   },
   elevation: async (page) => {
-    for (const k of ['>', '<', '>']) {
+    for (const k of ['>', '<']) {
       await page.keyboard.press(k);
       await settle(350);
     }
@@ -624,6 +629,34 @@ if (await gameIsLive()) {
   console.log('game is already in the arena - skipping the 90s entry');
 } else {
   await enterArenaOnce();
+}
+
+// The first input after the arena loads is Space: the arena comes up paused.
+// A paused game changes nothing, so every row measured after it is a measurement
+// of a frozen picture - which is how this suite reported "the picture never
+// changed" for a client that was working correctly all along.
+{
+  const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+  await page.goto(`${CMD_BASE}/df`, { waitUntil: 'domcontentloaded' });
+  await new Promise((r) => setTimeout(r, 15000));
+  const activity = async () => {
+    try {
+      const j = await (await fetch(`${CMD_BASE}/df-stats`)).json();
+      return (j.frames || 0) + ((j.raw && j.raw.changed) || 0);
+    } catch { return 0; }
+  };
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const before = await activity();
+    await new Promise((r) => setTimeout(r, 2500));
+    const after = await activity();
+    if (after > before) {
+      console.log(`game is running (${after - before} changes in 2.5s)`);
+      break;
+    }
+    console.log(`game is paused - pressing space to resume (attempt ${attempt + 1})`);
+    await page.keyboard.press(' ');
+  }
+  await page.close().catch(() => {});
 }
 const PATHS = (process.env.DF_PATHS || 'instruction,pixel').split(',');
 if (PATHS.includes('instruction')) await measurePath('instruction', `${CMD_BASE}/df`);

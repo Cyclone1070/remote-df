@@ -19,6 +19,7 @@
 // worse than that floor.
 import { chromium } from 'playwright';
 import { mkdirSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 
 const BASE = process.env.DF_API || 'http://192.168.1.111:8484';
 const PIXEL_PAGE = process.env.DF_RAW_PAGE || 'http://192.168.1.111:8000/';
@@ -26,6 +27,17 @@ const dir = `evidence/bench/frame-parity/${new Date().toISOString().replace(/[:.
 mkdirSync(dir, { recursive: true });
 
 const settle = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// The raw page renders nothing at all unless the pixel capture is switched on, and
+// a page showing nothing compares at a constant difference against every capture -
+// which reads as six failing pairs and looks like a rendering fault. Parity owns
+// this switch so it cannot inherit whatever the last pass left behind.
+try {
+  execFileSync('ssh', ['-o', 'ConnectTimeout=10', 'cyc@192.168.1.111',
+    'podman exec remote-df touch /tmp/df_raw_on'], { stdio: 'ignore' });
+} catch (e) {
+  console.log(`could not switch the pixel capture on: ${String(e).slice(0, 80)}`);
+}
 
 // Capture harness, installed into both pages.
 //

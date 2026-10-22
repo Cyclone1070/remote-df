@@ -364,7 +364,7 @@ const rawPage = `<!doctype html>
     // Same shape and same clock as the instruction page, so the two are
     // comparable without a translation step.
     if (window.__dfBench && window.__dfBench.display) {
-      window.__dfBench.display.push(performance.timeOrigin + performance.now());
+      window.__dfBench.display.push(performance.now());
       if (window.__dfBench.display.length > 200000) window.__dfBench.display.shift();
     }
     var data = nativeCtx.getImageData(0, 0, w, h).data;
