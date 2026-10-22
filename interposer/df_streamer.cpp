@@ -578,21 +578,6 @@ static std::unordered_set<uint16_t> g_client_cache_set;
 static std::atomic<size_t> g_client_cache_cap{8192};
 static std::atomic<uint64_t> g_pic_sent_referenced{0};
 static std::atomic<uint64_t> g_pic_skipped_unreferenced{0};
-// The master cache: every picture referenced by a frame that actually went out,
-// in insertion order and bounded by the same overflow rule as the client model.
-// A new client is seeded from this instead of from every texture the game has
-// ever created, which measured as a ~20 MB burst per connection.
-static std::deque<uint16_t> g_master_order;
-static std::unordered_set<uint16_t> g_master_set;
-static void master_note(uint16_t id) {
-    if (!g_master_set.insert(id).second) return;
-    g_master_order.push_back(id);
-    const size_t cap = g_client_cache_cap.load(std::memory_order_relaxed);
-    while (g_master_order.size() > cap && !g_master_order.empty()) {
-        g_master_set.erase(g_master_order.front());
-        g_master_order.pop_front();
-    }
-}
 
 // Caller holds g_tex_lock (or is single-threaded at connect).
 static bool client_cache_has(uint16_t id) {
@@ -2257,20 +2242,15 @@ void handle_client_text_message(int fd, const std::string& msg) {
                             std::lock_guard<std::mutex> tlock(g_tex_lock);
                             client_cache_reset();
                         }
-                        // Seed from the master cache: the pictures outgoing frames have
-                        // referenced, bounded by the overflow rule. This is what lets a
-                        // client draw the frame it is about to be sent, and it is a
-                        // working set rather than the every-texture-ever-created dump
-                        // this replaces - which measured as a ~20 MB burst per connect.
+                        // Send all cached textures directly over df-stream DataChannel!
                         {
                             std::lock_guard<std::mutex> lock(g_tex_lock);
-                            for (uint16_t i : g_master_order) {
-                                if (i == 0 || i > g_texture_count) continue;
-                                if (g_cached_textures[i - 1].rgba.empty()) continue;
-                                g_tex_dump_count++;
-                                g_tex_dump_bytes += g_cached_textures[i - 1].rgba.size();
-                                send_texture_all_chunks_dc(dc, g_cached_textures[i - 1]);
-                                client_cache_push(i);
+                            for (uint16_t i = 0; i < g_texture_count; i++) {
+                                if (!g_cached_textures[i].rgba.empty()) {
+                                    g_tex_dump_count++;
+                                    g_tex_dump_bytes += g_cached_textures[i].rgba.size();
+                                    send_texture_all_chunks_dc(dc, g_cached_textures[i]);
+                                }
                             }
                             fprintf(stderr, "[TEXDUMP] client fd=%d: pushed %llu cached pictures (%llu KB)\n",
                                     fd, (unsigned long long)g_tex_dump_count,
@@ -3398,7 +3378,6 @@ static bool service_picture_send(const DrawCommand* cmds, uint16_t count,
                 for (uint16_t i = 0; i < count; i++) {
                     const uint16_t id = cmds[i].tex_id;
                     if (id == 0 || id > g_texture_count) continue;
-                    master_note(id);
                     if (client_cache_has(id)) continue;
                     CachedTexture& ct = g_cached_textures[id - 1];
                     if (ct.rgba.empty()) continue;
