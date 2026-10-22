@@ -564,6 +564,16 @@ async function measurePath(pathName, pageUrl) {
       row.verified = name === 'idle' ? true : disp.length > 0;
       if (!row.verified) {
         row.note = 'input did not change the picture during the measured window';
+        // Fatal, not an annotation. A run where the input moves nothing has
+        // measured nothing, and printing rows with the numbers withheld lets it
+        // exit 0 and be mistaken for a passing bench. It did exactly that: six
+        // rows, both transports, all withheld, exit 0.
+        console.error(
+          `\nFATAL: ${pathName}/${name} applied its input and the picture never changed.\n` +
+          'The game is not in a playable map, so this run measures nothing. Fix the scenario; do not read these numbers.',
+        );
+        step({ path: pathName, interaction: name, phase: 'fatal', reason: 'no movement' });
+        process.exit(3);
       }
       results.push(row);
       step({ path: pathName, interaction: name, phase: 'done', row });
