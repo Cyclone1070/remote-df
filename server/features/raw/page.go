@@ -358,6 +358,15 @@ const rawPage = `<!doctype html>
     }
     var started = performance.now();
     nativeCtx.drawImage(screen, 0, 0);
+    // Display timestamp for the bench. Without it this page reports no displayed
+    // pictures at all, so every pixel row was withheld as "[NO MOVEMENT]" - the
+    // bench was not failing to see movement, the page was never saying anything.
+    // Same shape and same clock as the instruction page, so the two are
+    // comparable without a translation step.
+    if (window.__bench && window.__bench.display) {
+      window.__bench.display.push(performance.timeOrigin + performance.now());
+      if (window.__bench.display.length > 200000) window.__bench.display.shift();
+    }
     var data = nativeCtx.getImageData(0, 0, w, h).data;
     var changed = false;
     if (nativePrev === null || nativePrev.length !== data.length) {
@@ -424,7 +433,9 @@ const rawPage = `<!doctype html>
         }
       } catch (error) { /* an unreadable surface is not a measurement */ }
     }
-    window.requestAnimationFrame(sampleDisplay);
+    window.__bench = window.__bench || { display: [], paints: 0, framesApplied: 0 };
+  window.__bench.glRenderer = 'pixel-path';
+  window.requestAnimationFrame(sampleDisplay);
   }
   window.requestAnimationFrame(sampleDisplay);
 
