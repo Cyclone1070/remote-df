@@ -220,6 +220,20 @@ static void (*real_SDL_RenderPresent)(void*) = nullptr;
 static int (*real_SDL_PushEvent)(void*) = nullptr;
 static int (*real_SDL_PollEvent)(void*) = nullptr;
 static void* (*real_SDL_CreateTextureFromSurface)(void*, void*) = nullptr;
+static int (*real_SDL_UpdateTexture)(void*, const void*, const void*, int) = nullptr;
+static int (*real_SDL_LockTexture)(void*, const void*, void**, int*) = nullptr;
+static void (*real_SDL_UnlockTexture)(void*) = nullptr;
+// What SDL_UpdateTexture actually looks like. Capturing its pixels is only worth
+// doing if they are small: copying a full-screen buffer on every call would be
+// hundreds of gigabytes a second, which is exactly why an earlier version that
+// copied unconditionally stopped the game presenting.
+static std::atomic<uint64_t> g_upd_calls{0};
+static std::atomic<uint64_t> g_upd_lock_calls{0};
+static std::atomic<uint64_t> g_upd_unlock_calls{0};
+static std::atomic<uint64_t> g_upd_pitch_le256{0};
+static std::atomic<uint64_t> g_upd_pitch_le2048{0};
+static std::atomic<uint64_t> g_upd_pitch_le8192{0};
+static std::atomic<uint64_t> g_upd_pitch_gt8192{0};
 static uint32_t (*real_SDL_GetMouseState)(int*, int*) = nullptr;
 static void (*real_SDL_DestroyTexture)(void*) = nullptr;
 static int (*real_SDL_RenderReadPixels)(void*, const SDL_Rect*, uint32_t, void*, int) = nullptr;
@@ -571,6 +585,9 @@ static void resolve_symbols() {
     if (!real_SDL_RenderPresent) real_SDL_RenderPresent = (void(*)(void*))dlsym(RTLD_NEXT, "SDL_RenderPresent");
     if (!real_SDL_PushEvent) real_SDL_PushEvent = (int(*)(void*))dlsym(RTLD_NEXT, "SDL_PushEvent");
     if (!real_SDL_CreateTextureFromSurface) real_SDL_CreateTextureFromSurface = (void*(*)(void*,void*))dlsym(RTLD_NEXT, "SDL_CreateTextureFromSurface");
+    if (!real_SDL_UpdateTexture) real_SDL_UpdateTexture = (int(*)(void*,const void*,const void*,int))dlsym(RTLD_NEXT, "SDL_UpdateTexture");
+    if (!real_SDL_LockTexture) real_SDL_LockTexture = (int(*)(void*,const void*,void**,int*))dlsym(RTLD_NEXT, "SDL_LockTexture");
+    if (!real_SDL_UnlockTexture) real_SDL_UnlockTexture = (void(*)(void*))dlsym(RTLD_NEXT, "SDL_UnlockTexture");
     if (!real_SDL_GetMouseState) real_SDL_GetMouseState = (uint32_t(*)(int*,int*))dlsym(RTLD_NEXT, "SDL_GetMouseState");
     if (!real_SDL_DestroyTexture) real_SDL_DestroyTexture = (void(*)(void*))dlsym(RTLD_NEXT, "SDL_DestroyTexture");
     if (!real_SDL_RenderReadPixels) real_SDL_RenderReadPixels = (int(*)(void*,const SDL_Rect*,uint32_t,void*,int))dlsym(RTLD_NEXT, "SDL_RenderReadPixels");
@@ -3026,6 +3043,47 @@ void SDL_DestroyTexture(void* texture) {
         }
     }
     if (real_SDL_DestroyTexture && texture) real_SDL_DestroyTexture(texture);
+}
+
+
+// Counting only. Whether these pixels can be captured is a measurement, not an
+// assumption: at the observed call rate a full-frame copy would be hundreds of
+// gigabytes a second, which is why an earlier version that copied unconditionally
+// stopped the game presenting at all.
+int SDL_UpdateTexture(void* texture, const void* rect, const void* pixels, int pitch) {
+    if (!real_SDL_UpdateTexture) resolve_symbols();
+    const uint64_t n = g_upd_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (pitch <= 256) g_upd_pitch_le256.fetch_add(1, std::memory_order_relaxed);
+    else if (pitch <= 2048) g_upd_pitch_le2048.fetch_add(1, std::memory_order_relaxed);
+    else if (pitch <= 8192) g_upd_pitch_le8192.fetch_add(1, std::memory_order_relaxed);
+    else g_upd_pitch_gt8192.fetch_add(1, std::memory_order_relaxed);
+    if ((n & 15) == 0) {
+        FILE* f = fopen("/tmp/df_upd_stats", "w");
+        if (f) {
+            fprintf(f, "calls=%llu lock=%llu unlock=%llu pitch_le256=%llu pitch_le2048=%llu pitch_le8192=%llu pitch_gt8192=%llu\n",
+                    (unsigned long long)g_upd_calls.load(),
+                    (unsigned long long)g_upd_lock_calls.load(),
+                    (unsigned long long)g_upd_unlock_calls.load(),
+                    (unsigned long long)g_upd_pitch_le256.load(),
+                    (unsigned long long)g_upd_pitch_le2048.load(),
+                    (unsigned long long)g_upd_pitch_le8192.load(),
+                    (unsigned long long)g_upd_pitch_gt8192.load());
+            fclose(f);
+        }
+    }
+    return real_SDL_UpdateTexture ? real_SDL_UpdateTexture(texture, rect, pixels, pitch) : -1;
+}
+
+int SDL_LockTexture(void* texture, const void* rect, void** pixels, int* pitch) {
+    if (!real_SDL_LockTexture) resolve_symbols();
+    g_upd_lock_calls.fetch_add(1, std::memory_order_relaxed);
+    return real_SDL_LockTexture ? real_SDL_LockTexture(texture, rect, pixels, pitch) : -1;
+}
+
+void SDL_UnlockTexture(void* texture) {
+    if (!real_SDL_UnlockTexture) resolve_symbols();
+    g_upd_unlock_calls.fetch_add(1, std::memory_order_relaxed);
+    if (real_SDL_UnlockTexture) real_SDL_UnlockTexture(texture);
 }
 
 void* SDL_CreateTextureFromSurface(void* renderer, void* surface) {
