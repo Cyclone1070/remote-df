@@ -227,6 +227,7 @@ static int (*real_SDL_UpdateTexture)(void*, const void*, const void*, int) = nul
 // measured at 4,919 changed pixels against zero command updates. Counting only:
 // pass-through, no lock, no capture.
 static std::atomic<uint64_t> g_rc_copy_calls{0};
+static std::atomic<uint64_t> g_rc_copyex_calls{0};
 static std::atomic<uint64_t> g_rc_fillrect{0};
 static std::atomic<uint64_t> g_rc_fillrects{0};
 static std::atomic<uint64_t> g_rc_drawline{0};
@@ -3280,6 +3281,7 @@ int SDL_RenderCopy(void* renderer, void* texture, const SDL_Rect* srcrect, const
 
 int SDL_RenderCopyEx(void* renderer, void* texture, const SDL_Rect* srcrect, const SDL_Rect* dstrect, double angle, const void* center, int flip) {
     if (!real_SDL_RenderCopyEx) resolve_symbols();
+    g_rc_copyex_calls.fetch_add(1, std::memory_order_relaxed);
     SDL_RenderCopy(renderer, texture, srcrect, dstrect);
     return real_SDL_RenderCopyEx(renderer, texture, srcrect, dstrect, angle, center, flip);
 }
@@ -3711,7 +3713,8 @@ extern "C++" std::string df_stats_json() {
              "\"target\":%llu,\"sent\":%llu,\"bytes\":%llu},"
              "\"raw\":{\"on\":%d,\"connected\":%d,\"sent\":%llu,\"changed\":%llu,"
              "\"same\":%llu,\"bytes\":%llu,\"dropped\":%llu,\"stampExpired\":%llu,"
-             "\"stampAnswered\":%llu,\"stampP50\":%.0f}}",
+             "\"stampAnswered\":%llu,\"stampP50\":%.0f},"
+             "\"rc\":{\"copy\":%llu,\"unknown\":%llu,\"nopix\":%llu,\"cmds\":%llu,\"upd\":%llu,\"copyex\":%llu}}",
              (long long)epoch_now_ms(),
              g_current_w, g_current_h,
              (unsigned long long)g_wire_bytes,
@@ -3770,7 +3773,13 @@ extern "C++" std::string df_stats_json() {
              (unsigned long long)g_raw_dropped.load(),
              (unsigned long long)g_raw_stamp_expired.load(),
              (unsigned long long)g_raw_stamp_answered.load(),
-             raw_stamp_p50);
+             raw_stamp_p50,
+             (unsigned long long)g_rc_copy_calls.load(),
+             (unsigned long long)g_draw_unknown,
+             (unsigned long long)g_draw_nopixels,
+             (unsigned long long)g_frame_cmd_count,
+             (unsigned long long)g_upd_calls.load(),
+             (unsigned long long)g_rc_copyex_calls.load());
     return std::string(buf);
 }
 
