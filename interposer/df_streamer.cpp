@@ -428,17 +428,31 @@ public:
         // a client that is parked on an older sequence.
         if (!force_keyframe && !is_combined && base_count > 0 &&
             curr_count == base_count && num_updates == 0) {
-            stat_nothing++;
             // The commands are identical. Did the picture change anyway?
+            //
+            // If it did, the frame must not be suppressed. Commands can be
+            // identical while the screen moves: anything drawn from a texture
+            // whose content changed - animated water or lava, an in-place sprite -
+            // changes pixels without changing a single DrawCommand. Counting that
+            // and returning Nothing anyway is how the client keeps painting the
+            // old picture: the host knows the screen moved, says so in a counter
+            // nobody reads, and sends nothing.
             uint64_t now_hash = 0;
-            if (sample_pixel_hash(g_probe_renderer, now_hash)) {
-                if (g_last_sent_pixel_hash_valid && now_hash != g_last_sent_pixel_hash) {
-                    g_nothing_pixels_changed.fetch_add(1, std::memory_order_relaxed);
-                } else {
-                    g_nothing_pixels_same.fetch_add(1, std::memory_order_relaxed);
-                }
+            const bool have_hash = sample_pixel_hash(g_probe_renderer, now_hash);
+            const bool pixels_moved = have_hash && g_last_sent_pixel_hash_valid &&
+                                      now_hash != g_last_sent_pixel_hash;
+            if (pixels_moved) {
+                g_nothing_pixels_changed.fetch_add(1, std::memory_order_relaxed);
+                // Re-send as a full frame: the command list did not change, so a
+                // delta would carry nothing, and what the client is missing is the
+                // picture content, not the commands.
+                force_keyframe = true;
+                num_updates = 0;
+            } else {
+                stat_nothing++;
+                if (have_hash) g_nothing_pixels_same.fetch_add(1, std::memory_order_relaxed);
+                return EncodeResult::Nothing;
             }
-            return EncodeResult::Nothing;
         }
 
         FrameHeader hdr;
@@ -3504,14 +3518,36 @@ static bool service_picture_send(const DrawCommand* cmds, uint16_t count,
 static bool sample_pixel_hash(void* renderer, uint64_t& out) {
     if (!real_SDL_RenderReadPixels || !renderer) return false;
     static uint32_t buf[64 * 64];
-    SDL_Rect r;
-    r.x = (g_current_w > 64 ? (g_current_w - 64) / 2 : 0);
-    r.y = (g_current_h > 64 ? (g_current_h - 64) / 2 : 0);
-    r.w = 64; r.h = 64;
-    if (real_SDL_RenderReadPixels(renderer, &r, 376840196 /* ABGR8888 */, buf, 64 * 4) != 0) return false;
-    uint64_t h = 1469598103934665603ull;
-    for (int i = 0; i < 64 * 64; i++) { h ^= buf[i]; h *= 1099511628211ull; }
-    out = h;
+    // Five regions, not one.
+    //
+    // This used to read a single 64x64 block in the middle of the screen. In DF
+    // the middle of the screen is usually terrain that does not move, so the hash
+    // came back identical while the rest of the frame was changing - which is why
+    // the "pixels changed but the commands did not" counter had never once fired
+    // in 20,292 presents. A sampler that cannot see movement cannot be used to
+    // decide whether a frame may be suppressed.
+    const int w = g_current_w, h = g_current_h;
+    if (w <= 0 || h <= 0) return false;
+    const int pts[5][2] = {
+        {(w - 64) / 2, (h - 64) / 2},   // centre
+        {8, 8},                          // top-left
+        {w - 72, 8},                     // top-right
+        {8, h - 72},                     // bottom-left
+        {w - 72, h - 72},                // bottom-right
+    };
+    uint64_t hsh = 1469598103934665603ull;
+    bool any = false;
+    for (int p2 = 0; p2 < 5; p2++) {
+        SDL_Rect r;
+        r.x = (int16_t)std::max(0, pts[p2][0]);
+        r.y = (int16_t)std::max(0, pts[p2][1]);
+        r.w = 64; r.h = 64;
+        if (real_SDL_RenderReadPixels(renderer, &r, 376840196 /* ABGR8888 */, buf, 64 * 4) != 0) continue;
+        any = true;
+        for (int i = 0; i < 64 * 64; i++) { hsh ^= buf[i]; hsh *= 1099511628211ull; }
+    }
+    if (!any) return false;
+    out = hsh;
     return true;
 }
 

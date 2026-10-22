@@ -363,9 +363,9 @@ const rawPage = `<!doctype html>
     // bench was not failing to see movement, the page was never saying anything.
     // Same shape and same clock as the instruction page, so the two are
     // comparable without a translation step.
-    if (window.__bench && window.__bench.display) {
-      window.__bench.display.push(performance.timeOrigin + performance.now());
-      if (window.__bench.display.length > 200000) window.__bench.display.shift();
+    if (window.__dfBench && window.__dfBench.display) {
+      window.__dfBench.display.push(performance.timeOrigin + performance.now());
+      if (window.__dfBench.display.length > 200000) window.__dfBench.display.shift();
     }
     var data = nativeCtx.getImageData(0, 0, w, h).data;
     var changed = false;
@@ -433,8 +433,8 @@ const rawPage = `<!doctype html>
         }
       } catch (error) { /* an unreadable surface is not a measurement */ }
     }
-    window.__bench = window.__bench || { display: [], paints: 0, framesApplied: 0 };
-  window.__bench.glRenderer = 'pixel-path';
+    window.__dfBench = window.__dfBench || { display: [], paints: 0, framesApplied: 0 };
+  window.__dfBench.glRenderer = 'pixel-path';
   window.requestAnimationFrame(sampleDisplay);
   }
   window.requestAnimationFrame(sampleDisplay);
