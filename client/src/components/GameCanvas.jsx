@@ -91,6 +91,23 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
                 }
             }).observe({ type: 'longtask', buffered: true });
         } catch (e) { /* not exposed here; the bench reports the gap as unattributed */ }
+        // The connection's own statistics. Without them a delay seen inside the
+        // message handler cannot be told apart from a delay on the wire: the
+        // timestamp is taken after dispatching, so it includes both. These counters
+        // are measured by the transport itself.
+        bench.transport = async () => {
+            if (!pc || !pc.getStats) return null;
+            const out = { inbound: {}, pair: {}, channel: {} };
+            const stats = await pc.getStats();
+            stats.forEach((r) => {
+                if (r.type === 'candidate-pair' && (r.nominated || r.selected)) {
+                    out.pair = { rtt: r.currentRoundTripTime, jitter: r.jitter, inFlight: r.bytesInFlight, available: r.availableOutgoingBitrate };
+                }
+                if (r.type === 'data-channel') { out.channel[r.label] = { messages: r.messagesReceived, bytes: r.bytesReceived }; }
+                if (r.type === 'inbound-rtp') { out.inbound = { jitter: r.jitter, packetsLost: r.packetsLost }; }
+            });
+            return out;
+        };
         window.__dfBench = bench;
 
         let lastMissingLogged = -1;
@@ -138,12 +155,26 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
         renderer.onDeltaStat = (d) => { deltaStatN++; if (!d.changed) deltaStatEmpty++; deltaStatCarry += d.updates; };
         const sequencer = new FrameSequencer({
             applyFullFrame: cmds => {
+                bench.lastFrameAt = performance.now();
+                if (bench.frameArrivedAt) {
+                    bench.arrivalToApply = bench.arrivalToApply || [];
+                    bench.arrivalToApply.push(+(bench.lastFrameAt - bench.frameArrivedAt).toFixed(1));
+                    if (bench.arrivalToApply.length > 4000) bench.arrivalToApply.shift();
+                }
+                bench.framesApplied = (bench.framesApplied || 0) + 1;
                 renderer.applyFullFrame(cmds);
                 syncAssets();
                 if (renderer.missingTextureIds().size === 0) markDrawn();
                 window.__dfFrameCount = (window.__dfFrameCount || 0) + 1;
             },
             applyDelta: (totalCmdCount, updates) => {
+                bench.lastFrameAt = performance.now();
+                if (bench.frameArrivedAt) {
+                    bench.arrivalToApply = bench.arrivalToApply || [];
+                    bench.arrivalToApply.push(+(bench.lastFrameAt - bench.frameArrivedAt).toFixed(1));
+                    if (bench.arrivalToApply.length > 4000) bench.arrivalToApply.shift();
+                }
+                bench.framesApplied = (bench.framesApplied || 0) + 1;
                 renderer.applyDelta(totalCmdCount, updates);
                 syncAssets();
                 if (renderer.missingTextureIds().size === 0) markDrawn();
@@ -449,6 +480,17 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
                 // show before. This is the frame the player saw change.
                 if (renderer.paintChanged) {
                     bench.display.push(now);
+                    // How long the client held the newest frame before showing it.
+                    // This is the client's own share of latency: the interval
+                    // between a frame being applied and the pixels changing. If it
+                    // grows while the bytes fall, the cost is reconstruction, not
+                    // transport - which is exactly the question a lower payload but
+                    // higher latency raises.
+                    if (bench.lastFrameAt) {
+                        bench.frameToDraw = bench.frameToDraw || [];
+                        bench.frameToDraw.push(+(now - bench.lastFrameAt).toFixed(1));
+                        if (bench.frameToDraw.length > 4000) bench.frameToDraw.shift();
+                    }
                     // How much of the picture changed, for telling a response
                     // apart from the animation the game does by itself.
                     bench.changeMagnitude.push(renderer.paintMagnitude);
@@ -655,15 +697,13 @@ function ingestTextureChunk(chunk) {
         }
 
         function handleFrameBinary(buffer) {
+            // Stamped before decode: what the client does with a frame, and how
+            // long it is held before it can be shown, are different costs and were
+            // being confused. A held frame waits for artwork, not for the transport.
+            bench.frameArrivedAt = performance.now();
             if (isDestroyed) return;
             if (isDebug) bytesReceived += buffer.byteLength;
 
-            // The bench's controlled-load probe, counted before anything else
-            // looks at the message. This handler is the only place in the page
-            // that sees every message, so it is the only place a probe message
-            // can be counted as arriving, and the sequence number the message
-            // carries is what turns "fewer arrived than were sent" into "these
-            // messages did not".
             const probe = DFProtocol.decodeProbe(buffer);
             if (probe) {
                 // Counted in three numbers as well as logged. The wire log is

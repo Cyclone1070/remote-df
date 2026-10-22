@@ -21,3 +21,10 @@ tests/*.png
 # ./qa/, so those images resolve locally but are intentionally not committed.
 qa/
 .tdd
+
+# Bench output: run logs, event logs and captured PNGs. Reproducible from the
+# bench itself, and far too large to track.
+evidence/
+
+# Superseded tests kept for reference only.
+tests/legacy/
