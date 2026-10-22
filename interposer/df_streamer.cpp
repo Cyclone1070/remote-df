@@ -221,6 +221,38 @@ static int (*real_SDL_PushEvent)(void*) = nullptr;
 static int (*real_SDL_PollEvent)(void*) = nullptr;
 static void* (*real_SDL_CreateTextureFromSurface)(void*, void*) = nullptr;
 static int (*real_SDL_UpdateTexture)(void*, const void*, const void*, int) = nullptr;
+// Which SDL draw calls the game actually uses, beyond RenderCopy. Anything drawn
+// with a call that is not captured never enters the command list, so the encoder
+// sees an identical frame and stays silent while the screen changes underneath -
+// measured at 4,919 changed pixels against zero command updates. Counting only:
+// pass-through, no lock, no capture.
+static std::atomic<uint64_t> g_rc_fillrect{0};
+static std::atomic<uint64_t> g_rc_fillrects{0};
+static std::atomic<uint64_t> g_rc_drawline{0};
+static std::atomic<uint64_t> g_rc_drawlines{0};
+static std::atomic<uint64_t> g_rc_drawpoint{0};
+static std::atomic<uint64_t> g_rc_geometry{0};
+static std::atomic<uint64_t> g_rc_setclip{0};
+static std::atomic<uint64_t> g_rc_setcolor{0};
+static int (*real_SDL_RenderFillRect)(void*, const void*) = nullptr;
+static int (*real_SDL_RenderFillRects)(void*, const void*, int) = nullptr;
+static int (*real_SDL_RenderDrawLine)(void*, int, int, int, int) = nullptr;
+static int (*real_SDL_RenderDrawLines)(void*, const void*, int) = nullptr;
+static int (*real_SDL_RenderDrawPoint)(void*, int, int) = nullptr;
+static int (*real_SDL_RenderGeometry)(void*, void*, const void*, int, const void*, int) = nullptr;
+static int (*real_SDL_RenderSetClipRect)(void*, const void*) = nullptr;
+static int (*real_SDL_SetRenderDrawColor)(void*, uint8_t, uint8_t, uint8_t, uint8_t) = nullptr;
+static void dump_render_call_counts() {
+    FILE* f = fopen("/tmp/df_render_calls", "w");
+    if (!f) return;
+    fprintf(f, "fillRect=%llu fillRects=%llu drawLine=%llu drawLines=%llu drawPoint=%llu geometry=%llu setClipRect=%llu setDrawColor=%llu\n",
+            (unsigned long long)g_rc_fillrect.load(), (unsigned long long)g_rc_fillrects.load(),
+            (unsigned long long)g_rc_drawline.load(), (unsigned long long)g_rc_drawlines.load(),
+            (unsigned long long)g_rc_drawpoint.load(), (unsigned long long)g_rc_geometry.load(),
+            (unsigned long long)g_rc_setclip.load(), (unsigned long long)g_rc_setcolor.load());
+    fclose(f);
+}
+
 static int (*real_SDL_LockTexture)(void*, const void*, void**, int*) = nullptr;
 static void (*real_SDL_UnlockTexture)(void*) = nullptr;
 // What SDL_UpdateTexture actually looks like. Capturing its pixels is only worth
@@ -586,6 +618,14 @@ static void resolve_symbols() {
     if (!real_SDL_PushEvent) real_SDL_PushEvent = (int(*)(void*))dlsym(RTLD_NEXT, "SDL_PushEvent");
     if (!real_SDL_CreateTextureFromSurface) real_SDL_CreateTextureFromSurface = (void*(*)(void*,void*))dlsym(RTLD_NEXT, "SDL_CreateTextureFromSurface");
     if (!real_SDL_UpdateTexture) real_SDL_UpdateTexture = (int(*)(void*,const void*,const void*,int))dlsym(RTLD_NEXT, "SDL_UpdateTexture");
+    if (!real_SDL_RenderFillRect) real_SDL_RenderFillRect = (int(*)(void*,const void*))dlsym(RTLD_NEXT, "SDL_RenderFillRect");
+    if (!real_SDL_RenderFillRects) real_SDL_RenderFillRects = (int(*)(void*,const void*,int))dlsym(RTLD_NEXT, "SDL_RenderFillRects");
+    if (!real_SDL_RenderDrawLine) real_SDL_RenderDrawLine = (int(*)(void*,int,int,int,int))dlsym(RTLD_NEXT, "SDL_RenderDrawLine");
+    if (!real_SDL_RenderDrawLines) real_SDL_RenderDrawLines = (int(*)(void*,const void*,int))dlsym(RTLD_NEXT, "SDL_RenderDrawLines");
+    if (!real_SDL_RenderDrawPoint) real_SDL_RenderDrawPoint = (int(*)(void*,int,int))dlsym(RTLD_NEXT, "SDL_RenderDrawPoint");
+    if (!real_SDL_RenderGeometry) real_SDL_RenderGeometry = (int(*)(void*,void*,const void*,int,const void*,int))dlsym(RTLD_NEXT, "SDL_RenderGeometry");
+    if (!real_SDL_RenderSetClipRect) real_SDL_RenderSetClipRect = (int(*)(void*,const void*))dlsym(RTLD_NEXT, "SDL_RenderSetClipRect");
+    if (!real_SDL_SetRenderDrawColor) real_SDL_SetRenderDrawColor = (int(*)(void*,uint8_t,uint8_t,uint8_t,uint8_t))dlsym(RTLD_NEXT, "SDL_SetRenderDrawColor");
     if (!real_SDL_LockTexture) real_SDL_LockTexture = (int(*)(void*,const void*,void**,int*))dlsym(RTLD_NEXT, "SDL_LockTexture");
     if (!real_SDL_UnlockTexture) real_SDL_UnlockTexture = (void(*)(void*))dlsym(RTLD_NEXT, "SDL_UnlockTexture");
     if (!real_SDL_GetMouseState) real_SDL_GetMouseState = (uint32_t(*)(int*,int*))dlsym(RTLD_NEXT, "SDL_GetMouseState");
@@ -3050,6 +3090,16 @@ void SDL_DestroyTexture(void* texture) {
 // assumption: at the observed call rate a full-frame copy would be hundreds of
 // gigabytes a second, which is why an earlier version that copied unconditionally
 // stopped the game presenting at all.
+
+int SDL_RenderFillRect(void* r, const void* rect) { if (!real_SDL_RenderFillRect) resolve_symbols(); g_rc_fillrect.fetch_add(1, std::memory_order_relaxed); dump_render_call_counts(); return real_SDL_RenderFillRect ? real_SDL_RenderFillRect(r, rect) : -1; }
+int SDL_RenderFillRects(void* r, const void* rects, int n) { if (!real_SDL_RenderFillRects) resolve_symbols(); g_rc_fillrects.fetch_add(1, std::memory_order_relaxed); dump_render_call_counts(); return real_SDL_RenderFillRects ? real_SDL_RenderFillRects(r, rects, n) : -1; }
+int SDL_RenderDrawLine(void* r, int x1, int y1, int x2, int y2) { if (!real_SDL_RenderDrawLine) resolve_symbols(); g_rc_drawline.fetch_add(1, std::memory_order_relaxed); dump_render_call_counts(); return real_SDL_RenderDrawLine ? real_SDL_RenderDrawLine(r, x1, y1, x2, y2) : -1; }
+int SDL_RenderDrawLines(void* r, const void* pts, int n) { if (!real_SDL_RenderDrawLines) resolve_symbols(); g_rc_drawlines.fetch_add(1, std::memory_order_relaxed); dump_render_call_counts(); return real_SDL_RenderDrawLines ? real_SDL_RenderDrawLines(r, pts, n) : -1; }
+int SDL_RenderDrawPoint(void* r, int x, int y) { if (!real_SDL_RenderDrawPoint) resolve_symbols(); g_rc_drawpoint.fetch_add(1, std::memory_order_relaxed); dump_render_call_counts(); return real_SDL_RenderDrawPoint ? real_SDL_RenderDrawPoint(r, x, y) : -1; }
+int SDL_RenderGeometry(void* r, void* tex, const void* v, int nv, const void* i, int ni) { if (!real_SDL_RenderGeometry) resolve_symbols(); g_rc_geometry.fetch_add(1, std::memory_order_relaxed); dump_render_call_counts(); return real_SDL_RenderGeometry ? real_SDL_RenderGeometry(r, tex, v, nv, i, ni) : -1; }
+int SDL_RenderSetClipRect(void* r, const void* rect) { if (!real_SDL_RenderSetClipRect) resolve_symbols(); g_rc_setclip.fetch_add(1, std::memory_order_relaxed); dump_render_call_counts(); return real_SDL_RenderSetClipRect ? real_SDL_RenderSetClipRect(r, rect) : -1; }
+int SDL_SetRenderDrawColor(void* r, uint8_t a, uint8_t b2, uint8_t c, uint8_t d) { if (!real_SDL_SetRenderDrawColor) resolve_symbols(); g_rc_setcolor.fetch_add(1, std::memory_order_relaxed); dump_render_call_counts(); return real_SDL_SetRenderDrawColor ? real_SDL_SetRenderDrawColor(r, a, b2, c, d) : -1; }
+
 int SDL_UpdateTexture(void* texture, const void* rect, const void* pixels, int pitch) {
     if (!real_SDL_UpdateTexture) resolve_symbols();
     const uint64_t n = g_upd_calls.fetch_add(1, std::memory_order_relaxed) + 1;
