@@ -57,6 +57,7 @@
 // the pages' own bench objects, which share measure.js, so the two transports are
 // measured with one ruler rather than two.
 import { chromium } from 'playwright';
+import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync, appendFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -207,25 +208,103 @@ const IDLE_BEAT_ONLY = () => {
   window.__enableM2P = false;
 };
 
+// The page runs on this machine, so anything else using it is measured too. A
+// load average of 7 from an unrelated build produced a 4,636 ms p95 on a path whose
+// honest figure is 55 ms - the run was not wrong, the machine was busy. Every sample
+// carries the load so a tail like that can be recognised instead of believed.
+const hostLoad = () => {
+  const l = os.loadavg();
+  return { l1: Math.round(l[0] * 100) / 100, l5: Math.round(l[1] * 100) / 100 };
+};
+
 const browser = await chromium.launch({
   headless: true,
-  args: ['--disable-frame-rate-limit', '--disable-gpu-vsync', '--run-all-compositor-stages-before-draw',
+  // Deliberately NOT --disable-frame-rate-limit or --disable-gpu-vsync.
+  //
+  // Those flags let requestAnimationFrame run unthrottled: measured on the real
+  // client page, the render loop ran at 900 iterations a second with a 0.2ms median
+  // gap, where a display gives 60. A client looping fifteen times faster than any
+  // real browser burns the CPU it would need for decoding and picture assembly, and
+  // every client-side number taken under it - paint cost, long tasks, frames held -
+  // described a browser that cannot exist. The measurement has to be of the product.
+  args: ['--run-all-compositor-stages-before-draw',
          '--disable-background-timer-throttling', '--disable-renderer-backgrounding',
          '--disable-backgrounding-occluded-windows'],
 });
 
 // ---------- get the game into the arena once: every interaction needs a map ---
+// Wait for the client to be showing something drawable, or give up.
+//
+// The fixed sleeps here cost 87 seconds of a 300 second budget and were pure guess:
+// 22 seconds for the menu and a full 60 after "Create arena". A blind wait that is
+// too short starts clicking a blank canvas, which is how automated arena entry kept
+// failing; one that is too long is time taken from the measurement. So wait for the
+// thing itself - the client reporting artwork-ready and a frame with real content -
+// and cap the wait where the old sleep was.
+async function waitForClient(page, label, maxMs, predicate) {
+  const started = Date.now();
+  for (;;) {
+    let state = null;
+    try {
+      state = await page.evaluate(() => {
+        const r = window.renderer || {};
+        return {
+          ready: r.assetsReady === true,
+          missing: (r.missingTextureIds ? r.missingTextureIds().size : 0),
+          cmds: (r.commands || []).length,
+          frames: window.__dfFrameCount || 0,
+        };
+      });
+    } catch { /* page still navigating */ }
+    if (state && predicate(state)) {
+      step({ phase: 'arena', what: label, waitedMs: Date.now() - started, cmds: state.cmds });
+      return true;
+    }
+    if (Date.now() - started > maxMs) {
+      step({ phase: 'arena', what: `${label}-timeout`, waitedMs: Date.now() - started, state });
+      return false;
+    }
+    await settle(1000);
+  }
+}
+
 async function enterArenaOnce() {
+  // The movement probe reads the instruction client's command list, so make sure
+  // the module is not still pointing at the pixel path from an earlier pass.
+  currentPath = 'instruction';
   const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
   await page.goto(`${CMD_BASE}/df`, { waitUntil: 'domcontentloaded' });
-  await settle(22000);
+  // The main menu is a small frame; anything drawable will do before the first click.
+  await waitForClient(page, 'menu', 30000, (s) => s.cmds > 0 && s.ready);
   const b = page.viewportSize();
   await page.mouse.click(b.width * 0.5, b.height * (479 / 800));
   await settle(4000);
   await page.mouse.click(b.width * (180 / 1280), b.height * (144 / 800));
   await settle(1500);
   await page.mouse.click(b.width * (1000 / 1280), b.height * (755 / 800));
-  await settle(60000);
+  // Wait for the arena to be PLAYABLE, not for a command count.
+  //
+  // Counting commands does not identify the arena: measured on this build the main
+  // menu renders 976, the world-generation screen 10,912 and the arena 465, so any
+  // threshold either matches the menu or the loading screen. That mistake put the
+  // bench into "measuring" a loading bar. The only honest test of a pannable map is
+  // that panning moves the view, which is what -d already does - so poll until the
+  // camera answers, then say how long world creation actually took.
+  const arenaT0 = Date.now();
+  let playable = false;
+  // World creation takes as long as it takes; there is no fixed sleep that is both
+  // safe and cheap, so poll for the camera answering input. Requiring the scene to
+  // be static first was wrong: a running arena never is, so the probe waited its
+  // whole allowance and then called a perfectly playable map unplayable. A key that
+  // moves the view is the only thing being asked for here, and the per-interaction
+  // liveness gate downstream re-checks that the measurement itself moved something.
+  for (let attempt = 0; attempt < 40 && !playable; attempt++) {
+    await settle(3000);
+    playable = await viewMoves(page, 'd');
+  }
+  step({ phase: 'arena', what: playable ? 'playable' : 'never-became-playable',
+         waitedMs: Date.now() - arenaT0 });
+  if (!playable) console.log('  arena never became playable - the run will refuse to measure');
   await page.close();
 }
 
@@ -328,8 +407,15 @@ async function movesPicture(page, fn) {
 // The command list is the signal, not the pixels: it is what changes when the
 // camera moves, and it does not change on its own while the world animates. An
 // ambient animation therefore cannot masquerade as a successful pan.
-async function viewMoves(page, key) {
-  const sig = () => page.evaluate(() => {
+// The two paths have to be asked the same question in their own vocabulary. The
+// instruction page exposes the renderer's command list; the pixel page has no
+// renderer at all, only a picture, so its "has the view changed" signal is the
+// host's count of pictures that actually differed. Using the command list for both
+// made every pixel-path interaction report "the camera will not move" - the gate was
+// reading an empty array and calling it a stuck camera.
+// The instruction client's own description of what it is drawing.
+function viewSignature(page) {
+  return page.evaluate(() => {
     const c = (window.renderer || {}).commands || [];
     let h = 2166136261;
     for (let i = 0; i < c.length; i++) {
@@ -339,10 +425,23 @@ async function viewMoves(page, key) {
     }
     return `${c.length}:${h.toString(16)}`;
   });
+}
+
+async function viewMoves(page, key) {
+  const sig = () => currentPath === 'pixel' ? rawChangeCount() : viewSignature(page);
   const before = await sig();
   await page.keyboard.press(key);
   await settle(600);
   return (await sig()) !== before;
+}
+
+// How many pictures the host produced that differed from the one before. That is the
+// game's own output, independent of either transport.
+async function rawChangeCount() {
+  try {
+    const j = await (await fetch(`${CMD_BASE}/df-stats`, { signal: AbortSignal.timeout(8000) })).json();
+    return (j.raw && j.raw.changed) || 0;
+  } catch { return -1; }
 }
 
 // Press until the view changes, or give up.
@@ -360,14 +459,41 @@ async function pressUntilChange(page, key, tries) {
 }
 
 // True if the camera answers, after one attempt to resume a paused game.
+const pathProvenMovable = new Set();
+
 async function requireMovable(page, where) {
-  for (const key of ['w', 's']) {
+  // All four pan directions, not just vertical. The camera hits a map edge and then
+  // that one key does nothing however healthy everything else is - which is exactly
+  // how a playable arena was called unplayable before the elevation pass and the
+  // whole run was abandoned. Any direction answering is proof enough.
+  for (const key of ['a', 'd', 'w', 's']) {
     if (await viewMoves(page, key)) return true;
   }
-  await page.keyboard.press(' ');
-  await settle(1500);
-  for (const key of ['w', 's']) {
-    if (await viewMoves(page, key)) return true;
+  // Space is a toggle. Pressing it on a running game PAUSES it, which turns a
+  // transport measurement into a frozen picture - the exact failure this gate was
+  // added to catch. So only press when the host says the game is presenting without
+  // anything changing, which is what a paused game looks like from outside.
+  const counts = async () => {
+    try {
+      const j = await (await fetch(`${CMD_BASE}/df-stats`, { signal: AbortSignal.timeout(8000) })).json();
+      return { frames: j.frames || 0, nothing: j.encodeNothing || 0, raw: (j.raw && j.raw.changed) || 0 };
+    } catch { return null; }
+  };
+  const a = await counts();
+  await settle(900);
+  const b = await counts();
+  const stagnant = a && b && b.frames <= a.frames && b.nothing > a.nothing && b.raw <= a.raw;
+  if (stagnant) {
+    console.log('  the game looks paused - resuming once');
+    await page.keyboard.press(' ');
+    await settle(1500);
+  }
+  // Proved once per path. Re-proving the same map before every interaction costs
+  // four keypresses each time and teaches nothing new - the per-interaction record
+  // still carries whether that interaction moved the picture.
+  if (pathProvenMovable.has(currentPath)) return true;
+  for (const key of ['a', 'd', 'w', 's']) {
+    if (await viewMoves(page, key)) { pathProvenMovable.add(currentPath); return true; }
   }
   console.log(
     `FATAL: the camera will not move before ${where}. ` +
@@ -383,6 +509,190 @@ const stepsPath = `${dir}/steps.ndjson`;
 writeFileSync(stepsPath, '');
 
 const step = (o) => appendFileSync(stepsPath, JSON.stringify({ t: Date.now(), ...o }) + '\n');
+// The host records every captured draw, every picture sent or skipped, every
+// encode decision and every input it pushed into the game, as ndjson. Pull it
+// alongside the client trace so one log holds both sides of the same run.
+// The host writes its per-event log to a file beside the game. Pulling it over HTTP
+// was the wrong transport: one interaction produced 2.9 million records, needed 45
+// requests, took 33 seconds of a 45 second interaction, and still reported billions
+// dropped because the drain could not keep up with the game. `podman exec cat` reads
+// the file directly and cannot fall behind.
+const EVENT_LOG_PATH = process.env.DF_EVENT_LOG_PATH || '/tmp/df_events.log';
+// The relay keeps its own file. Its decisions - which viewer was offered which
+// frame, and which frame it lost - belong in the same run log as the capture side.
+const SERVER_EVENT_LOG_PATH = process.env.DF_SERVER_EVENT_LOG_PATH || '/tmp/df_server_events.log';
+let serverOffset = 0;
+const CONTAINER = process.env.DF_CONTAINER || 'remote-df';
+
+// Bytes of the host log already taken. The file grows for the whole run, so each
+// interaction reads only what is new; copying it whole every time duplicated every
+// earlier interaction into every later one.
+let hostOffset = 0;
+
+function hostLogSize() {
+  try {
+    const out = execFileSync('ssh', [GAME_HOST,
+      `podman exec ${CONTAINER} stat -c %s ${EVENT_LOG_PATH}`], { encoding: 'utf8' });
+    return parseInt(out.trim(), 10) || 0;
+  } catch { return -1; }
+}
+
+// The record filter runs on the host, because the log there is gigabytes and the
+// interesting records are a fraction of a percent of it. It lives in a file so the
+// command line carries no quoting: three shells deep (ssh, podman, sh) every nested
+// quote and every $ has to survive, and one that does not turns the filter into a
+// syntax error that silently yields nothing - which is exactly how an entire
+// interaction's host log went missing while the run still reported success.
+const HOST_FILTER = '/tmp/df_ev_filter.awk';
+let hostFilterReady = false;
+
+function ensureHostFilter() {
+  if (hostFilterReady) return true;
+  // Drop draw captures (kind 0) entirely: they are ~99% of all records and the
+  // aggregate is already in /df-stats as hookCalls. Collapse repeated
+  // "already holds this picture" records (kind 16) to one per id, which is all the
+  // id-level join needs. Everything else is kept verbatim.
+  const program = [
+    '$2==0 { next }',
+    '$2==16 { if (seen[$4]++) next }',
+    '{ print }',
+  ].join('\n');
+  try {
+    execFileSync('ssh', [GAME_HOST,
+      `podman exec -i ${CONTAINER} sh -c "cat > ${HOST_FILTER}"`],
+      { input: program, encoding: 'utf8' });
+    hostFilterReady = true;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readHostEventsFrom(offset) {
+  if (!ensureHostFilter()) return null;
+  try {
+    return execFileSync('ssh', [GAME_HOST,
+      `podman exec ${CONTAINER} sh -c "tail -c +${offset + 1} ${EVENT_LOG_PATH} | awk -f ${HOST_FILTER}"`],
+      { maxBuffer: 1 << 30, encoding: 'utf8' });
+  } catch (err) {
+    // awk exits non-zero only on a real error; an empty result is success.
+    if (err && err.stdout) return String(err.stdout);
+    return null;
+  }
+}
+
+// Discard whatever the log holds before the measured window.
+function flushHostEvents() {
+  const size = hostLogSize();
+  if (size < 0) {
+    step({ src: 'host', ev: 'flush-failed', note: 'could not size the host event file' });
+    return 0;
+  }
+  hostOffset = size;
+  // The relay's file is flushed to the same boundary, so both logs describe the
+  // same window and can be compared record for record.
+  const serverSize = serverLogSize();
+  if (serverSize >= 0) serverOffset = serverSize;
+  step({ src: 'host', ev: 'pre-run-flush', bytesBefore: size, serverBytesBefore: serverSize });
+  return size;
+}
+
+// Same contract as the capture-side drain: hand back only what is new, and never
+// take a half-written line. The relay's file is small (one record per frame per
+// viewer), so it is read whole from the offset rather than filtered on the host.
+function readServerEventsFrom(offset) {
+  try {
+    return execFileSync('ssh', [GAME_HOST,
+      `podman exec ${CONTAINER} sh -c "tail -c +${offset + 1} ${SERVER_EVENT_LOG_PATH} 2>/dev/null"`,
+      ], { maxBuffer: 1 << 28, encoding: 'utf8' });
+  } catch (err) {
+    if (err && err.stdout) return String(err.stdout);
+    return null;
+  }
+}
+
+function serverLogSize() {
+  try {
+    const out = execFileSync('ssh', [GAME_HOST,
+      `podman exec ${CONTAINER} stat -c %s ${SERVER_EVENT_LOG_PATH} 2>/dev/null`], { encoding: 'utf8' });
+    return parseInt(out.trim(), 10) || 0;
+  } catch { return -1; }
+}
+
+function drainServerEvents(label) {
+  const size = serverLogSize();
+  if (size < 0) {
+    step({ src: 'server', ev: 'drain-failed', interaction: label, error: 'no relay event file' });
+    return 0;
+  }
+  const text = readServerEventsFrom(serverOffset);
+  if (text === null) return 0;
+  const lastNl = text.lastIndexOf('\n');
+  if (lastNl < 0) return 0;
+  const complete = text.slice(0, lastNl + 1);
+  serverOffset += Buffer.byteLength(complete, 'utf8');
+  const file = `${dir}/server-${currentPath}-${label}.log`;
+  appendFileSync(file, complete);
+  step({ src: 'server', ev: 'drain-summary', interaction: label, records: complete.split('\n').length - 1, file });
+  return complete.split('\n').length - 1;
+}
+
+async function drainHostEvents(label) {
+  const size = hostLogSize();
+  if (size < 0) {
+    step({ src: 'host', ev: 'drain-failed', interaction: label,
+           error: 'could not size the host event file' });
+    return 0;
+  }
+  let text = readHostEventsFrom(hostOffset);
+  if (text === null) {
+    step({ src: 'host', ev: 'drain-failed', interaction: label,
+           error: 'could not read the host event file' });
+    return 0;
+  }
+  // Never take a half-written line: leave it for the next drain by holding the
+  // offset back to the last newline in this chunk.
+  const lastNl = text.lastIndexOf('\n');
+  if (lastNl < 0) return 0;
+  const complete = text.slice(0, lastNl + 1);
+  hostOffset += Buffer.byteLength(complete, 'utf8');
+
+  // Written verbatim, in the compact form the interposer already uses:
+  //   t_us kind seq id a b c flags
+  // Re-serialising millions of records into JSON cost more than the transfer and
+  // bought nothing: the analysis parses this format directly.
+  const file = `${dir}/host-${currentPath}-${label}.log`;
+  writeFileSync(file, complete);
+  const n = complete.split('\n').filter(Boolean).length;
+  step({ src: 'host', ev: 'drain-summary', interaction: label, records: n,
+         file: file.slice(dir.length + 1) });
+  return n;
+}
+
+// The path the interaction belongs to, so both passes cannot overwrite each other.
+function pathNameOf() { return currentPath; }
+
+// The client already records every decision and arrival into window.__trace, with
+// a performance.now() timestamp, and throws it away when the page closes. That is
+// the detail the log is supposed to carry: aggregates in the OVERVIEW say a stream
+// was slow, the trace says which frame was held, behind which gap, and for how
+// long. Drain it into the log instead of discarding it.
+async function drainTrace(page, label) {
+  let batch = [];
+  try {
+    batch = await page.evaluate(() => { const t = window.__trace || []; window.__trace = []; return t; });
+  } catch { return 0; }
+  // One append for the whole batch. Writing a line per record meant opening and
+  // closing the log twenty thousand times per interaction, which cost 35 seconds
+  // of the five minute budget - more than the drain it was recording.
+  const lines = [];
+  for (const row of batch) {
+    const [t, kind, data] = row;
+    lines.push(JSON.stringify({ t: Date.now(), src: 'client', ev: kind, at: t, interaction: label, data }));
+  }
+  if (lines.length) appendFileSync(stepsPath, lines.join('\n') + '\n');
+  return batch.length;
+}
 
 const results = [];
 
@@ -445,7 +755,10 @@ async function dumpEvents(page, pathName) {
   return files;
 }
 
+let currentPath = '';
+
 async function measurePath(pathName, pageUrl) {
+  currentPath = pathName;
   // One connection for every interaction on this transport.
   //
   // A fresh page and a fresh WebRTC handshake before each interaction cost about
@@ -516,6 +829,8 @@ async function measurePath(pathName, pageUrl) {
     return;
   }
 
+  await flushHostEvents();
+
   try {
   for (const [name, fn] of Object.entries(INTERACTIONS)) {
     if (ONLY && !ONLY.split(',').includes(name)) continue;
@@ -537,6 +852,13 @@ async function measurePath(pathName, pageUrl) {
       // Per-path, receiver-side. Summing both paths' server counters into one
       // baseline and then subtracting it from each path let the pixel path's idle
       // traffic leak into the instruction path's numbers.
+      // Start this interaction's slice of the host log where the interaction
+      // starts. Without this the first interaction's file also carried the whole
+      // cold start and arena entry - 3.3 million records for an 8.7 s window, most
+      // of it setup, all of it transferred over ssh and written to disk. The setup
+      // window is not lost: it is captured by the pre-run flush.
+      flushHostEvents();
+
       const idleAmount = async () => (pathName === 'pixel'
         ? (await pixelStats()).bytes
         : (await page.evaluate(READ_RECEIVED)).bytes);
@@ -560,7 +882,7 @@ async function measurePath(pathName, pageUrl) {
       const sampler = (async () => {
         while (sampling) {
           const s = await serverStats().catch(() => null);
-          if (s) step({ path: pathName, interaction: name, phase: 'sample', server: { frames: s.frames, wire: s.wireBytes, tex: s.textureBytes, presents: s.presents, raw: s.raw ? { sent: s.raw.sent, bytes: s.raw.bytes } : null } });
+          if (s) step({ path: pathName, interaction: name, phase: 'sample', load: hostLoad(), server: { frames: s.frames, wire: s.wireBytes, tex: s.textureBytes, presents: s.presents, raw: s.raw ? { sent: s.raw.sent, bytes: s.raw.bytes } : null } });
           await settle(500);
         }
       })();
@@ -718,7 +1040,10 @@ async function measurePath(pathName, pageUrl) {
         process.exit(3);
       }
       results.push(row);
-      step({ path: pathName, interaction: name, phase: 'done', row });
+      const drained = await drainTrace(page, name);
+      const hostRecords = await drainHostEvents(name);
+      drainServerEvents(name);
+      step({ path: pathName, interaction: name, phase: 'done', row, traceRecords: drained, hostRecords });
       console.log(
         `${pathName.padEnd(12)} ${name.padEnd(11)} ` +
         `payload ${(row.payload.bytesPerSec / 1024).toFixed(0).padStart(6)} KB/s ` +
@@ -771,18 +1096,26 @@ async function gameIsLive() {
 {
   const target = CMD_BASE.replace(/^https?:\/\//, '');
   console.log('restarting the game so this run starts with no cache');
+  const t0 = Date.now();
+  step({ phase: 'cold-start', what: 'restart-begin' });
   try {
     execFileSync('bash', ['scripts/df_restart.sh', target], { stdio: 'ignore' });
     await new Promise((r) => setTimeout(r, 6000));
   } catch (e) {
     console.log(`  could not restart the game: ${String(e).slice(0, 80)}`);
   }
+  // The restart is the single largest fixed cost in the run and it was never
+  // timed, so an overrun could not be attributed to it.
+  step({ phase: 'cold-start', what: 'restart-done', ms: Date.now() - t0 });
 }
 
+const arenaT0 = Date.now();
 if (await gameIsLive()) {
   console.log('game is already in the arena - skipping the 90s entry');
+  step({ phase: 'cold-start', what: 'arena-skipped' });
 } else {
   await enterArenaOnce();
+  step({ phase: 'cold-start', what: 'arena-entered', ms: Date.now() - arenaT0 });
 }
 
 // The first input after the arena loads is Space: the arena comes up paused.

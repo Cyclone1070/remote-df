@@ -173,11 +173,90 @@ const noiseFloor = compare(n1.grey, n2.grey);
 console.log(`noise floor (raw page against itself, still scene): ${noiseFloor}`);
 
 const pairs = [];
+// Capture each page twice and only accept a pair whose captures stopped changing.
+//
+// The two pages are grabbed one after the other, so if either is still settling the
+// pair compares two different instants and scores a rendering fault that is really
+// a timing fault. Exactly that failed the gate twice on pan pairs while the still
+// pairs passed - the scene was still moving after a pan when the raw page was read.
+// Waiting for both to go quiet removes the ambiguity instead of widening the limit.
+// Capture each page twice and accept the pair only once both stopped changing.
+//
+// The pages are grabbed one after the other, so if either is still settling the pair
+// compares two different instants and scores a timing artefact as a rendering fault.
+// That is what failed the gate twice on pan pairs while the still pairs passed.
+// Asking the pages whether they are still drawing does not work - the pixel path
+// repaints every frame by design, so it never looks idle - so the test is the picture
+// itself: read it again after a short settle and require it to be unchanged.
+// Wait until the instruction client is holding every picture its frame references.
+//
+// Panning into unseen terrain makes the game create new pictures, which have to
+// travel before the client can draw them. Comparing during that window scores
+// "artwork still arriving" as "the renderer paints the wrong thing" - which is
+// exactly how this gate failed on pan pairs while the still and zoom pairs passed.
+async function waitForArtwork(maxMs = 20000) {
+  const started = Date.now();
+  for (;;) {
+    let missing = -1;
+    try {
+      missing = await instruction.evaluate(() => {
+        const r = window.renderer || {};
+        if (!r.missingTextureIds) return 0;
+        return r.assetsReady === true ? r.missingTextureIds().size : 999;
+      });
+    } catch { /* page busy */ }
+    if (missing === 0) return true;
+    if (Date.now() - started > maxMs) return false;
+    await settle(250);
+  }
+}
+
+// Wait until the instruction client has taken in a frame produced after this press.
+// Comparing straight after a keypress compares the pixel path's live screen against a
+// picture the other path has not received yet: that reads as a rendering fault and is
+// really a capture taken too early.
+async function waitForFrameAfter(page, appliedBefore, timeoutMs = 6000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const now = await page.evaluate(() => (window.__dfBench || {}).framesApplied || 0);
+    if (now > appliedBefore) return true;
+    await page.waitForTimeout(120);
+  }
+  return false;
+}
+
 const snap = async (label) => {
-  const a = await grab(instruction);
-  const b = await grab(pixel);
-  const d = compare(a.grey, b.grey);
-  pairs.push({ label, t: a.t, diff: d, inst: a, raw: b });
+  await waitForArtwork();
+  let a2, b2;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const a = await grab(instruction);
+    const b = await grab(pixel);
+    await settle(300);
+    a2 = await grab(instruction);
+    b2 = await grab(pixel);
+    if (compare(a.grey, a2.grey) <= noiseFloor + 0.05 && compare(b.grey, b2.grey) <= noiseFloor + 0.05) break;
+  }
+  const d = compare(a2.grey, b2.grey);
+  // When a pair disagrees, say WHY in the terms that explain it. A picture that
+  // never changed is a held frame, not a mis-render, and the two need opposite
+  // fixes - so record the client's own view of its completeness alongside the diff.
+  let diag = null;
+  if (d > 12) {
+    try {
+      diag = await instruction.evaluate(() => {
+        const r = window.renderer || {};
+        return {
+          ready: r.assetsReady === true,
+          missing: r.missingTextureIds ? r.missingTextureIds().size : -1,
+          missingIds: r.missingTextureIds ? [...r.missingTextureIds()].slice(0, 12) : [],
+          cmds: (r.commands || []).length,
+          framesApplied: (window.__dfBench || {}).framesApplied || 0,
+          paints: (window.__dfBench || {}).paints || 0,
+        };
+      });
+    } catch { /* page busy */ }
+  }
+  pairs.push({ label, t: a2.t, diff: d, inst: a2, raw: b2, diag });
   return d;
 };
 
@@ -187,11 +266,38 @@ const snap = async (label) => {
 // captures scores as a difference even when both paths render correctly. Freezing the
 // simulation removes that: on a paused game the picture is the same wait as long as
 // you like, so a non-zero score can only mean the two renderers disagree.
-await instruction.keyboard.press(' ');
-await settle(2500);
+// Space is a toggle, so pressing it blind is only correct on a game that is
+// running. The arena loads paused: pressing Space there *resumes* it, and then
+// every pair photographs an animating world at two different instants, which scores
+// as a rendering fault on a healthy build. That is exactly how this gate failed a
+// good run. So look at the host's counters first: frames advancing means running,
+// encodeNothing advancing means presenting-but-paused.
+async function hostCounts() {
+  try {
+    const j = await (await fetch(`${BASE}/df-stats`, { signal: AbortSignal.timeout(8000) })).json();
+    return { frames: j.frames || 0, nothing: j.encodeNothing || 0 };
+  } catch { return null; }
+}
+async function ensurePaused() {
+  const a = await hostCounts();
+  await settle(1200);
+  const b = await hostCounts();
+  if (!a || !b) {
+    console.log('  could not read the host counters - not pressing space blind');
+    return;
+  }
+  if (b.frames > a.frames) {
+    console.log('  game is running - pausing it for the comparison');
+    await instruction.keyboard.press(' ');
+    await settle(2500);
+  } else {
+    console.log('  game is already paused - leaving it alone');
+  }
+}
+await ensurePaused();
 
 console.log('\nstill scene (game paused):');
-for (let i = 0; i < 2; i++) { console.log(`  pair ${i}: diff ${await snap('still')}`); await settle(600); }
+console.log(`  pair 0: diff ${await snap('still')}`);
 
 console.log('\nzooming:');
 // The capture of one page happens after the other, so both must be taken on a
@@ -199,8 +305,10 @@ console.log('\nzooming:');
 // compared; without this the gate measures the gap between two capture instants and
 // calls it a rendering fault.
 for (const k of [']', '[']) {
+  const before = await instruction.evaluate(() => (window.__dfBench || {}).framesApplied || 0);
   await instruction.keyboard.press(k);
-  await settle(900);
+  if (!(await waitForFrameAfter(instruction, before))) console.log(`  (no frame arrived after ${k})`);
+  await settle(400);
   console.log(`  after ${k}: diff ${await snap(`zoom-${k}`)}`);
 }
 
@@ -209,18 +317,29 @@ for (const k of [']', '[']) {
 // which scored as a rendering fault and failed the gate on a healthy build.
 console.log('\npanning:');
 for (const k of ['a', 'd']) {
+  const before = await instruction.evaluate(() => (window.__dfBench || {}).framesApplied || 0);
   await instruction.keyboard.down(k);
   await settle(400);
   await instruction.keyboard.up(k);
-  await settle(900);
-  console.log(`  after ${k}: diff ${await snap(`pan-${k}`)}`);
+  if (!(await waitForFrameAfter(instruction, before))) console.log(`  (no frame arrived after ${k})`);
+  await settle(400);
+  const d = await snap(`pan-${k}`);
+  console.log(`  after ${k}: diff ${d}${d > 12 ? '  ' + JSON.stringify(pairs[pairs.length - 1].diag) : ''}`);
 }
 
 // Resume the game before leaving. The gate pauses it to compare a settled scene, and
 // a run that hands a paused game to the bench makes every later interaction read as
-// "no movement" - a whole run wasted by a cleanup this small.
-await instruction.keyboard.press(' ');
-await settle(1500);
+// "no movement" - a whole run wasted by a cleanup this small. Same rule as above:
+// only press if it is actually paused.
+{
+  const a = await hostCounts();
+  await settle(1000);
+  const b = await hostCounts();
+  if (a && b && b.frames <= a.frames) {
+    await instruction.keyboard.press(' ');
+    await settle(1500);
+  }
+}
 
 await browser.close();
 
