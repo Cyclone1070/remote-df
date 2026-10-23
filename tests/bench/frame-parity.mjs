@@ -204,9 +204,9 @@ for (const k of [']', '[']) {
   console.log(`  after ${k}: diff ${await snap(`zoom-${k}`)}`);
 }
 
-await instruction.keyboard.press(' ');
-await settle(1500);
-
+// Still paused. The pan pairs compare two captures taken one after the other, and
+// resuming here made them photograph an animating world at different instants -
+// which scored as a rendering fault and failed the gate on a healthy build.
 console.log('\npanning:');
 for (const k of ['a', 'd']) {
   await instruction.keyboard.down(k);
@@ -219,8 +219,6 @@ for (const k of ['a', 'd']) {
 // Resume the game before leaving. The gate pauses it to compare a settled scene, and
 // a run that hands a paused game to the bench makes every later interaction read as
 // "no movement" - a whole run wasted by a cleanup this small.
-await instruction.keyboard.press(' ');
-await settle(1500);
 await instruction.keyboard.press(' ');
 await settle(1500);
 

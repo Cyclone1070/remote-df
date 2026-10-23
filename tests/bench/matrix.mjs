@@ -1,3 +1,45 @@
+// What this bench must satisfy. Written down because every one of these has been
+// quietly dropped at some point, and a bench that forgets one of them reports a
+// number that looks fine and means nothing.
+//
+//   1. Under five minutes for the whole run. 300s, hard. Over it is a rejection,
+//      not a warning.
+//   2. One run, both transports. Instruction and pixel measured in the same
+//      session against the same game, never stitched together across runs.
+//   3. A realistic, imperfect, deterministic simulated network.
+//   4. Input covers pan, zoom and elevation, using the game's own keys: pan is
+//      a/d and w/s, zoom is ] and [, elevation is > and <. Nothing else pans -
+//      the arrow keys are not pan keys in this build, and a check that presses
+//      them will conclude the camera is stuck when it is not.
+//   5. The game is running, not paused. The arena loads paused; unpause it before
+//      measuring, because a paused game changes nothing and every row then
+//      describes a frozen picture.
+//   6. Every event carries a timestamp, however small, so a gap can be attributed
+//      afterwards to the wire, the host or the page's own main thread.
+//   7. One structured, machine-readable log per run.
+//   8. A gate that cannot fail is not a gate. If an interaction moves nothing, exit
+//      loudly rather than printing withheld rows as if they were results.
+//   9. The lossy pixel page is never ground truth for picture equality.
+//  10. Report the tail, p90/p95/worst, not just the middle. The median hides
+//      exactly the stalls a player notices.
+//  11. Report payload per frame and in total, so both transports are compared on
+//      the same footing.
+//  12. Prove that the artwork sent is artwork the frames actually reference.
+//  13. Every run starts from a cold game and a cold connection. No visited terrain
+//      and no warmed client cache carried over from a previous run, because those
+//      are exactly what make two runs of the same code disagree: a camera that has
+//      already seen a tile ships no artwork for it, so the second run measures a
+//      cheaper path than the first and neither says so.
+//
+// The log is the report. What this file prints is an OVERVIEW: one line per
+// interaction, enough to see the shape and catch a catastrophic regression. It
+// cannot answer "where did the stall come from", and it is not meant to. The
+// ndjson log contains every step with its own timestamp, which is the only thing
+// specific enough to attribute a delay to a link in the chain. Any analysis of a
+// bench run must therefore do its arithmetic and filtering on the log, never on
+// the overview alone. If a claim cannot be reconstructed from the log, it is not
+// a finding.
+
 // The interaction matrix: every input the bench knows how to drive, measured on
 // both transports, with a per-step log so a failure can be read back later
 // without re-running anything.
@@ -45,7 +87,7 @@ const PIXEL_PAGE = process.env.DF_RAW_PAGE || 'http://192.168.1.111:8000/';
 // Interactions drive themselves now: a fixed few inputs each, so there is no
 // window length to configure.
 
-const ONLY = process.env.DF_MATRIX_ONLY || '';
+const ONLY = process.env.DF_MATRIX_ONLY || process.env.DF_ONLY || '';
 const PIXEL_STATS = process.env.DF_RAW_STATS || 'http://192.168.1.111:8000/raw-stats';
 const OUT_ROOT = 'evidence/bench/interaction-matrix';
 // Which network the numbers were taken on. A matrix measured only on a bare LAN
@@ -191,6 +233,15 @@ async function enterArenaOnce() {
 // Each returns a function that drives the input for the whole window, and is
 // applied through whichever page is being measured so both transports receive
 // the same thing.
+// How long to wait after a pan keypress.
+//
+// Too short and the game swallows presses: the camera moves once for three keys,
+// so a 5x5 sweep silently becomes a 3x3 and the row is shorter than it claims.
+// Too long and 32 presses per path do not fit the five minute budget. Verified by
+// hand against the running game - each press must produce its own visible change
+// before this value is trusted.
+const PAN_STEP_MS = 250;
+
 const INTERACTIONS = {
   // A few inputs, not a window.
   //
@@ -207,22 +258,45 @@ const INTERACTIONS = {
   // of map. One press out, one press back: the camera never moves more than a
   // single tile from where it began, so no interaction can fail because the map
   // ended rather than because the transport was slow.
+  // Pan a 5x5 area around the centre, then come back to it.
+  //
+  // Cancelling pairs measured almost nothing: one step out and straight back
+  // touches a couple of tiles and leaves the rest of the view cached, so the row
+  // described a camera that barely moved. A 5x5 sweep visits every tile within
+  // two steps of the centre - twenty-five positions, each one revealing artwork
+  // the previous position did not need - and then returns to the centre so the
+  // next interaction starts from the same place.
+  //
+  // The route is a serpentine: get to one corner, walk each row, step down, walk
+  // back. That is 32 presses, which is why the spacing between them has to be
+  // short enough to fit the budget and long enough that the game does not swallow
+  // a press. PAN_STEP_MS is the compromise, verified by hand against the live game
+  // rather than assumed: see the note on that constant.
   pan: async (page) => {
-    for (const k of ['d', 'a']) {
+    const press = async (k) => {
       await page.keyboard.press(k);
-      await settle(300);
+      await settle(PAN_STEP_MS);
+    };
+    for (const k of ['a', 'a', 'w', 'w']) await press(k);   // to the far corner
+    for (let row = 0; row < 5; row++) {
+      const across = row % 2 === 0 ? 'd' : 'a';
+      for (let i = 0; i < 4; i++) await press(across);
+      if (row < 4) await press('s');
     }
+    for (const k of ['a', 'a', 'w', 'w']) await press(k);    // back to the centre
   },
   zoom: async (page) => {
     for (const k of [']', '[']) {
-      await page.keyboard.press(k);
-      await settle(350);
+      const other = k === ']' ? '[' : ']';
+      if (!(await pressUntilChange(page, k, 2))) await pressUntilChange(page, other, 2);
+      await settle(250);
     }
   },
   elevation: async (page) => {
     for (const k of ['>', '<']) {
-      await page.keyboard.press(k);
-      await settle(350);
+      const other = k === '>' ? '<' : '>';
+      if (!(await pressUntilChange(page, k, 2))) await pressUntilChange(page, other, 2);
+      await settle(250);
     }
   },
 };
@@ -241,6 +315,65 @@ async function movesPicture(page, fn) {
   await settle(600);
   const after = await page.evaluate(() => ((window.__dfBench || {}).display || []).length);
   return after > before;
+}
+
+// Can the camera move at all right now?
+//
+// Every blocked round so far ended the same way: a row of zeros that looked like
+// a transport result but was really "the game was never in a pannable map". A
+// fixed-coordinate arena entry can miss, and the camera can walk off the map
+// mid-sweep, so liveness has to be established before each interaction rather
+// than assumed once at the start.
+//
+// The command list is the signal, not the pixels: it is what changes when the
+// camera moves, and it does not change on its own while the world animates. An
+// ambient animation therefore cannot masquerade as a successful pan.
+async function viewMoves(page, key) {
+  const sig = () => page.evaluate(() => {
+    const c = (window.renderer || {}).commands || [];
+    let h = 2166136261;
+    for (let i = 0; i < c.length; i++) {
+      const x = c[i];
+      h = (h ^ ((x.tex_id * 31) + (x.src_x | 0) * 7 + (x.src_y | 0) + (x.dst_x | 0) * 13)) >>> 0;
+      h = (h * 16777619) >>> 0;
+    }
+    return `${c.length}:${h.toString(16)}`;
+  });
+  const before = await sig();
+  await page.keyboard.press(key);
+  await settle(600);
+  return (await sig()) !== before;
+}
+
+// Press until the view changes, or give up.
+//
+// Zoom and elevation top out: once the view is at its deepest or shallowest level
+// the key does nothing, and the interaction then reports "applied its input and the
+// picture never changed" for a reason that is not a fault. Trying the opposite
+// direction first makes the interaction satisfiable from whatever level it starts
+// at, instead of depending on what an earlier interaction left behind.
+async function pressUntilChange(page, key, tries) {
+  for (let i = 0; i < tries; i++) {
+    if (await viewMoves(page, key)) return true;
+  }
+  return false;
+}
+
+// True if the camera answers, after one attempt to resume a paused game.
+async function requireMovable(page, where) {
+  for (const key of ['w', 's']) {
+    if (await viewMoves(page, key)) return true;
+  }
+  await page.keyboard.press(' ');
+  await settle(1500);
+  for (const key of ['w', 's']) {
+    if (await viewMoves(page, key)) return true;
+  }
+  console.log(
+    `FATAL: the camera will not move before ${where}. ` +
+    'The game is not in a pannable map, so nothing measured here would describe a transport.',
+  );
+  return false;
 }
 
 const runId = new Date().toISOString().replace(/[:.]/g, '-');
@@ -386,6 +519,10 @@ async function measurePath(pathName, pageUrl) {
   try {
   for (const [name, fn] of Object.entries(INTERACTIONS)) {
     if (ONLY && !ONLY.split(',').includes(name)) continue;
+    if (!(await requireMovable(page, `${pathName}/${name}`))) {
+      step({ path: pathName, interaction: name, phase: 'fatal', reason: 'camera will not move' });
+      process.exit(4);
+    }
     try {
       step({ path: pathName, interaction: name, phase: 'ready' });
       // The interaction is run once, inside the measured window. A separate
@@ -625,6 +762,23 @@ async function gameIsLive() {
   }
 }
 
+// Cold start, every run.
+//
+// A warmed game is a different measurement: terrain already visited ships no
+// artwork, and the client already holds pictures it would otherwise have to wait
+// for. Restarting costs time out of the five minute budget, which is the price of
+// the numbers meaning the same thing twice.
+{
+  const target = CMD_BASE.replace(/^https?:\/\//, '');
+  console.log('restarting the game so this run starts with no cache');
+  try {
+    execFileSync('bash', ['scripts/df_restart.sh', target], { stdio: 'ignore' });
+    await new Promise((r) => setTimeout(r, 6000));
+  } catch (e) {
+    console.log(`  could not restart the game: ${String(e).slice(0, 80)}`);
+  }
+}
+
 if (await gameIsLive()) {
   console.log('game is already in the arena - skipping the 90s entry');
 } else {
@@ -662,7 +816,8 @@ const PATHS = (process.env.DF_PATHS || 'instruction,pixel').split(',');
 if (PATHS.includes('instruction')) await measurePath('instruction', `${CMD_BASE}/df`);
 if (PATHS.includes('pixel')) await measurePath('pixel', PIXEL_PAGE);
 
-const summary = { runId, network: NET_LABEL, glRenderer: results.find((r) => r.health?.glRenderer)?.health?.glRenderer || null, results };
-writeFileSync(`${dir}/results.json`, JSON.stringify(summary, null, 2));
-console.log(`\nwritten to ${dir}/results.json and ${dir}/steps.ndjson`);
+const overview = { runId, network: NET_LABEL, glRenderer: results.find((r) => r.health?.glRenderer)?.health?.glRenderer || null, results };
+writeFileSync(`${dir}/results.json`, JSON.stringify(overview, null, 2));
+console.log(`\nOVERVIEW above. The report is the log: ${dir}/steps.ndjson`);
+console.log(`Do arithmetic and filtering on the log, not on these lines.`);
 await browser.close();
