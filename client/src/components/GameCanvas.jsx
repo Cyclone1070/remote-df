@@ -624,6 +624,32 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
         };
         window.addEventListener('resize', onWindowResize);
 
+        // The browser's own view of the connection, once a second. The host can say
+        // what it handed over; only this can say what arrived. A stall where the
+        // host's queue is empty and these counters stop is a lost-packet stall; a
+        // stall where the host's queue grows is the browser refusing delivery.
+        let netSampler = null;
+        function startNetSampler() {
+            if (netSampler) return;
+            let lastRecv = 0;
+            netSampler = setInterval(async () => {
+                if (!pc || pc.connectionState === 'closed') return;
+                try {
+                    const report = await pc.getStats();
+                    let recvMsgs = 0, sentMsgs = 0, bytes = 0;
+                    report.forEach((r) => {
+                        if (r.type === 'data-channel') {
+                            recvMsgs += r.messagesReceived || 0;
+                            sentMsgs += r.messagesSent || 0;
+                            bytes += r.bytesReceived || 0;
+                        }
+                    });
+                    T('net-stats', { recvMsgs, sentMsgs, bytes, delta: recvMsgs - lastRecv });
+                    lastRecv = recvMsgs;
+                } catch { /* stats are diagnostic; never break the stream for them */ }
+            }, 1000);
+        }
+
         function sendInputBuffer(buf) {
             // Timed because the send is the only thing that runs per pointer move,
             // and a pointer move is what a drag is made of. A blocking send here
@@ -975,6 +1001,7 @@ function ingestTextureChunk(chunk) {
                 };
 
                 dc.onopen = () => {
+                    startNetSampler();
                     console.log('[WebRTC] Ordered stream DataChannel (no retransmit) + reliable input DataChannel OPENED!');
                     setIsWebRTCReady(true);
                     if (onTransportChange) onTransportChange('UDP (WebRTC)');

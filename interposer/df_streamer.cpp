@@ -3671,6 +3671,12 @@ static bool service_picture_send(const DrawCommand* cmds, uint16_t count,
                                     enc == EncodeResult::Full ? wire_log::Keyframe : wire_log::Frame,
                                     (uint32_t)frame_packet.size(), (int64_t)dc->bufferedAmount(),
                                     (int64_t)g_sent_seq, carried_stamp ? stamp : 0);
+                    // How much was already waiting to go out when this frame was
+                    // handed over. Without it "the frame arrived late" cannot be
+                    // told from "the frame left late": both look identical in every
+                    // other record, and they need opposite fixes.
+                    evlog(event_log::LinkBuffered, g_sent_seq, 0,
+                       (int64_t)dc->bufferedAmount(), (int64_t)frame_packet.size(), 0);
                     dc_send_counted(dc, frame_packet.data(), frame_packet.size());
                     g_wire_bytes += frame_packet.size();
                     g_wire_frames++;

@@ -65,6 +65,7 @@ enum Kind : uint8_t {
     ClientConnect = 33,      // a client attached
     ClientDisconnect = 34,   // a client left
     PicSkippedNoData = 36,   // a frame referenced a picture the host has no pixels for
+    LinkBuffered = 37,       // bytes waiting in the channel when a frame was handed over
 };
 
 // Why a keyframe was forced. Carried in the `a` field of an EncodeKeyframe
