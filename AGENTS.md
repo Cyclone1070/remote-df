@@ -72,3 +72,22 @@ misses every one of them. Wait for `assetsReady` before the first click.
   `/tmp/df_raw_on` must be set with `podman exec remote-df touch ...` over ssh.
 - The server often needs `bash scripts/df_restart.sh 192.168.1.111:8484` after a
   deploy before `/df-stats` responds.
+
+## Measurement traps that cost real time
+
+- **Never launch the bench browser with `--disable-frame-rate-limit` or
+  `--disable-gpu-vsync`.** They let `requestAnimationFrame` run at **900 Hz**
+  (measured: 0.2 ms median gap) against a display's 60. With them, "the client is
+  holding 300 pictures" was reported 3,397 times; without them, 28. The client was
+  being measured in a browser that cannot exist.
+- **A stall logged per loop turn measures the frame rate, not the stall.** Hold a
+  frame 300 ms at 900 Hz and it is 270 "held" records; at 60 Hz it is 18. Log
+  episodes with durations.
+- **Arena detection by command count is impossible on this build:** main menu 976
+  commands, world generation 10 912, arena 465. The honest test is that panning
+  moves the view — and even that is fooled by a loading screen, which animates by
+  itself.
+- **`/df-stats` polling shows up in the interposer's own event log** as client
+  disconnects, because every one-shot HTTP request ends in the same close path. 175
+  phantom "disconnects" in one run were the bench measuring itself. Only sockets
+  with a live RTC session count now.
