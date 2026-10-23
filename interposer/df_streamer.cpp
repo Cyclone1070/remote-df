@@ -198,6 +198,12 @@ struct CachedTexture {
     // the send path only ever holds a const reference.
     mutable std::vector<uint8_t> compressed;
     mutable bool compress_tried = false;
+    // JPEG is the pixel path's codec. Encoding artwork with it too is the only way
+    // the two paths can be compared: otherwise one side pays a lossy transform per
+    // frame and the other ships 8.3 MB of raw pixels, and the difference measured
+    // is the difference in codecs, which nobody was arguing about.
+    mutable bool jpeg_tried = false;
+    mutable bool jpeg = false;
 };
 
 struct SDL_PixelFormat_Internal {
@@ -1771,9 +1777,44 @@ static bool texture_lossless_on() {
 // picture and keeps the result, because a picture is re-sent on every reconnect
 // and on every request and re-compressing it each time would burn the game's
 // frame time for no reason.
-static const std::vector<uint8_t>& texture_wire_bytes(const CachedTexture& ct, bool& is_compressed) {
-    is_compressed = false;
-    if (!texture_lossless_on() || ct.rgba.size() < PIC_LOSSLESS_MIN_BYTES) return ct.rgba;
+// Which codec the bytes below are in. On the wire it is one magic byte, because a
+// receiver that has to sniff JPEG from PNG is one guess away from a blank screen.
+enum class PicCodec { Raw, Zstd, Jpeg };
+
+// JPEG cannot carry transparency. A picture with a transparent pixel is therefore
+// sent as it is: encoding it would replace the transparency with whatever RGB
+// happens to sit under the alpha, which reads as black edges around every sprite.
+static bool texture_is_opaque(const std::vector<uint8_t>& rgba) {
+    for (size_t i = 3; i < rgba.size(); i += 4) {
+        if (rgba[i] != 255) return false;
+    }
+    return true;
+}
+
+static const std::vector<uint8_t>& texture_wire_bytes(const CachedTexture& ct, PicCodec& codec) {
+    codec = PicCodec::Raw;
+    if (ct.rgba.size() < PIC_LOSSLESS_MIN_BYTES) return ct.rgba;
+
+    // Same codec, same quality as the pixel path's frames.
+    if (!ct.jpeg_tried) {
+        ct.jpeg_tried = true;
+        if (texture_is_opaque(ct.rgba)) {
+            std::vector<uint8_t> out;
+            const auto t0 = std::chrono::steady_clock::now();
+            if (raw_jpeg_encode(ct.rgba.data(), (int)ct.w, (int)ct.h, 80, out) &&
+                out.size() < ct.rgba.size()) {
+                ct.compressed = std::move(out);
+                ct.jpeg = true;
+            }
+            const auto us = (int64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            evlog(event_log::PicCompressed, 0, ct.id, (int64_t)ct.rgba.size(),
+               (int64_t)ct.compressed.size(), ct.jpeg ? 2 : 0, us);
+        }
+    }
+    if (ct.jpeg) { codec = PicCodec::Jpeg; return ct.compressed; }
+
+    if (!texture_lossless_on()) return ct.rgba;
 
     if (!ct.compress_tried) {
         ct.compress_tried = true;
@@ -1794,7 +1835,7 @@ static const std::vector<uint8_t>& texture_wire_bytes(const CachedTexture& ct, b
     }
 
     if (ct.compressed.empty()) return ct.rgba;
-    is_compressed = true;
+    codec = PicCodec::Zstd;
     return ct.compressed;
 }
 
@@ -1927,8 +1968,8 @@ static bool take_queued_texture(uint16_t& id, uint32_t& next_chunk, bool& urgent
 static void send_texture_chunk_dc(std::shared_ptr<rtc::DataChannel> dc, const CachedTexture& ct,
                                   uint32_t chunk_index, uint32_t chunk_count) {
     if (!dc || !dc->isOpen() || ct.rgba.empty()) return;
-    bool compressed = false;
-    const std::vector<uint8_t>& bytes = texture_wire_bytes(ct, compressed);
+    PicCodec codec = PicCodec::Raw;
+    const std::vector<uint8_t>& bytes = texture_wire_bytes(ct, codec);
     const size_t total = bytes.size();
     const size_t offset = (size_t)chunk_index * TEXTURE_CHUNK_BYTES;
     if (offset >= total) return;
@@ -1936,7 +1977,7 @@ static void send_texture_chunk_dc(std::shared_ptr<rtc::DataChannel> dc, const Ca
 
     TextureHeader hdr;
     hdr.magic[0] = 'D';
-    hdr.magic[1] = compressed ? 'Z' : 'T';
+    hdr.magic[1] = codec == PicCodec::Jpeg ? 'J' : (codec == PicCodec::Zstd ? 'Z' : 'T');
     hdr.tex_id = ct.id;
     hdr.w = ct.w;
     hdr.h = ct.h;
@@ -1986,8 +2027,8 @@ static void send_texture_chunk_dc(std::shared_ptr<rtc::DataChannel> dc, const Ca
 }
 
 static uint32_t texture_chunk_count(const CachedTexture& ct) {
-    bool compressed = false;
-    const std::vector<uint8_t>& bytes = texture_wire_bytes(ct, compressed);
+    PicCodec codec = PicCodec::Raw;
+    const std::vector<uint8_t>& bytes = texture_wire_bytes(ct, codec);
     return (uint32_t)((bytes.size() + TEXTURE_CHUNK_BYTES - 1) / TEXTURE_CHUNK_BYTES);
 }
 

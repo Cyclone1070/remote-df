@@ -701,7 +701,7 @@ function ingestTextureChunk(chunk) {
             pictureArrivedSinceRequest = true;
             // Fast path: fits in one message, no assembly and no extra copy.
             // A compressed picture still has to be decompressed first.
-            if (chunk.chunkCount === 1 && !chunk.compressed) {
+            if (chunk.chunkCount === 1 && !chunk.compressed && !chunk.jpeg) {
                 const rgba = new Uint8ClampedArray(
                     chunk.data.buffer, chunk.data.byteOffset, chunk.data.byteLength
                 );
@@ -717,6 +717,7 @@ function ingestTextureChunk(chunk) {
                     totalLen: chunk.totalLen,
                     chunkCount: chunk.chunkCount,
                     compressed: chunk.compressed,
+                    jpeg: chunk.jpeg,
                     chunks: new Map()
                 };
                 pendingTextures.set(chunk.texId, pending);
@@ -744,6 +745,21 @@ function ingestTextureChunk(chunk) {
             }
 
             pendingTextures.delete(chunk.texId);
+
+            // Artwork arrives in the pixel path's own codec: decode it the way a
+            // browser decodes any image, then hand the renderer a drawable. The
+            // alternative - shipping raw RGBA - is what made the two paths
+            // incomparable in the first place.
+            if (pending.jpeg) {
+                const blob = new Blob([out], { type: 'image/jpeg' });
+                createImageBitmap(blob).then((bitmap) => {
+                    renderer.setTexture(chunk.texId, bitmap);
+                    pictureArrivedSinceRequest = true;
+                }).catch(() => {
+                    console.warn(`[Assets] Texture ${chunk.texId} failed to decode as JPEG - discarding`);
+                });
+                return;
+            }
 
             let rgba = out;
             if (pending.compressed) {

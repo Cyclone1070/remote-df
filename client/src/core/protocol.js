@@ -47,9 +47,10 @@ export class DFProtocol {
         // 'D','T' is RGBA as the game made it. 'D','Z' is the same RGBA after
         // zstd, which is lossless: the decompressed bytes are identical to what
         // would have been sent uncompressed.
-        const plain = magic0 === 0x44 && magic1 === 0x54;
-        const packed = magic0 === 0x44 && magic1 === 0x5a; // 'D', 'Z'
-        if (!plain && !packed) {
+        const plain = magic0 === 0x44 && magic1 === 0x54;   // 'D', 'T'
+        const packed = magic0 === 0x44 && magic1 === 0x5a;  // 'D', 'Z' (zstd)
+        const jpeg = magic0 === 0x44 && magic1 === 0x4a;    // 'D', 'J' (JPEG)
+        if (!plain && !packed && !jpeg) {
             return null;
         }
         const texId = view.getUint16(2, true);
@@ -69,6 +70,7 @@ export class DFProtocol {
             // totalLen means the bytes on the wire, so for a compressed picture
             // it is the compressed length; the caller decompresses to w*h*4.
             compressed: packed,
+            jpeg,
             data: new Uint8Array(buffer, this.TEXTURE_HEADER_BYTES, dataLen)
         };
     }
