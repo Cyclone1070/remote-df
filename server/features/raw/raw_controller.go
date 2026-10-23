@@ -185,21 +185,28 @@ func (c *RawController) RegisterRoutes(mux *http.ServeMux) {
 // before and after a scenario without scraping the log.
 func (c *RawController) ServeStats(w http.ResponseWriter, r *http.Request) {
 	times, parts := c.partTimeline()
+	viewerDelivered, viewerReplaced := c.holder.ViewerCounters()
 
 	body := map[string]any{
 		// The relay's own clock, so a bench can put the host-side part log on
 		// the page's timeline without assuming the two machines agree.
-		"now":             time.Now().UnixMilli(),
-		"bytes":           c.wireBytes.Load(),
-		"frames":          c.wireFrames.Load(),
-		"echoes":          c.echoes.Load(),
-		"echoDropped":     c.echoDropped.Load(),
+		"now":         time.Now().UnixMilli(),
+		"bytes":       c.wireBytes.Load(),
+		"frames":      c.wireFrames.Load(),
+		"echoes":      c.echoes.Load(),
+		"echoDropped": c.echoDropped.Load(),
 		// Frames the relay has actually received from the game. The egress
 		// counters below it are all zero with no viewer attached, so they cannot
 		// answer whether the link is alive.
 		"ingested": c.holder.Count(),
 		"viewers":  c.holder.SubscriberCount(),
-		"parts":    parts,
+		// Frames thrown away because a viewer still held the previous one. The
+		// pixel path has always dropped these by design; it simply never said so,
+		// which made "the relay sent 40 frames a second" and "the browser saw 11"
+		// look like a mystery instead of arithmetic.
+		"viewerFrames":   viewerDelivered,
+		"viewerReplaced": viewerReplaced,
+		"parts":          parts,
 	}
 	// The part timeline is thousands of timestamps and only a diagnostic wants
 	// it. A bench that samples the byte total several times a second to see
@@ -266,6 +273,10 @@ func (c *RawController) ServeMJPEG(w http.ResponseWriter, r *http.Request) {
 			c.wireBytes.Add(uint64(len(frame.Image)) + mjpegPartOverhead)
 			c.wireFrames.Add(1)
 			flusher.Flush()
+			// Recorded after the flush, not before: "written" must mean the bytes
+			// reached the socket, otherwise the log claims delivery for a frame the
+			// write is about to fail on.
+			serverEvents.Note(ServerFrameWritten, frame.Seq, subscriber.id, int64(len(frame.Image)), 0, 0)
 			// Measured to after the flush: if the browser is not reading, this is
 			// where the relay waits, and a frame behind that wait is late for a
 			// reason that has nothing to do with the game or the link.

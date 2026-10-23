@@ -131,6 +131,8 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
         // loop keeps its cadence, large enough that a steady trickle clears in
         // one pass instead of being spread across frames.
         const ASSET_INGEST_BUDGET_MS = 4;
+        let holdStartedAt = 0;
+        let holdMaxMissing = 0;
         let drawnOnce = false;
         const markDrawn = () => {
             if (drawnOnce) return;
@@ -149,8 +151,27 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
         // says which frame was held, behind which gap, and for how long.
         const trace = (window.__trace = window.__trace || []);
         let deltaStatN = 0, deltaStatEmpty = 0, deltaStatCarry = 0;
-        let traceOn = true;
+        // The trace has to be switchable from outside: the only way to know what it
+        // costs is to run the same interaction with it on and off, and a cost nobody
+        // measured is a cost nobody can defend.
+        let traceOn = new URLSearchParams(window.location.search).get('trace') !== '0';
+        window.__setTrace = (on) => { traceOn = on; };
         const T = (kind, data) => { if (traceOn && trace.length < 200000) trace.push([performance.now(), kind, data || 0]); };
+
+        // An atlas reset throws away every picture the client holds while the host
+        // still believes it holds them, so the host will skip resending them. This
+        // is the moment that disagreement begins, so it goes in the log with the
+        // number of pictures invalidated.
+        renderer.onAtlasReset = (generation, cleared) => {
+            T('atlas-reset', { generation, cleared });
+        };
+
+        // A picture that has been decoded and uploaded is the only kind a frame can
+        // actually draw. Recorded so "the host sent it" can be told from "the client
+        // can use it" without guessing.
+        renderer.onPictureUploaded = (id, w, h) => {
+            T('pic-upload', { id, w, h });
+        };
 
         renderer.onDeltaStat = (d) => { deltaStatN++; if (!d.changed) deltaStatEmpty++; deltaStatCarry += d.updates; };
         const sequencer = new FrameSequencer({
@@ -181,7 +202,13 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
                 window.__dfFrameCount = (window.__dfFrameCount || 0) + 1;
             },
             onEvent: T,
-            requestBridgingDelta: lastSeq => sendInputBuffer(DFProtocol.encodeGapAck(lastSeq)),
+            // The client's half of the gap repair. The host logs when a GAP_ACK
+            // arrives; without this the log could not say whether a repair was never
+            // asked for or never answered.
+            requestBridgingDelta: lastSeq => {
+                T('gap-request', { lastSeq });
+                sendInputBuffer(DFProtocol.encodeGapAck(lastSeq));
+            },
             requestFullFrame: () => sendInputBuffer(DFProtocol.encodeKeyframeRequest()),
             onGapRequest: (lastSeq, frame) => {
                 if (isDebug) {
@@ -448,8 +475,29 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
                 syncAssets();
             }
 
+            // Holding a frame is measured as an EPISODE, not as a count of loop
+            // turns. Logging it every iteration made the number track the frame
+            // rate rather than the stall: the same client reported 3,397 holds at
+            // 900 loops a second and 28 at 22, which says nothing about how long a
+            // picture was actually withheld. What matters is when the wait began,
+            // how long it lasted and how much was missing at its worst.
             if (!renderer.assetsReady && renderer.dirty) {
-                T('held-back', { missing: renderer.missingTextureIds().size });
+                if (!holdStartedAt) {
+                    const miss = renderer.missingTextureIds();
+                    holdStartedAt = performance.now();
+                    holdMaxMissing = miss.size;
+                    // The ids, not just the count: a hold saying "315 missing" cannot
+                    // be joined to the host's log, so it cannot say whether the host
+                    // refused to send them or never had them.
+                    T('hold-start', { missing: miss.size, ids: [...miss].slice(0, 8) });
+                } else {
+                    const n = renderer.missingTextureIds().size;
+                    if (n > holdMaxMissing) holdMaxMissing = n;
+                }
+            } else if (holdStartedAt) {
+                T('hold-end', { ms: Math.round(performance.now() - holdStartedAt), maxMissing: holdMaxMissing });
+                holdStartedAt = 0;
+                holdMaxMissing = 0;
             }
             // How long the paint itself takes, and how long the loop took to come
             // round again. A slow paint and a throttled loop produce the same
@@ -569,21 +617,38 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
             // and a pointer move is what a drag is made of. A blocking send here
             // starves the frame loop directly.
             const inT0 = performance.now();
+            let sent = false;
             try {
-                sendInputBufferInner(buf);
+                sent = sendInputBufferInner(buf);
             } finally {
                 pendingInputMs += performance.now() - inT0;
+                // The client's half of the input path. The host records arrival and
+                // delivery to the game; without this the log cannot say whether a
+                // keypress that did nothing was never sent, sent and lost, or sent
+                // and ignored - three different bugs that look identical.
+                // byteLength covers the ArrayBuffer-backed views the encoders return;
+                // length covers plain arrays. A field that reads `undefined` for the
+                // normal case is worse than no field.
+                const bytes = buf && (buf.byteLength !== undefined ? buf.byteLength : buf.length);
+                T('input-send', { bytes, sent });
             }
         }
 
+        // Returns whether the buffer actually went out. "Sent" has to mean sent: an
+        // input with no open channel is dropped silently, and that is precisely the
+        // case the log needs to distinguish from a keypress the game ignored.
         function sendInputBufferInner(buf) {
             if (inputDc && inputDc.readyState === 'open') {
                 inputDc.send(buf); // True Reliable Ordered WebRTC DataChannel!
+                return true;
             } else if (dc && dc.readyState === 'open') {
                 dc.send(buf); // Fallback to stream DC
+                return true;
             } else if (ws && ws.readyState === WebSocket.OPEN) {
                 ws.send(buf); // TCP fallback
+                return true;
             }
+            return false;
         }
 
         // Incomplete textures, keyed by texId. A texture is only handed to the

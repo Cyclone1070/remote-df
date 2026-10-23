@@ -277,6 +277,12 @@ export class DFRenderer {
             h: h,
             offscreen: imageOrData
         });
+        // The end of a picture's journey: received as chunks, decoded, uploaded to
+        // the atlas and now usable by a frame. Without this the log stops at the
+        // wire and cannot say whether a picture the host sent is actually drawable.
+        if (typeof this.onPictureUploaded === 'function') {
+            this.onPictureUploaded(id, w, h);
+        }
         this.fingerprints.set(fp, { ax: ax, ay: ay, w: w, h: h, offscreen: imageOrData });
         this.dirty = true;
     }
@@ -302,6 +308,13 @@ export class DFRenderer {
     }
 
     resetAtlas() {
+        // A reset invalidates every picture this client holds, in one step. The
+        // host keeps its own record of what this client has and is not told, so it
+        // goes on skipping those pictures - which is how a frame can wait forever
+        // for artwork nobody will ever send. Recorded so that can be seen.
+        if (typeof this.onAtlasReset === 'function') {
+            this.onAtlasReset(this.atlasGeneration + 1, this.textures.size);
+        }
         const gl = this.gl;
         if (gl) {
             gl.bindTexture(gl.TEXTURE_2D, this.atlasTexture);

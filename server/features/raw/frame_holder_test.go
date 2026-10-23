@@ -89,3 +89,42 @@ func TestFrameHolder_ConcurrentWritersNeverBlock(t *testing.T) {
 		t.Errorf("latest frame carries payload %q, which no writer produced", frame.Image)
 	}
 }
+
+// A viewer that cannot keep up loses frames by design: its slot holds one. That
+// loss used to be silent, so a run could not tell "the server sent everything and
+// the picture arrived every time" from "the server threw most of it away". Counted.
+func TestSubscriberCountsFramesItReplaced(t *testing.T) {
+	holder := NewFrameHolder()
+	sub := holder.Subscribe()
+
+	holder.Publish([]byte{1})
+	holder.Publish([]byte{2})
+	holder.Publish([]byte{3})
+
+	if got := sub.Replaced(); got != 2 {
+		t.Fatalf("replaced frames = %d, want 2", got)
+	}
+	if got := sub.Delivered(); got != 3 {
+		t.Fatalf("offered frames = %d, want 3", got)
+	}
+}
+
+// The stats endpoint reports one number per path, so the viewer counters have to
+// be summed where the holder keeps them. Two viewers that each lose one frame are
+// two lost frames, not one.
+func TestHolderAggregatesViewerCounters(t *testing.T) {
+	holder := NewFrameHolder()
+	holder.Subscribe()
+	holder.Subscribe()
+
+	holder.Publish([]byte{1})
+	holder.Publish([]byte{2})
+
+	delivered, replaced := holder.ViewerCounters()
+	if delivered != 4 {
+		t.Fatalf("delivered = %d, want 4", delivered)
+	}
+	if replaced != 2 {
+		t.Fatalf("replaced = %d, want 2", replaced)
+	}
+}

@@ -105,6 +105,13 @@ func (s *ProcessSupervisor) Start(m domain.GameManifest, args []string, streamPo
 		env = append(env, "DISPLAY=:99")
 	}
 	env = append(env, fmt.Sprintf("PORT=%d", streamPort))
+	// Where the interposer writes its per-event log. Every captured draw, every
+	// picture sent or skipped and every encode decision lands here; the ring it is
+	// drained from cannot be read fast enough over HTTP at tens of thousands of
+	// records a second. Harmless when no reader ever fetches it.
+	if os.Getenv("DF_EVENT_LOG") == "" {
+		env = append(env, "DF_EVENT_LOG=/tmp/df_events.log")
+	}
 	for k, v := range m.Env {
 		env = append(env, fmt.Sprintf("%s=%s", k, v))
 	}

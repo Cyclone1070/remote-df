@@ -38,6 +38,13 @@
 
 #include "stamp_slot.hpp"
 #include "wire_log.hpp"
+#include "event_log.hpp"
+
+// The event log lives near the bottom of this file with the rest of the
+// instrumentation, but the encoder and the caches above it need to record things
+// too, so the entry point is declared here once.
+static void evlog(uint8_t kind, uint32_t seq, uint32_t id, int64_t a, int64_t b,
+                  uint8_t flags, int64_t c = 0);
 #include "ws_server.hpp"
 #include "texture_queue.hpp"
 #include "raw_jpeg.hpp"
@@ -382,6 +389,11 @@ public:
                               bool force_keyframe, uint32_t combined_base_seq, uint8_t stamp,
                               std::vector<uint8_t>& out_packet) {
 
+        // Why a keyframe is being forced, recorded with the frame. "We send a
+        // keyframe whenever the client asks" and "we send one because a base
+        // expired" are completely different diagnoses and used to look identical.
+        int64_t kf_reason = force_keyframe ? event_log::KfClientAsked : event_log::KfUnknown;
+
         bool is_combined = false;
         const DrawCommand* base_cmds = prev_cmds;
         uint16_t base_count = prev_count;
@@ -399,6 +411,7 @@ public:
                 fprintf(stderr, "[COMBINED_DELTA] Base seq %u expired from history -> forcing keyframe\n", combined_base_seq);
                 fflush(stderr);
                 force_keyframe = true;
+                kf_reason = event_log::KfBaseExpired;
             }
         }
 
@@ -447,10 +460,12 @@ public:
                 // delta would carry nothing, and what the client is missing is the
                 // picture content, not the commands.
                 force_keyframe = true;
+                kf_reason = event_log::KfPixelsMoved;
                 num_updates = 0;
             } else {
                 stat_nothing++;
                 if (have_hash) g_nothing_pixels_same.fetch_add(1, std::memory_order_relaxed);
+                evlog(event_log::EncodeNothing, seq, 0, event_log::NothingUnchanged, curr_count, 0);
                 return EncodeResult::Nothing;
             }
         }
@@ -478,7 +493,13 @@ public:
             if (include_stamp) full_packet[sizeof(hdr)] = stamp;
 
             size_t c_size = ZSTD_compress(full_packet.data() + header_size, max_comp, curr_cmds, raw_len, 1);
-            if (ZSTD_isError(c_size)) return EncodeResult::Nothing;
+            if (ZSTD_isError(c_size)) {
+                // An encode failure used to return Nothing, which is the same
+                // result as "the frame did not change" - so an erroring encoder
+                // read as a still picture. It gets its own record now.
+                evlog(event_log::EncodeError, seq, 0, (int64_t)c_size, raw_len, 0);
+                return EncodeResult::Nothing;
+            }
             full_packet.resize(header_size + c_size);
         }
 
@@ -488,6 +509,9 @@ public:
             stat_full++;
             stat_bytes_full += full_packet.size();
             out_packet = std::move(full_packet);
+            evlog(event_log::EncodeKeyframe, seq, 0,
+               (int64_t)kf_reason,
+               (int64_t)full_packet.size(), (uint8_t)curr_count);
             record(curr_cmds, curr_count, seq);
             return EncodeResult::Full;
         }
@@ -537,6 +561,8 @@ public:
         // The old rule switched on a command-count ratio, which is only a proxy
         // for size and got it wrong in the band around the break-even point.
         EncodeResult result;
+        evlog(delta_packet.size() < full_packet.size() ? event_log::EncodeDelta : event_log::EncodeFull,
+           seq, 0, (int64_t)delta_packet.size(), (int64_t)full_packet.size(), (uint8_t)num_updates);
         if (delta_packet.size() < full_packet.size()) {
             stat_delta_wins++;
             stat_delta++;
@@ -592,6 +618,10 @@ static std::unordered_set<uint16_t> g_client_cache_set;
 static std::atomic<size_t> g_client_cache_cap{8192};
 static std::atomic<uint64_t> g_pic_sent_referenced{0};
 static std::atomic<uint64_t> g_pic_skipped_unreferenced{0};
+// Pictures a frame named but the client was already holding. Counted because the
+// per-id records are collapsed in transit to keep the drain small, and an aggregate
+// must not disappear along with them.
+static std::atomic<uint64_t> g_pic_skipped_cached{0};
 
 // Caller holds g_tex_lock (or is single-threaded at connect).
 static bool client_cache_has(uint16_t id) {
@@ -606,10 +636,16 @@ static void client_cache_push(uint16_t id) {
         const uint16_t old = g_client_cache_order.front();
         g_client_cache_order.pop_front();
         g_client_cache_set.erase(old);
+        // An eviction is the only thing that explains a picture being re-sent
+        // later to a client that appeared to have it. It was invisible.
+        evlog(event_log::CacheEvict, 0, old, 0, (int64_t)g_client_cache_order.size(), 0);
     }
 }
 
 static void client_cache_reset() {
+    // Clearing the cache means every picture the next frame references is sent
+    // again. Recorded with the size that was discarded.
+    evlog(event_log::CacheReset, 0, 0, 0, (int64_t)g_client_cache_order.size(), 0);
     g_client_cache_order.clear();
     g_client_cache_set.clear();
 }
@@ -899,6 +935,53 @@ static int64_t steady_now_ms() {
 // frames and pings, which on this link is 1% of the traffic.
 static wire_log::Log g_wire_log;
 
+// The event ring. Sized for about a second of heavy activity: a thousand draws
+// per frame at fifty frames per second is fifty thousand records a second, so a
+// million records holds roughly twenty seconds of everything. The bench drains it
+// per interaction; a build without a reader pays a bounds check per event.
+static event_log::Ring g_events(1u << 20);
+
+static void evlog(uint8_t kind, uint32_t seq, uint32_t id, int64_t a, int64_t b,
+                  uint8_t flags, int64_t c) {
+    g_events.note(kind, seq, id, a, b, flags, c);
+}
+
+// The bulk of the log goes to a file beside the game, not over HTTP.
+//
+// Every draw is recorded, and the game draws about a thousand times a frame, so the
+// log produces tens of thousands of records a second. Draining that through the
+// stats endpoint could not keep up: a single interaction needed 45 requests, took 33
+// seconds of a 45 second interaction, and still reported two billion records
+// dropped. A background writer drains the ring to a file on the host instead - the
+// ring keeps the render thread cheap, and the file holds everything. The endpoint
+// stays for looking at the log while the game is running.
+static void event_file_writer() {
+    const char* path = getenv("DF_EVENT_LOG");
+    if (!path || !*path) return;
+    FILE* f = fopen(path, "w");   // truncate: a game restart is a new run
+    if (!f) return;
+    std::vector<event_log::Rec> buf;
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        const size_t n = g_events.drain(buf, 1u << 18);
+        for (size_t i = 0; i < n; i++) {
+            const event_log::Rec& r = buf[i];
+            fprintf(f, "%lld %u %u %u %lld %lld %lld %u\n",
+                    (long long)r.t_us, (unsigned)r.kind, (unsigned)r.seq, (unsigned)r.id,
+                    (long long)r.a, (long long)r.b, (long long)r.c, (unsigned)r.flags);
+        }
+        if (n) fflush(f);
+    }
+}
+
+static void start_event_file_writer() {
+    static bool started = false;
+    if (started) return;
+    started = true;
+    std::thread t(event_file_writer);
+    t.detach();
+}
+
 // The host's wall clock, for lining these events up with the page's timeline.
 // The page and the host are different machines, so the bench estimates the
 // offset from a round trip (see clockAlign in measure.js) rather than assuming
@@ -1067,6 +1150,9 @@ extern "C" int SDL_PollEvent(void* event) {
         m_ev.motion.y = g_motion_y.load(std::memory_order_relaxed);
         if (event) memcpy(event, &m_ev, sizeof(SDL2_Event));
         g_motion_delivered.fetch_add(1, std::memory_order_relaxed);
+        // Motion reaching the game is the instant an input can move the camera.
+        // Without it, input latency could only be measured from the client side.
+        evlog(event_log::InputPushed, 0, 1, m_ev.motion.x, m_ev.motion.y, 0);
         return 1;
     }
 
@@ -1125,6 +1211,9 @@ void handle_client_input_event(const uint8_t* data, size_t len) {
         uint32_t acked_seq = 0;
         memcpy(&acked_seq, data + 1, sizeof(uint32_t));
         g_pending_combined_base.store(acked_seq);
+        // A GAP_ACK means the client saw a hole in the sequence. It was a stderr
+        // line only, so the number of repairs per run was unknowable.
+        evlog(event_log::GapAck, acked_seq, 0, 0, 0, 0);
         fprintf(stderr, "[COMBINED_DELTA] Received GAP_ACK for seq %u from client\n", acked_seq);
         fflush(stderr);
         return;
@@ -1161,6 +1250,8 @@ void handle_client_input_event(const uint8_t* data, size_t len) {
             }
         }
 
+        evlog(event_log::BridgeRequest, seq, 0, (int64_t)want_count,
+           (int64_t)wanted_chunks.size(), 0);
         fprintf(stderr, "[ASSET_BRIDGE] Request for seq %u, client wants %u asset(s)%s",
                 seq, want_count, wanted_chunks.empty() ? "" : " (with chunk hints)");
         fprintf(stderr, "\n");
@@ -1304,6 +1395,7 @@ void handle_client_input_event(const uint8_t* data, size_t len) {
         k_ev.key.keysym.mod = sdl_mod;
 
         int p_res = real_SDL_PushEvent ? real_SDL_PushEvent(&k_ev) : -1;
+        evlog(event_log::InputPushed, 0, 16, (int64_t)ev->keycode, (int64_t)p_res, 0);
         fprintf(stderr, "[INPUT] key=%u scancode=%u mod=%u %s winID=%u push=%d\n",
                 ev->keycode, ev->scancode, ev->mod, (ev->event_type == 16) ? "DOWN" : "UP", g_df_window_id, p_res);
         fflush(stderr);
@@ -1372,6 +1464,7 @@ static uint16_t alloc_texture_id(void* texture) {
     if (g_texture_count < MAX_TEXTURES) {
         uint16_t id = ++g_texture_count;
         g_textures[id - 1] = texture;
+        evlog(event_log::PicAlloc, 0, id, 0, 0, 0);
         return id;
     }
     // Only reachable once the whole id space is used up. Counted, because an id
@@ -1677,7 +1770,14 @@ static const std::vector<uint8_t>& texture_wire_bytes(const CachedTexture& ct, b
         ct.compress_tried = true;
         size_t bound = ZSTD_compressBound(ct.rgba.size());
         ct.compressed.resize(bound);
+        const auto comp_t0 = std::chrono::steady_clock::now();
         size_t got = ZSTD_compress(ct.compressed.data(), bound, ct.rgba.data(), ct.rgba.size(), 1);
+        const auto comp_us = (int64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - comp_t0).count();
+        // Compression is a per-picture CPU cost paid on the render thread while a
+        // frame is waiting. It was unmeasured, so "the host is not the bottleneck"
+        // could not be stated with a number attached to it.
+        evlog(event_log::PicCompressed, 0, ct.id, (int64_t)ct.rgba.size(), (int64_t)got, 0, comp_us);
         // A picture that did not get smaller is sent as it is: the tag would
         // cost a byte and buy nothing.
         if (ZSTD_isError(got) || got >= ct.rgba.size()) ct.compressed.clear();
@@ -1783,6 +1883,10 @@ static void queue_texture(uint16_t id, uint32_t next_chunk, bool urgent) {
         g_tex_deferred++;
     }
     g_tex_queue_hint.store((uint32_t)g_texture_queue.size(), std::memory_order_relaxed);
+    // A picture put back on the queue means the send budget ran out. Recorded so
+    // a slow artwork stream can be told from a slow frame stream.
+    evlog(event_log::PicQueued, 0, id, (int64_t)next_chunk,
+       (int64_t)g_texture_queue.size(), urgent ? 1 : 0);
 }
 
 // Queues a picture the CLIENT asked for, starting again from its first chunk.
@@ -1837,6 +1941,10 @@ static void send_texture_chunk_dc(std::shared_ptr<rtc::DataChannel> dc, const Ca
 
     g_tex_count++;
     g_tex_bytes += packet.size();
+    // One record per chunk actually handed to a link, carrying which picture it
+    // belongs to and how big it was. This is the only per-picture wire detail the
+    // counters could never give: a 180 KB picture is not one event on the link.
+    evlog(event_log::PicChunkSent, 0, ct.id, (int64_t)packet.size(), 0, 0);
     // Pictures count toward the wire total too: the comparison against whole
     // frames is only honest if both sides count everything they send.
     g_wire_bytes += packet.size();
@@ -2055,6 +2163,8 @@ static void resend_missing_textures(uint32_t seq, const std::vector<uint16_t>& r
         }
     }
 
+    evlog(event_log::ResendMissing, seq, 0, (int64_t)queued, (int64_t)unknown, 0);
+    if (unknown > 0) evlog(event_log::MissingUnknown, seq, 0, (int64_t)unknown, 0, 0);
     fprintf(stderr, "[ASSET_BRIDGE] Frame %u asked for %zu asset(s); %zu queued for delivery, %zu not held here\n",
             seq, wanted.size(), queued, unknown);
     fflush(stderr);
@@ -2253,6 +2363,7 @@ void handle_client_text_message(int fd, const std::string& msg) {
                         {
                             std::lock_guard<std::mutex> lock(g_rtc_lock);
                             g_active_dcs.push_back(dc);
+                            evlog(event_log::ClientConnect, 0, (uint32_t)fd, 0, 0, 0);
                             std::lock_guard<std::mutex> tlock(g_tex_lock);
                             client_cache_reset();
                         }
@@ -2327,6 +2438,11 @@ void handle_client_text_message(int fd, const std::string& msg) {
                     if (std::holds_alternative<rtc::binary>(data)) {
                         auto& b = std::get<rtc::binary>(data);
                         g_input_msgs.fetch_add(1, std::memory_order_relaxed);
+                        // Every input message is recorded on arrival, with its
+                        // length and opcode, so the uplink can be reconstructed
+                        // frame by frame instead of being inferred from a count.
+                        evlog(event_log::InputRecv, 0, 0, (int64_t)b.size(),
+                           b.empty() ? 0 : (int64_t)b[0], 0);
                         handle_client_input_event((const uint8_t*)b.data(), b.size());
                     }
                 });
@@ -2369,7 +2485,13 @@ void handle_client_text_message(int fd, const std::string& msg) {
 void handle_client_disconnected(int fd) {
     std::lock_guard<std::mutex> lock(g_rtc_lock);
     auto it = g_rtc_sessions.find(fd);
+    // Logged only for a real session. Every one-shot HTTP request - /df-stats,
+    // /df-wire, the bench's own polling - closes through this same path, and
+    // counting those made one bench run report 175 client disconnects for a client
+    // that never left, which read as data-channel flapping and was the measurement
+    // tool measuring itself.
     if (it != g_rtc_sessions.end()) {
+        evlog(event_log::ClientDisconnect, 0, (uint32_t)fd, 0, 0, 0);
         if (it->second.dc) {
             g_active_dcs.erase(std::remove(g_active_dcs.begin(), g_active_dcs.end(), it->second.dc), g_active_dcs.end());
         }
@@ -3199,6 +3321,7 @@ void* SDL_CreateTextureFromSurface(void* renderer, void* surface) {
             }
         }
         g_pic_created.fetch_add(1, std::memory_order_relaxed);
+        evlog(event_log::PicCreated, 0, id, (int64_t)s->w, (int64_t)s->h, 0);
         {
             uint64_t h = 1469598103934665603ull;
             for (size_t i = 0; i < ct.rgba.size(); i += 13) { h ^= ct.rgba[i]; h *= 1099511628211ull; }
@@ -3224,6 +3347,10 @@ void* SDL_CreateTextureFromSurface(void* renderer, void* surface) {
 
 int SDL_RenderClear(void* renderer) {
     if (!real_SDL_RenderClear) resolve_symbols();
+    // A clear throws away whatever had been captured for the frame so far. It is
+    // recorded because a frame that begins with a clear looks identical to a frame
+    // that never drew anything, and those two mean opposite things.
+    if (g_frame_cmd_count > 0) evlog(event_log::Clear, g_frame_seq, 0, g_frame_cmd_count, 0, 0);
     g_frame_cmd_count = 0;
     return real_SDL_RenderClear ? real_SDL_RenderClear(renderer) : 0;
 }
@@ -3267,14 +3394,20 @@ int SDL_RenderCopy(void* renderer, void* texture, const SDL_Rect* srcrect, const
         // is correct, so nothing looks obviously broken.
         g_draw_unknown++;
         tid = alloc_texture_id(texture);
+        evlog(event_log::DrawDroppedUnknown, 0, tid, 0, 0, 0);
     }
     if (tid == 0 || !texture_pixels_available(tid)) {
         g_draw_nopixels++;
+        evlog(event_log::DrawDroppedNoPixels, 0, tid, 0, 0, 0);
         dump_render_call_counts();
         return res;
     }
 
     if (g_frame_cmd_count < MAX_DRAW_COMMANDS) {
+        // Every captured draw is recorded: this is the only way to answer "how
+        // many sprites did the game actually draw in this frame", which is the
+        // denominator for every artwork ratio ever claimed here.
+        evlog(event_log::DrawCaptured, g_frame_seq, tid, g_frame_cmd_count, 0, 0);
         DrawCommand& cmd = g_frame_cmds[g_frame_cmd_count++];
         cmd.tex_id = tid;
         if (srcrect) {
@@ -3289,6 +3422,10 @@ int SDL_RenderCopy(void* renderer, void* texture, const SDL_Rect* srcrect, const
         } else {
             cmd.dst_x = 0; cmd.dst_y = 0; cmd.dst_w = (int16_t)g_current_w; cmd.dst_h = (int16_t)g_current_h;
         }
+    } else {
+        // The command buffer is full. This drop was completely silent before: the
+        // frame went out with the sprite missing and nothing anywhere recorded it.
+        evlog(event_log::DrawDroppedOverflow, g_frame_seq, tid, g_frame_cmd_count, 0, 0);
     }
     return res;
 }
@@ -3392,12 +3529,43 @@ static bool service_picture_send(const DrawCommand* cmds, uint16_t count,
                 for (uint16_t i = 0; i < count; i++) {
                     const uint16_t id = cmds[i].tex_id;
                     if (id == 0 || id > g_texture_count) continue;
-                    if (client_cache_has(id)) continue;
-                    CachedTexture& ct = g_cached_textures[id - 1];
-                    if (ct.rgba.empty()) continue;
-                    for (auto& dc : g_active_dcs) {
-                        if (dc && dc->isOpen()) send_texture_all_chunks_dc(dc, ct);
+                    if (client_cache_has(id)) {
+                        evlog(event_log::PicSkippedCached, g_frame_seq, id, 0, 0, 0);
+                        g_pic_skipped_cached.fetch_add(1, std::memory_order_relaxed);
+                        continue;
                     }
+                    CachedTexture& ct = g_cached_textures[id - 1];
+                    if (ct.rgba.empty()) {
+                        // The frame names a picture, but there are no pixels to send.
+                        // This used to `continue` without a word, so the picture was
+                        // in neither "sent" nor "skipped as cached" - and the client,
+                        // which can do nothing with an id nobody will ever send, said
+                        // so and moved on. That is how a map ends up painted with
+                        // holes while every frame reports complete. Counted per id so
+                        // the holes can be matched to the ids a frame asked for.
+                        evlog(event_log::PicSkippedNoData, g_frame_seq, id, 0, 0, 0);
+                        continue;
+                    }
+                    // Only claim the client holds this picture if it actually went
+                    // out in full. The old code pushed it into the cache either
+                    // way: with no channel open, or when the send budget ran out
+                    // after the first chunk and the rest were only queued. The
+                    // host then skipped that picture for ever while the client
+                    // reported it missing, which is a permanent hole the client
+                    // waits on - the freeze. Measured: the host skipped ids 2370
+                    // and 2373 as "client has it" while the client listed both as
+                    // missing in the same window.
+                    bool all_sent = true;
+                    for (auto& dc : g_active_dcs) {
+                        if (!dc || !dc->isOpen()) { all_sent = false; continue; }
+                        if (!send_texture_all_chunks_dc(dc, ct)) all_sent = false;
+                    }
+                    // Recorded, not acted on: flags say whether the picture really went
+                    // out (0), was only queued (1), or had no open channel (2).
+                    uint8_t outcome = 0;
+                    if (g_active_dcs.empty()) outcome = 2;
+                    else if (!all_sent) outcome = 1;
+                    evlog(event_log::PicSent, g_frame_seq, id, (int64_t)outcome, 0, 0);
                     client_cache_push(id);
                     g_pic_sent_referenced.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -3430,6 +3598,10 @@ static bool service_picture_send(const DrawCommand* cmds, uint16_t count,
             // sent, so a silent present leaves no hole for the client to treat
             // as packet loss.
             g_sent_seq++;
+            // The frame left. `a` carries the wire size so a spike can be read
+            // against the frame that caused it, and `b` the sequence the client
+            // will be told to expect.
+            evlog(event_log::PresentSent, g_sent_seq, 0, (int64_t)frame_packet.size(), 0, 0);
 
             static uint64_t last_report_seq = 0;
             if (g_sent_seq - last_report_seq >= 25) {
@@ -3566,6 +3738,9 @@ void SDL_RenderPresent(void* renderer) {
     if ((g_presents.load(std::memory_order_relaxed) & 63) == 0) dump_render_call_counts();
     g_presents.fetch_add(1, std::memory_order_relaxed);
     g_frame_seq++;
+    // Every present is recorded with the command count it carried: that number is
+    // the only honest denominator for frames the client should have seen.
+    evlog(event_log::Present, g_frame_seq, 0, g_frame_cmd_count, 0, 0);
 
     // Force DF to redraw full screen on next frame so all viewport & map tiles stay fresh
     force_full_display();
@@ -3643,7 +3818,15 @@ void SDL_RenderPresent(void* renderer) {
     // single 131,088 B chunk -- so one picture was enough to stop frames going
     // out, and the client sat on a stale screen until the queue drained.
     g_probe_renderer = renderer;
-    if (g_frame_cmd_count == 0) g_presents_nocmd.fetch_add(1, std::memory_order_relaxed);
+    if (g_frame_cmd_count == 0) {
+        g_presents_nocmd.fetch_add(1, std::memory_order_relaxed);
+        evlog(event_log::EncodeNothing, g_frame_seq, 0, event_log::NothingNoCommands, 0, 0);
+    }
+    // A present with no client attached is not a slow frame; it is a frame nobody
+    // asked for. Recorded so an idle stretch cannot be read as a stall.
+    if (!has_receivers) {
+        evlog(event_log::PresentNoReceiver, g_frame_seq, 0, g_frame_cmd_count, 0, 0);
+    }
     if (g_frame_cmd_count > 0 && has_receivers) {
         std::lock_guard<std::mutex> send_lock(g_send_lock);
         const uint32_t seq_before = g_sent_seq;
@@ -3705,6 +3888,46 @@ static int64_t max_of(std::vector<int64_t> v) {
     return *std::max_element(v.begin(), v.end());
 }
 
+// Drain the event ring as ndjson. One record per line, oldest first, and if the
+// ring overflowed since the last drain the first line says so - a log that hides
+// its own losses would recreate the problem it exists to solve.
+// At most this many records per response. Every draw is recorded, and the game
+// draws about a thousand times per frame, so a full ring is tens of thousands of
+// records a second. Handing the whole ring back in one body produced a 73 MB
+// response that a caller could not fetch inside its own timeout; the caller
+// instead asks repeatedly until the log is empty.
+static const size_t DF_EVENTS_PAGE = 65536;
+
+extern "C++" void df_events_set_enabled(bool on) {
+    g_events.set_enabled(on);
+}
+
+extern "C++" std::string df_events_json() {
+    std::vector<event_log::Rec> recs;
+    const size_t n = g_events.drain(recs, DF_EVENTS_PAGE);
+    // Read after the drain: dropped only clears when the log has been emptied, so
+    // a caller paging through a burst still sees that records were lost.
+    const uint64_t dropped = g_events.dropped();
+    const bool more = g_events.pending() > 0;
+    std::string out;
+    out.reserve(n * 96 + 96);
+    char line[192];
+    const int meta = snprintf(line, sizeof(line),
+             "{\"meta\":{\"n\":%zu,\"dropped\":%llu,\"more\":%s}}\n",
+             n, (unsigned long long)dropped, more ? "true" : "false");
+    if (meta > 0) out.append(line, (size_t)meta);
+    for (size_t i = 0; i < recs.size(); i++) {
+        const event_log::Rec& r = recs[i];
+        const int wrote = snprintf(line, sizeof(line),
+                 "{\"t\":%lld,\"k\":%u,\"seq\":%u,\"id\":%u,\"a\":%lld,\"b\":%lld,\"c\":%lld,\"f\":%u}\n",
+                 (long long)r.t_us, (unsigned)r.kind, (unsigned)r.seq,
+                 (unsigned)r.id, (long long)r.a, (long long)r.b, (long long)r.c,
+                 (unsigned)r.flags);
+        if (wrote > 0) out.append(line, (size_t)wrote);
+    }
+    return out;
+}
+
 extern "C++" std::string df_stats_json() {
     double raw_stamp_p50;
     {
@@ -3750,7 +3973,7 @@ extern "C++" std::string df_stats_json() {
              "\"raw\":{\"on\":%d,\"connected\":%d,\"sent\":%llu,\"changed\":%llu,"
              "\"same\":%llu,\"bytes\":%llu,\"dropped\":%llu,\"stampExpired\":%llu,"
              "\"stampAnswered\":%llu,\"stampP50\":%.0f},"
-             "\"rc\":{\"copy\":%llu,\"unknown\":%llu,\"nopix\":%llu,\"cmds\":%llu,\"upd\":%llu,\"copyex\":%llu}}",
+             "\"rc\":{\"copy\":%llu,\"unknown\":%llu,\"nopix\":%llu,\"cmds\":%llu,\"upd\":%llu,\"copyex\":%llu},\"picSkippedCached\":%llu}",
              (long long)epoch_now_ms(),
              g_current_w, g_current_h,
              (unsigned long long)g_wire_bytes,
@@ -3815,13 +4038,15 @@ extern "C++" std::string df_stats_json() {
              (unsigned long long)g_draw_nopixels,
              (unsigned long long)g_frame_cmd_count,
              (unsigned long long)g_upd_calls.load(),
-             (unsigned long long)g_rc_copyex_calls.load());
+             (unsigned long long)g_rc_copyex_calls.load(),
+             (unsigned long long)g_pic_skipped_cached.load());
     return std::string(buf);
 }
 
 __attribute__((constructor))
 static void init_interposer() {
     fprintf(stderr, "[INIT] libdf_streamer constructor started!\n"); fflush(stderr);
+    start_event_file_writer();
     resolve_symbols();
     const char* p_str = getenv("PORT");
     int port = p_str ? atoi(p_str) : 8484;

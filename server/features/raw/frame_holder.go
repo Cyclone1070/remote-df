@@ -1,6 +1,9 @@
 package raw
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // Frame is one complete picture as the interposer delivered it, together with
 // the codec that produced it. Seq counts published frames, so callers derive a
@@ -23,7 +26,23 @@ type Frame struct {
 // building a backlog, and the producer never waits for it.
 type Subscriber struct {
 	frames chan Frame
+	// id names this viewer in the event log, so "which viewer lost the frame"
+	// has an answer.
+	id uint32
+	// offered counts every frame this viewer was given the chance to receive;
+	// replaced counts the ones thrown away because its slot still held an older
+	// frame. Without these a slow viewer looks identical to a fast one in the
+	// counters, and the pixel path's losses are invisible.
+	offered  atomic.Uint64
+	replaced atomic.Uint64
 }
+
+// Delivered reports how many frames were offered to this viewer.
+func (s *Subscriber) Delivered() uint64 { return s.offered.Load() }
+
+// Replaced reports how many frames were dropped because the viewer had not yet
+// taken the previous one. This is the measure of a viewer falling behind.
+func (s *Subscriber) Replaced() uint64 { return s.replaced.Load() }
 
 // Frames exposes the subscriber's frame channel. Whatever arrives on it is the
 // newest frame the holder had to give, never a queue of stale ones.
@@ -34,16 +53,19 @@ func (s *Subscriber) Frames() <-chan Frame {
 // offer places frame into the subscriber's single slot, replacing a stale frame
 // that is still waiting there. It never blocks.
 func (s *Subscriber) offer(frame Frame) {
+	s.offered.Add(1)
+	serverEvents.Note(ServerFrameOffered, frame.Seq, s.id, 0, 0, 0)
 	select {
 	case s.frames <- frame:
 		return
 	default:
 	}
 
-	// Slot full: the waiting frame is already out of date, so drop it.
-	select {
-	case <-s.frames:
-	default:
+	s.replaced.Add(1)
+	if stale, ok := s.takeStale(); ok {
+		// Which frame was thrown away, and for which one. A count of replacements
+		// cannot say whether the viewer missed one frame or a second of them.
+		serverEvents.Note(ServerFrameDropped, stale.Seq, s.id, int64(frame.Seq), 0, 0)
 	}
 
 	select {
@@ -115,7 +137,8 @@ func (h *FrameHolder) Latest() (Frame, bool) {
 // Subscribe registers a viewer. A viewer that joins between two frames is
 // seeded with the current frame so it has something to draw immediately.
 func (h *FrameHolder) Subscribe() *Subscriber {
-	sub := &Subscriber{frames: make(chan Frame, 1)}
+	sub := &Subscriber{frames: make(chan Frame, 1), id: nextSubscriberID.Add(1)}
+	serverEvents.Note(ServerSubscriberJoins, 0, sub.id, 0, 0, 0)
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -139,6 +162,7 @@ func (h *FrameHolder) Unsubscribe(sub *Subscriber) {
 		return
 	}
 	delete(h.subscribers, sub)
+	serverEvents.Note(ServerSubscriberLeaves, 0, sub.id, 0, 0, 0)
 	close(sub.frames)
 }
 
@@ -153,8 +177,32 @@ func (h *FrameHolder) Count() uint64 {
 }
 
 // SubscriberCount reports how many viewers are attached.
+// ViewerCounters sums the delivery counters over every attached viewer. It answers
+// the question the pixel path could not previously answer: of the frames the relay
+// received, how many were thrown away because a viewer had not taken the previous
+// one.
+func (h *FrameHolder) ViewerCounters() (delivered, replaced uint64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for sub := range h.subscribers {
+		delivered += sub.Delivered()
+		replaced += sub.Replaced()
+	}
+	return delivered, replaced
+}
+
 func (h *FrameHolder) SubscriberCount() int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return len(h.subscribers)
+}
+
+// takeStale removes and returns the frame waiting in a viewer's slot.
+func (s *Subscriber) takeStale() (Frame, bool) {
+	select {
+	case f, ok := <-s.frames:
+		return f, ok
+	default:
+		return Frame{}, false
+	}
 }

@@ -39,6 +39,16 @@ void handle_client_input_event(const uint8_t* data, size_t len);
 std::string df_stats_json();
 // The host-side wire log, read once per run by the spike forensics.
 std::string df_wire_json();
+// The per-event log: every captured draw, every picture sent or skipped, every
+// encode decision, drained as ndjson. The counters in /df-stats say how many;
+// this says which frame waited on which picture, which is the question a latency
+// investigation actually asks.
+std::string df_events_json();
+// Switching the event log off at runtime. The hot path is a ring write, and the
+// only honest way to price it is to measure the same game with it on and off - a
+// claim that logging "costs nothing" without a number is exactly the kind of
+// unverified statement this log exists to prevent.
+void df_events_set_enabled(bool on);
 void sync_client_textures(int fd);
 void handle_client_text_message(int fd, const std::string& msg);
 void handle_client_disconnected(int fd);
@@ -131,8 +141,26 @@ private:
 
         // The producer's counters, before static serving so a request for them
         // can never be answered by a file that happens to share the name.
-        if (path == "/df-stats" || path == "/df-wire") {
-            std::string body = (path == "/df-wire") ? df_wire_json() : df_stats_json();
+        if (path == "/df-events-on" || path == "/df-events-off") {
+            df_events_set_enabled(path == "/df-events-on");
+            const std::string body = std::string("{\"enabled\":") + (path == "/df-events-on" ? "true" : "false") + "}";
+            std::ostringstream oss;
+            oss << "HTTP/1.1 200 OK\r\n"
+                << "Content-Type: application/json\r\n"
+                << "Content-Length: " << body.size() << "\r\n"
+                << "Connection: close\r\n"
+                << "Cache-Control: no-store\r\n"
+                << "Access-Control-Allow-Origin: *\r\n\r\n";
+            std::string header_str = oss.str();
+            send_raw(client.fd, header_str.data(), header_str.size());
+            send_raw(client.fd, body.data(), body.size());
+            client.state = STATE_DEAD;
+            return;
+        }
+        if (path == "/df-stats" || path == "/df-wire" || path == "/df-events") {
+            std::string body = (path == "/df-wire") ? df_wire_json()
+                             : (path == "/df-events") ? df_events_json()
+                             : df_stats_json();
             std::ostringstream oss;
             oss << "HTTP/1.1 200 OK\r\n"
                 << "Content-Type: application/json\r\n"

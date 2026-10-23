@@ -28,4 +28,9 @@ func RegisterStreamProxy(mux *http.ServeMux, streamPort int) {
 	mux.Handle("/ws", proxy)
 	mux.Handle("/df-stats", proxy)
 	mux.Handle("/df-wire", proxy)
+	// The per-event log. Counters say how many; this says which frame waited on
+	// which picture, so it has to be reachable from the same number.
+	mux.Handle("/df-events", proxy)
+	mux.Handle("/df-events-on", proxy)
+	mux.Handle("/df-events-off", proxy)
 }

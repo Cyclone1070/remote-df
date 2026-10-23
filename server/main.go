@@ -114,6 +114,14 @@ func main() {
 	var rawLink *raw.LinkServer
 
 	if *rawEnabled {
+		// The relay's own decisions go to their own file, in the same line format
+		// the interposer uses. Two writers into one file would tear lines; two files
+		// with one format can be read by one analysis.
+		eventPath := os.Getenv("DF_SERVER_EVENT_LOG")
+		if eventPath == "" {
+			eventPath = "/tmp/df_server_events.log"
+		}
+		raw.StartEventWriter(eventPath)
 		frameHolder := raw.NewFrameHolder()
 		rawLink = raw.NewLinkServer(frameHolder)
 
