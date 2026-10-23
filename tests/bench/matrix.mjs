@@ -1,44 +1,67 @@
-// What this bench must satisfy. Written down because every one of these has been
-// quietly dropped at some point, and a bench that forgets one of them reports a
-// number that looks fine and means nothing.
+// WHAT THIS BENCH MUST SATISFY
 //
-//   1. Under five minutes for the whole run. 300s, hard. Over it is a rejection,
-//      not a warning.
-//   2. One run, both transports. Instruction and pixel measured in the same
-//      session against the same game, never stitched together across runs.
-//   3. A realistic, imperfect, deterministic simulated network.
-//   4. Input covers pan, zoom and elevation, using the game's own keys: pan is
-//      a/d and w/s, zoom is ] and [, elevation is > and <. Nothing else pans -
-//      the arrow keys are not pan keys in this build, and a check that presses
-//      them will conclude the camera is stuck when it is not.
-//   5. The game is running, not paused. The arena loads paused; unpause it before
-//      measuring, because a paused game changes nothing and every row then
-//      describes a frozen picture.
-//   6. Every event carries a timestamp, however small, so a gap can be attributed
+// Written down because every one of these has been quietly dropped at least once,
+// and a bench that forgets one reports a number that looks fine and means nothing.
+//
+// BUDGET AND SCOPE
+//   1. The whole run is under 300s. Hard. Over it is a REJECTION, not a warning,
+//      and a rejected run's numbers are not quoted anywhere.
+//   2. One run covers both transports. Instruction and pixel are measured in the
+//      same run, against the same game process, inside the same shaped window.
+//   3. Both paths run on the SAME DF process. Never two processes: two processes
+//      are two games, with different scenes, different frame pacing and different
+//      artwork, so a comparison between them measures the processes, not the paths.
+//   4. Both clients are attached AT THE SAME TIME. The instruction client drives;
+//      the pixel client is a pure viewer, because there is only one input channel.
+//      Sequential runs are not a comparison - the second inherits the first's state.
+//   5. The simulated network is realistic, deterministic, applied to both paths,
+//      and verified to be in effect (measured round trip, not just "applied").
+//
+// INPUT
+//   6. Input covers pan, zoom and elevation, using the game's own keys: pan is
+//      a/d and w/s, zoom is ] and [, elevation is > and <. Nothing else pans - the
+//      arrow keys are not pan keys in this build, and a check that presses them
+//      will conclude the camera is stuck when it is not.
+//   7. The game is running, not paused. The arena loads paused; unpause it, and
+//      verify activity by watching a counter advance rather than assuming.
+//   8. The pan is a 5x5 area around the centre, then back to the centre, so the
+//      next interaction starts where the last one did.
+//
+// WHAT IS RECORDED
+//   9. Every event carries a microsecond timestamp, so a gap can be attributed
 //      afterwards to the wire, the host or the page's own main thread.
-//   7. One structured, machine-readable log per run.
-//   8. A gate that cannot fail is not a gate. If an interaction moves nothing, exit
-//      loudly rather than printing withheld rows as if they were results.
-//   9. The lossy pixel page is never ground truth for picture equality.
-//  10. Report the tail, p90/p95/worst, not just the middle. The median hides
-//      exactly the stalls a player notices.
-//  11. Report payload per frame and in total, so both transports are compared on
-//      the same footing.
-//  12. Prove that the artwork sent is artwork the frames actually reference.
-//  13. Every run starts from a cold game and a cold connection. No visited terrain
-//      and no warmed client cache carried over from a previous run, because those
-//      are exactly what make two runs of the same code disagree: a camera that has
-//      already seen a tile ships no artwork for it, so the second run measures a
-//      cheaper path than the first and neither says so.
+//  10. Every transport record carries its BYTE SIZE, on BOTH paths, at BOTH ends:
+//      what the producer handed over and what the consumer received. Instruction
+//      bytes come from the interposer (per chunk) and the client (per arrival);
+//      pixel bytes from the relay's write. A path measured at one end only cannot
+//      be compared with a path measured at two.
+//  11. Bridge requests and resends record the IDS, not a count, and each id's
+//      byte size. "The client wanted 85 things" cannot be joined to a picture;
+//      "picture 1, 8294400 bytes" can.
+//  12. A lost frame is NAMED, not inferred. The client logs the missing sequence
+//      numbers explicitly rather than leaving them to be reconstructed from the
+//      pair (last held, arrived out of order).
+//  13. A hold logs its reason, its duration and the ids that caused it.
+//
+// HONESTY RULES
+//  14. One structured, machine-readable log per run. The printed lines are an
+//      OVERVIEW only; every claim must be arithmetic on the log, and if it cannot
+//      be reconstructed from the log it is not a finding.
+//  15. A gate that cannot fail is not a gate. If an interaction moves nothing,
+//      exit loudly instead of printing withheld rows as results.
+//  16. The lossy pixel page is never ground truth for picture equality.
+//  17. Report the tail - p90, p95, worst - never the median alone. The median
+//      hides exactly the stalls a player notices.
+//  18. Payload is reported per frame and in total, so the two transports are
+//      compared on the same footing.
+//  19. Prove the artwork sent is artwork the frames actually reference.
+//  20. Every run starts from a cold game and a cold connection: no visited terrain
+//      and no warmed client cache carried over, because those are exactly what make
+//      two runs of the same code disagree.
 //
 // The log is the report. What this file prints is an OVERVIEW: one line per
 // interaction, enough to see the shape and catch a catastrophic regression. It
-// cannot answer "where did the stall come from", and it is not meant to. The
-// ndjson log contains every step with its own timestamp, which is the only thing
-// specific enough to attribute a delay to a link in the chain. Any analysis of a
-// bench run must therefore do its arithmetic and filtering on the log, never on
-// the overview alone. If a claim cannot be reconstructed from the log, it is not
-// a finding.
+// cannot answer "where did the stall come from", and it is not meant to.
 
 // The interaction matrix: every input the bench knows how to drive, measured on
 // both transports, with a per-step log so a failure can be read back later
@@ -1145,9 +1168,96 @@ if (await gameIsLive()) {
   }
   await page.close().catch(() => {});
 }
+// Both transports, one game process, one window.
+//
+// Requirements 3 and 4: the sequential runner below measures instruction and then
+// pixel against the same game, but never at the same time, so the second inherits
+// whatever state the first left behind and neither ever competes for the link.
+// Here both clients are attached to the SAME interposer simultaneously; only the
+// instruction client sends input, because there is one input channel.
+//
+// What is comparable this way: bytes actually moved per path, and per-frame
+// cadence, over the same wall-clock window against the same frames.
+async function measureParallel() {
+  currentPath = 'parallel';
+  step({ phase: 'parallel', what: 'start', note: 'both clients, one game process' });
+  setRawCapture(true);          // the pixel path needs the raw capture to exist
+  await settle(1500);
+
+  const inst = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+  await inst.goto(`${CMD_BASE}/df?trace=1`, { waitUntil: 'domcontentloaded' });
+  const ready = await waitForClient(inst, 'parallel-instruction-ready', 60000,
+    (st) => st.ready && st.missing === 0);
+  if (!ready) throw new Error('the instruction client never became ready');
+
+  const pix = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+  await pix.goto(PIXEL_PAGE, { waitUntil: 'domcontentloaded' });
+  await settle(3000);           // let the pixel viewer attach and start drawing
+  step({ phase: 'parallel', what: 'both-attached' });
+
+  const hostFrom = hostLogSize();
+  const relayFrom = serverLogSize();
+  const t0 = Date.now();
+
+  await INTERACTIONS.pan(inst);            // the only input channel in the run
+  await settle(2000);
+
+  const wall = (Date.now() - t0) / 1000;
+  const hostText = readHostEventsFrom(hostFrom < 0 ? 0 : hostFrom) || '';
+  const relayText = readServerEventsFrom(relayFrom < 0 ? 0 : relayFrom) || '';
+  const instGaps = await inst.evaluate(() => {
+    const paints = (window.__trace || []).filter((e) => e[1] === 'draw').map((e) => e[0]);
+    return paints.slice(1).map((v, i) => v - paints[i]);
+  }).catch(() => []);
+  await drainTrace(inst, 'parallel-instruction');
+  await drainTrace(pix, 'parallel-pixel');
+
+  const sumField = (text, kind, field) => text.split('\n').reduce((acc, line) => {
+    const p2 = line.split(' ');
+    if (p2.length < 5 || Number(p2[1]) !== kind) return acc;
+    return acc + (Number(p2[field]) || 0);
+  }, 0);
+  const countKind = (text, kind) => text.split('\n').filter((l) => l.split(' ')[1] === String(kind)).length;
+
+  // Instruction: picture bytes (chunk records) plus frame bytes (present-sent).
+  const picBytes = sumField(hostText, 15, 4);
+  const frameBytes = sumField(hostText, 6, 4);
+  const framesSent = countKind(hostText, 6);
+  // Pixel: every byte the relay wrote to its viewer.
+  const relayFrames = countKind(relayText, 102);
+  const relayBytes = sumField(relayText, 102, 4);
+
+  // Pixel cadence from the relay's own write timestamps.
+  const relayTs = relayText.split('\n')
+    .map((l) => l.split(' '))
+    .filter((p2) => p2[1] === '102')
+    .map((p2) => Number(p2[0]) / 1000);
+  const gaps = relayTs.slice(1).map((v, i) => v - relayTs[i]).sort((a, b) => a - b);
+  const q = (f) => (gaps.length ? Math.round(gaps[Math.min(gaps.length - 1, Math.floor(gaps.length * f))]) : null);
+
+  const ig = [...instGaps].sort((a, b) => a - b);
+  const iq = (f) => (ig.length ? Math.round(ig[Math.min(ig.length - 1, Math.floor(ig.length * f))]) : null);
+  const summary = {
+    wallS: +wall.toFixed(1),
+    instruction: { frames: framesSent, picBytes, frameBytes, totalMB: +((picBytes + frameBytes) / 1e6).toFixed(2),
+      paints: ig.length + 1, gapP50: iq(0.5), gapP90: iq(0.9), gapP95: iq(0.95), gapWorst: iq(1) },
+    pixel: { frames: relayFrames, bytes: relayBytes, totalMB: +(relayBytes / 1e6).toFixed(2), gapP50: q(0.5), gapP90: q(0.9), gapP95: q(0.95), gapWorst: q(1) },
+  };
+  step({ phase: 'parallel', what: 'summary', data: summary });
+  console.log(`parallel  ${summary.wallS}s` +
+    `\n  instruction ${summary.instruction.totalMB} MB / ${framesSent} frames  gap p50 ${iq(0.5)} p90 ${iq(0.9)} p95 ${iq(0.95)} worst ${iq(1)} ms` +
+    `\n  pixel       ${summary.pixel.totalMB} MB / ${relayFrames} frames  gap p50 ${q(0.5)} p90 ${q(0.9)} p95 ${q(0.95)} worst ${q(1)} ms`);
+
+  await pix.close().catch(() => {});
+  await inst.close().catch(() => {});
+  setRawCapture(false);
+}
+
 const PATHS = (process.env.DF_PATHS || 'instruction,pixel').split(',');
-if (PATHS.includes('instruction')) await measurePath('instruction', `${CMD_BASE}/df`);
-if (PATHS.includes('pixel')) await measurePath('pixel', PIXEL_PAGE);
+if (process.env.DF_PARALLEL === '1') {
+  await measureParallel();
+} else if (PATHS.includes('instruction')) await measurePath('instruction', `${CMD_BASE}/df`);
+else if (PATHS.includes('pixel')) await measurePath('pixel', PIXEL_PAGE);
 
 const overview = { runId, network: NET_LABEL, glRenderer: results.find((r) => r.health?.glRenderer)?.health?.glRenderer || null, results };
 writeFileSync(`${dir}/results.json`, JSON.stringify(overview, null, 2));

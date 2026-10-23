@@ -1250,8 +1250,17 @@ void handle_client_input_event(const uint8_t* data, size_t len) {
             }
         }
 
-        evlog(event_log::BridgeRequest, seq, 0, (int64_t)want_count,
-           (int64_t)wanted_chunks.size(), 0);
+        // One record per requested id, not one count for the request. A count says
+        // "the client wanted 100 things"; only the id says which picture the frame
+        // was waiting for, and only the id can be joined to that picture's size.
+        for (size_t i = 0; i < wanted.size(); i++) {
+            const uint32_t hint = i < wanted_chunks.size() ? wanted_chunks[i] : 0;
+            evlog(event_log::BridgeRequest, seq, (uint32_t)wanted[i],
+               (int64_t)wanted.size(), (int64_t)hint, 0);
+        }
+        if (wanted.empty()) {
+            evlog(event_log::BridgeRequest, seq, 0, 0, 0, 0);
+        }
         fprintf(stderr, "[ASSET_BRIDGE] Request for seq %u, client wants %u asset(s)%s",
                 seq, want_count, wanted_chunks.empty() ? "" : " (with chunk hints)");
         fprintf(stderr, "\n");
@@ -2131,17 +2140,23 @@ static void resend_missing_textures(uint32_t seq, const std::vector<uint16_t>& r
 
     size_t queued = 0;
     size_t unknown = 0;
+    // What actually happened to each requested id, captured while the texture lock
+    // is held. The answer and its byte size are the point of the exercise: a frame
+    // that lost a 16-byte sprite and a frame that lost a 3.9 MB backdrop are
+    // different problems, and the counts alone cannot tell them apart.
+    std::vector<uint8_t> outcome(wanted.size(), 0);   // 0 none, 1 queued, 2 unknown
+    std::vector<uint32_t> out_bytes(wanted.size(), 0);
     {
         std::lock_guard<std::mutex> rlock(g_rtc_lock);
         for (auto& dc : g_active_dcs) {
             if (!dc || !dc->isOpen()) continue;
             std::lock_guard<std::mutex> tlock(g_tex_lock);
-            for (auto& w : wanted) {
-                const uint16_t id = w.first;
-                const uint32_t hint = w.second;
-                if (id > g_texture_count) { unknown++; continue; }
+            for (size_t wi = 0; wi < wanted.size(); wi++) {
+                const uint16_t id = wanted[wi].first;
+                const uint32_t hint = wanted[wi].second;
+                if (id > g_texture_count) { unknown++; if (!outcome[wi]) outcome[wi] = 2; continue; }
                 CachedTexture& ct = g_cached_textures[id - 1];
-                if (ct.rgba.empty()) { unknown++; continue; }
+                if (ct.rgba.empty()) { unknown++; if (!outcome[wi]) outcome[wi] = 2; continue; }
                 // Urgent: this picture is why a frame the client already holds
                 // commands for cannot be drawn. Queueing rather than sending
                 // here is deliberate: an eager send always starts at chunk 0,
@@ -2159,12 +2174,20 @@ static void resend_missing_textures(uint32_t seq, const std::vector<uint16_t>& r
                 // rather than resuming past the gap.
                 queue_texture_at(id, hint);
                 queued++;
+                if (!outcome[wi]) { outcome[wi] = 1; out_bytes[wi] = (uint32_t)ct.rgba.size(); }
             }
         }
     }
 
-    evlog(event_log::ResendMissing, seq, 0, (int64_t)queued, (int64_t)unknown, 0);
-    if (unknown > 0) evlog(event_log::MissingUnknown, seq, 0, (int64_t)unknown, 0, 0);
+    // Per id, with the size of the picture the client was waiting for.
+    for (size_t wi = 0; wi < wanted.size(); wi++) {
+        if (outcome[wi] == 1) {
+            evlog(event_log::ResendMissing, seq, (uint32_t)wanted[wi].first,
+               (int64_t)out_bytes[wi], (int64_t)wanted[wi].second, 0);
+        } else if (outcome[wi] == 2) {
+            evlog(event_log::MissingUnknown, seq, (uint32_t)wanted[wi].first, 0, 0, 0);
+        }
+    }
     fprintf(stderr, "[ASSET_BRIDGE] Frame %u asked for %zu asset(s); %zu queued for delivery, %zu not held here\n",
             seq, wanted.size(), queued, unknown);
     fflush(stderr);

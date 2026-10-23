@@ -206,6 +206,9 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
             // arrives; without this the log could not say whether a repair was never
             // asked for or never answered.
             requestBridgingDelta: lastSeq => {
+                // lastSeq is the last frame this client holds; the frames it does not
+                // hold come before the one that arrived out of order and are named in
+                // the bridge-request record beside this one.
                 T('gap-request', { lastSeq });
                 sendInputBuffer(DFProtocol.encodeGapAck(lastSeq));
             },
@@ -349,7 +352,16 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
             const seq = sequencer.lastSeq;
             // Send the missing ids themselves, not the held set: the host then
             // resends exactly these, with no frame lookup that could disagree.
-            sendInputBuffer(DFProtocol.encodeAssetBridgeRequest(seq, missing, missingChunksFor(missing)));
+            const askedChunks = missingChunksFor(missing);
+            sendInputBuffer(DFProtocol.encodeAssetBridgeRequest(seq, missing, askedChunks));
+            // The request as sent, with every id in it. A truncated list here is how
+            // "which picture was missing" turns back into a guess.
+            T('bridge-send', {
+                seq,
+                n: missing.size,
+                ids: [...missing],
+                chunks: askedChunks ? [...askedChunks] : [],
+            });
             if (isDebug) {
                 console.log(`[Assets] Holding frame ${seq}: ${missing.size} texture(s) missing [${key}], requesting bridge (opcode 0x08)`);
             }
@@ -489,7 +501,7 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
                     // The ids, not just the count: a hold saying "315 missing" cannot
                     // be joined to the host's log, so it cannot say whether the host
                     // refused to send them or never had them.
-                    T('hold-start', { missing: miss.size, ids: [...miss].slice(0, 8) });
+                    T('hold-start', { missing: miss.size, ids: [...miss] });
                 } else {
                     const n = renderer.missingTextureIds().size;
                     if (n > holdMaxMissing) holdMaxMissing = n;

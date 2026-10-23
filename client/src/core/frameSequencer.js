@@ -122,7 +122,14 @@ export class FrameSequencer {
         if (!this.awaitingBridge || ++this.gapFrames >= this.gapRetryFrames) {
             this.awaitingBridge = true;
             this.gapFrames = 0;
-            this.onEvent('bridge-request', { afterSeq: this.lastSeq, forSeq: frame.seq });
+            // The hole, named: everything between the last frame this client holds
+            // and the one that arrived. "Which frame was lost" has to be a fact in
+            // the log, not something reconstructed later from two other numbers.
+            const missingSeqs = [];
+            for (let q = this.lastSeq + 1; q < frame.seq; q++) missingSeqs.push(q);
+            this.onEvent('bridge-request', {
+                afterSeq: this.lastSeq, forSeq: frame.seq, missingSeqs,
+            });
             this.onGapRequest(this.lastSeq, frame);
             this.requestBridgingDelta(this.lastSeq);
         }
