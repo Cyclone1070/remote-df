@@ -1209,6 +1209,10 @@ async function measureParallel() {
     const paints = (window.__trace || []).filter((e) => e[1] === 'draw').map((e) => e[0]);
     return paints.slice(1).map((v, i) => v - paints[i]);
   }).catch(() => []);
+  // Persisted before anything is computed from them: a printed summary that cannot
+  // be reconstructed from the run's own log is exactly what requirement 14 forbids.
+  writeFileSync(`${dir}/host-parallel.log`, hostText);
+  writeFileSync(`${dir}/server-parallel.log`, relayText);
   await drainTrace(inst, 'parallel-instruction');
   await drainTrace(pix, 'parallel-pixel');
 
