@@ -142,6 +142,16 @@ public:
         return true;
     }
 
+    // True when the picture at the head was asked for by the client and is
+    // therefore blocking a frame it already holds.
+    //
+    // This exists so the send gate can let an urgent picture past the budget. The
+    // budget protects frames from being buried by bulk artwork, but it was being
+    // applied to repairs too: a 796-byte repair waited behind whatever was already
+    // buffered - measured 1 486 ms - while the frame that needed it could not be
+    // painted. A repair is the one thing on this queue that must not wait.
+    bool front_urgent() const { return !pending_.empty() && pending_.front().urgent; }
+
     size_t size() const { return pending_.size(); }
     bool empty() const { return pending_.empty(); }
     size_t budget() const { return budget_; }

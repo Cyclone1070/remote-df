@@ -1852,6 +1852,17 @@ static const std::vector<uint8_t>& texture_wire_bytes(const CachedTexture& ct, P
 // in a session with the queue reaching 16.3 MB. Dropping a frame is not a
 // saving, it is the freeze the client reports, because the frame is what the
 // user is looking at and the picture is not.
+// How far past the budget an urgent picture may still be sent.
+//
+// The budget has to apply to frames' worth of bulk artwork; it must not apply to
+// a repair. A repair is a picture the client has explicitly asked for because a
+// frame it already holds cannot be drawn without it, and it is one chunk, not a
+// picture: measured 796-856 B in the run that exposed this. Blocking it behind a
+// full budget turned a 40 ms repair into a 1 486 ms freeze.
+//
+// Bounded, because "ignore the budget" is how the queue reached 16 MB before.
+#define TEXTURE_URGENT_RESERVE (256u * 1024u)
+
 // How much may sit in the transport's send queue before pictures stop being
 // added to it.
 //
@@ -2085,7 +2096,12 @@ static void drain_pending_textures() {
         for (;;) {
             int64_t q = (int64_t)dc->bufferedAmount();
             if (q > g_queue_at_tex_max) g_queue_at_tex_max = q;
-            if (!g_texture_queue.has_room(q)) break;
+            // Over budget, only a picture the client is blocked on may proceed,
+            // and only as far as the reserve.
+            if (!g_texture_queue.has_room(q)) {
+                const int64_t hard_cap = (int64_t)(g_texture_queue.budget() + TEXTURE_URGENT_RESERVE);
+                if (q >= hard_cap || !g_texture_queue.front_urgent()) break;
+            }
 
             uint16_t id = 0;
             uint32_t next = 0;
@@ -2101,7 +2117,9 @@ static void drain_pending_textures() {
             g_tex_resumed++;
             for (uint32_t i = next; i < n; i++) {
                 int64_t q2 = (int64_t)dc->bufferedAmount();
-                if (!g_texture_queue.has_room(q2)) {
+                const bool urgent_may_pass = urgent &&
+                    q2 < (int64_t)(g_texture_queue.budget() + TEXTURE_URGENT_RESERVE);
+                if (!g_texture_queue.has_room(q2) && !urgent_may_pass) {
                     // Put back with the same urgency: a picture bigger than the
                     // budget is sent over several drains, and dropping to
                     // speculative half way would send it to the back of the
