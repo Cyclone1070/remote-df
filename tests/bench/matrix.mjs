@@ -1205,6 +1205,13 @@ async function measureParallel() {
   const wall = (Date.now() - t0) / 1000;
   const hostText = readHostEventsFrom(hostFrom < 0 ? 0 : hostFrom) || '';
   const relayText = readServerEventsFrom(relayFrom < 0 ? 0 : relayFrom) || '';
+  // The bridge between the two clocks. The page timestamps everything with
+  // performance.now(); adding timeOrigin puts those instants on the epoch clock the
+  // relay writes, which is the only way an instruction frame and the pixel frame
+  // shown at the same moment can be compared instead of compared by eye.
+  const timeOrigin = await inst.evaluate(() => performance.timeOrigin).catch(() => null);
+  if (timeOrigin) step({ phase: 'parallel', what: 'timeOrigin', epochMs: timeOrigin });
+
   const instGaps = await inst.evaluate(() => {
     const paints = (window.__trace || []).filter((e) => e[1] === 'draw').map((e) => e[0]);
     return paints.slice(1).map((v, i) => v - paints[i]);
