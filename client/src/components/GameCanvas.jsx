@@ -918,6 +918,12 @@ function ingestTextureChunk(chunk) {
                 // for no reason. The heartbeat still runs - it is what catches the
                 // case where a picture completes between frames - but it is no
                 // longer the thing that decides when a frame becomes visible.
+                // Recomputed here, not inherited: assetsReady is refreshed by
+                // syncAssets in the loop, so painting on arrival without it drew
+                // frames whose pictures had not arrived yet. That is the flicker
+                // and the ghosting - a tile drawn from the previous picture, then
+                // corrected a frame later.
+                syncAssets();
                 if (renderer.assetsReady) {
                     const t0 = performance.now();
                     const drew = renderer.render();

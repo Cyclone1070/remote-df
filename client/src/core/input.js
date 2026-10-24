@@ -213,6 +213,13 @@ export class DFInput {
 
 
         const onKeyDown = e => {
+            // One press is one press. The browser repeats keydown while a key is
+            // held (and flushes a backlog of them when the page was busy), and every
+            // repeat was being forwarded as a fresh press - so a single tap could pan
+            // several tiles, and a freeze turned into a burst of them on resume.
+            // Dwarf Fortress moves once per keydown, so a held key must not be
+            // forwarded again; repeat is the page's business, not the game's.
+            if (e.repeat) return;
             const code = this.translateKey(e.code, e.key);
             if (code) {
                 e.preventDefault();
