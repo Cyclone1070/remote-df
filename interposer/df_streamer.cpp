@@ -2055,14 +2055,19 @@ static uint32_t texture_chunk_count(const CachedTexture& ct) {
 // picture was queued instead, which the caller must not report as sent: doing so
 // made a request for 193 pictures that had barely started look fully satisfied.
 static bool send_texture_all_chunks_dc(std::shared_ptr<rtc::DataChannel> dc, const CachedTexture& ct,
-                                       bool urgent = false) {
+                                       bool urgent = false, bool with_frame = false) {
     if (!dc || !dc->isOpen() || ct.rgba.empty()) return false;
     g_texture_queue.set_budget(texture_queue_budget());
     uint32_t n = texture_chunk_count(ct);
     for (uint32_t i = 0; i < n; i++) {
         int64_t q = (int64_t)dc->bufferedAmount();
         if (q > g_queue_at_tex_max) g_queue_at_tex_max = q;
-        if (!g_texture_queue.has_room(q)) {
+        // with_frame: this picture belongs to the frame that is about to be sent.
+        // The frame is worthless without it, so it must not be throttled behind
+        // other traffic - the client would hold the frame and then ask for what
+        // should have been in the same trip. Ordering on this channel is the point:
+        // pictures first, then the frame that references them, one transaction.
+        if (!with_frame && !g_texture_queue.has_room(q)) {
             queue_texture(ct.id, i, urgent);
             return false;
         }
@@ -3486,10 +3491,11 @@ int SDL_RenderCopy(void* renderer, void* texture, const SDL_Rect* srcrect, const
     }
 
     if (g_frame_cmd_count < MAX_DRAW_COMMANDS) {
-        // Every captured draw is recorded: this is the only way to answer "how
-        // many sprites did the game actually draw in this frame", which is the
-        // denominator for every artwork ratio ever claimed here.
-        evlog(event_log::DrawCaptured, g_frame_seq, tid, g_frame_cmd_count, 0, 0);
+        // Not logged per draw. At ~1 000 draws per present this wrote 22 GB in one
+        // session - 650 million lines - which made the log impossible to read back:
+        // a full run could not be drained, so latency spikes could only be traced in
+        // the last few seconds of it. The count still reaches the log, once per
+        // frame, on the PresentSent record.
         DrawCommand& cmd = g_frame_cmds[g_frame_cmd_count++];
         cmd.tex_id = tid;
         if (srcrect) {
@@ -3640,7 +3646,7 @@ static bool service_picture_send(const DrawCommand* cmds, uint16_t count,
                     bool all_sent = true;
                     for (auto& dc : g_active_dcs) {
                         if (!dc || !dc->isOpen()) { all_sent = false; continue; }
-                        if (!send_texture_all_chunks_dc(dc, ct)) all_sent = false;
+                        if (!send_texture_all_chunks_dc(dc, ct, false, true)) all_sent = false;
                     }
                     // Recorded, not acted on: flags say whether the picture really went
                     // out (0), was only queued (1), or had no open channel (2).
@@ -3689,7 +3695,10 @@ static bool service_picture_send(const DrawCommand* cmds, uint16_t count,
             // The frame left. `a` carries the wire size so a spike can be read
             // against the frame that caused it, and `b` the sequence the client
             // will be told to expect.
-            evlog(event_log::PresentSent, g_sent_seq, 0, (int64_t)frame_packet.size(), 0, 0);
+            // id field carries the frame's draw count, which used to require one
+            // record per draw.
+            evlog(event_log::PresentSent, g_sent_seq, (uint32_t)g_frame_cmd_count,
+                  (int64_t)frame_packet.size(), 0, 0);
 
             static uint64_t last_report_seq = 0;
             if (g_sent_seq - last_report_seq >= 25) {

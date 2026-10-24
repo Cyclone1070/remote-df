@@ -34,7 +34,6 @@ namespace event_log {
 // bench, so they are written down once and a retired number is left free rather
 // than reused - dumps kept as evidence are read back by number.
 enum Kind : uint8_t {
-    DrawCaptured = 0,      // SDL_RenderCopy captured into the command list
     DrawDroppedNoPixels = 1, // draw skipped: its texture has no pixels stored
     DrawDroppedUnknown = 2,  // draw skipped: texture id could not be resolved
     DrawDroppedOverflow = 3, // draw skipped: command buffer full
