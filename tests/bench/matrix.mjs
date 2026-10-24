@@ -866,37 +866,6 @@ async function measurePath(pathName, pageUrl) {
     return;
   }
 
-  // Optional zoom extreme before interacting. Zoomed-out panning was reported as
-  // slower than zoomed-in and the difference had never been measured: at maximum
-  // zoom-out a pan step reveals far more distinct pictures, so both the artwork
-  // volume and the number of cells that change are larger.
-  if (process.env.DF_ZOOM === 'in' || process.env.DF_ZOOM === 'out') {
-    // Wheel rather than the zoom keys: '[' and ']' put this build into a state where
-    // the camera no longer answers pan input, which makes the run measure nothing.
-    const wheel = process.env.DF_ZOOM === 'in' ? -120 : 120;
-    const times = Number(process.env.DF_ZOOM_STEPS || 10);
-    const box = await page.locator('canvas').first().boundingBox();
-    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-    // Step until the camera stops answering a pan, then take one step back: past
-    // that point the view is no longer the map being measured, and the run would
-    // abort on its own guard.
-    let applied = 0;
-    for (let i = 0; i < times; i++) {
-      await page.mouse.wheel(0, wheel);
-      await settle(320);
-      applied++;
-      if (!(await viewMoves(page, 'd'))) {
-        await page.mouse.wheel(0, -wheel);
-        await settle(700);
-        applied--;
-        break;
-      }
-    }
-    step({ path: pathName, phase: 'zoom', direction: process.env.DF_ZOOM, presses: applied,
-           movable: await viewMoves(page, 'd') });
-    await settle(2500);
-  }
-
   await flushHostEvents();
 
   try {
