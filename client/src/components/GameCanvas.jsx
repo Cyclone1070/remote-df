@@ -908,6 +908,27 @@ function ingestTextureChunk(chunk) {
                 }
 
                 sequencer.onFrame(frame);
+
+                // Paint on arrival, not on the heartbeat.
+                //
+                // The pixel path has no per-frame JavaScript at all: a frame
+                // arrives, the browser swaps the image, done. Ours applied the
+                // frame immediately but then waited for the next animation frame to
+                // draw it, so every frame carried up to one tick of extra latency
+                // for no reason. The heartbeat still runs - it is what catches the
+                // case where a picture completes between frames - but it is no
+                // longer the thing that decides when a frame becomes visible.
+                if (renderer.assetsReady) {
+                    const t0 = performance.now();
+                    const drew = renderer.render();
+                    const ms = performance.now() - t0;
+                    if (ms > 10) T('paint-cost', { ms: Math.round(ms), drew });
+                    if (drew) {
+                        T('draw', { seq: frame.seq });
+                        bench.paints++;
+                        bench.display.push(performance.now());
+                    }
+                }
             }
         }
 
