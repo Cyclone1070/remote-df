@@ -240,8 +240,22 @@ const hostLoad = () => {
   return { l1: Math.round(l[0] * 100) / 100, l5: Math.round(l[1] * 100) / 100 };
 };
 
+const GPU_ARGS = ['--use-angle=metal', '--enable-gpu', '--ignore-gpu-blocklist'];
+
+// DF_HEADFUL=1 gives the client a real window and a real compositor. Headless
+// software-rasterises the WebGL canvas (measured 20 Hz against 60 Hz headful), and
+// the pixel path never draws through WebGL, so headless alone handicaps one path.
+const HEADLESS = process.env.DF_HEADFUL !== '1';
+
 const browser = await chromium.launch({
-  headless: true,
+  headless: HEADLESS,
+  // Real GPU, which headless does not use by default. Measured on the client page:
+  // software GL presents the WebGL canvas at 20 Hz, the GPU at 60. The pixel path
+  // displays through an <img> and never touches WebGL, so without this the bench
+  // compares a software-rasterised client against a hardware-composited one and
+  // blames the transport for a 3x frame-rate difference that only exists in the
+  // harness.
+  args: GPU_ARGS,
   // Deliberately NOT --disable-frame-rate-limit or --disable-gpu-vsync.
   //
   // Those flags let requestAnimationFrame run unthrottled: measured on the real
@@ -1185,12 +1199,22 @@ async function measureParallel() {
   await settle(1500);
 
   const inst = await browser.newPage({ viewport: { width: 1280, height: 800 } });
-  await inst.goto(`${CMD_BASE}/df?trace=1`, { waitUntil: 'domcontentloaded' });
+  // ?tcpprobe=1 mirrors the frame stream over TCP so its arrival can be timed
+  // against the data channel's for the same sequence numbers.
+  const probeQ = process.env.DF_TCP_PROBE === '1' ? '&tcpprobe=1' : '';
+  await inst.goto(`${CMD_BASE}/df?trace=1${probeQ}`, { waitUntil: 'domcontentloaded' });
   const ready = await waitForClient(inst, 'parallel-instruction-ready', 60000,
     (st) => st.ready && st.missing === 0);
   if (!ready) throw new Error('the instruction client never became ready');
 
-  const pix = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+  // Separate browsers, when asked. Two pages in one Chromium share a network
+  // process, so a data-channel stall measured that way may be the browser starving
+  // itself rather than anything about the path. In the product the two clients are
+  // different machines; this flag makes the bench match that.
+  const pixBrowser = process.env.DF_TWO_BROWSERS === '1'
+    ? await chromium.launch({ headless: HEADLESS, args: [...GPU_ARGS, '--disable-background-timer-throttling', '--disable-renderer-backgrounding'] })
+    : browser;
+  const pix = await pixBrowser.newPage({ viewport: { width: 1280, height: 800 } });
   await pix.goto(PIXEL_PAGE, { waitUntil: 'domcontentloaded' });
   await settle(3000);           // let the pixel viewer attach and start drawing
   step({ phase: 'parallel', what: 'both-attached' });
@@ -1260,6 +1284,7 @@ async function measureParallel() {
     `\n  pixel       ${summary.pixel.totalMB} MB / ${relayFrames} frames  gap p50 ${q(0.5)} p90 ${q(0.9)} p95 ${q(0.95)} worst ${q(1)} ms`);
 
   await pix.close().catch(() => {});
+  if (pixBrowser !== browser) await pixBrowser.close().catch(() => {});
   await inst.close().catch(() => {});
   setRawCapture(false);
 }

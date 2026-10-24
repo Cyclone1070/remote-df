@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <jpeglib.h>
 #include <sys/socket.h>
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <netdb.h>
@@ -978,6 +979,15 @@ static void event_file_writer() {
         }
         if (n) fflush(f);
     }
+}
+
+static void tcp_frames_connect();
+
+static void start_tcp_frames() {
+    static bool started = false;
+    if (started) return;
+    started = true;
+    tcp_frames_connect();
 }
 
 static void start_event_file_writer() {
@@ -2074,6 +2084,73 @@ static bool send_texture_all_chunks_dc(std::shared_ptr<rtc::DataChannel> dc, con
         send_texture_chunk_dc(dc, ct, i, n);
     }
     return true;
+}
+
+// How much of a frame's new artwork may ride on the frame's own channel before the
+// rest is handed to the picture queue. A frame is what the user is looking at; the
+// artwork behind it is not worth delaying the next frame by seconds.
+#define FRAME_PICTURE_PACK_CAP (128u * 1024u)
+
+// TCP frame probe.
+//
+// The product sends frames on a WebRTC data channel (SCTP over UDP). That channel
+// was measured going silent for 326 ms and then delivering nine frames in 0.6 ms,
+// with the sender's queue empty and the network at 0% loss, so the next question is
+// whether plain TCP does the same. This mirrors every frame onto a TCP socket; the
+// page timestamps both and the bench compares them for the same sequence numbers.
+// It is a measurement, never a path: failures are ignored and nothing waits on it.
+static int g_tcp_frames_fd = -1;
+static std::mutex g_tcp_frames_lock;
+
+static void tcp_frames_connect() {
+    // File first, like every other switch here: the game runs in a container whose
+    // environment is not ours to set from the bench.
+    static char file_addr[128];
+    const char* addr = getenv("DF_TCP_FRAMES_ADDR");
+    if (!addr || !*addr) {
+        FILE* f = fopen("/tmp/df_tcp_frames", "r");
+        if (!f) return;
+        if (fgets(file_addr, sizeof(file_addr), f)) {
+            size_t n = strlen(file_addr);
+            while (n && (file_addr[n - 1] == '\n' || file_addr[n - 1] == '\r')) file_addr[--n] = 0;
+            addr = file_addr;
+        }
+        fclose(f);
+        if (!addr || !*addr) return;
+    }
+    char host[128]; int port = 0;
+    if (sscanf(addr, "%127[^:]:%d", host, &port) != 2 || port <= 0) return;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return;
+    sockaddr_in sa{}; sa.sin_family = AF_INET; sa.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) { close(fd); return; }
+    if (connect(fd, (sockaddr*)&sa, sizeof(sa)) != 0) { close(fd); return; }
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    g_tcp_frames_fd = fd;
+}
+
+static void tcp_frames_send(const void* data, size_t len, uint32_t seq) {
+    if (g_tcp_frames_fd < 0) {
+        // Retry occasionally: the relay may come up after the game does, and a
+        // probe that gives up once is a probe that reports nothing.
+        static int64_t last_try_us = 0;
+        const int64_t now = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (now - last_try_us < 2000000) return;
+        last_try_us = now;
+        tcp_frames_connect();
+        if (g_tcp_frames_fd < 0) return;
+    }
+    std::lock_guard<std::mutex> lock(g_tcp_frames_lock);
+    uint32_t n = (uint32_t)(len + 4);
+    uint8_t hdr[8];
+    hdr[0] = (uint8_t)(n >> 24); hdr[1] = (uint8_t)(n >> 16); hdr[2] = (uint8_t)(n >> 8); hdr[3] = (uint8_t)n;
+    hdr[4] = (uint8_t)(seq >> 24); hdr[5] = (uint8_t)(seq >> 16); hdr[6] = (uint8_t)(seq >> 8); hdr[7] = (uint8_t)seq;
+    struct iovec iov[2] = { {hdr, 8}, {(void*)data, len} };
+    struct msghdr msg{};
+    msg.msg_iov = iov; msg.msg_iovlen = 2;
+    if (sendmsg(g_tcp_frames_fd, &msg, 0) < 0) { close(g_tcp_frames_fd); g_tcp_frames_fd = -1; }
 }
 
 // Hands waiting pictures to the link while there is room for them.
@@ -3643,10 +3720,28 @@ static bool service_picture_send(const DrawCommand* cmds, uint16_t count,
                     // waits on - the freeze. Measured: the host skipped ids 2370
                     // and 2373 as "client has it" while the client listed both as
                     // missing in the same window.
+                    // Bounded, because a frame is not worth everything else.
+                    //
+                    // These pictures travel on the same ordered channel as the frames,
+                    // so a pan into unseen terrain put megabytes ahead of the next frame:
+                    // measured with a TCP mirror of the same stream, 38% of frames
+                    // arrived more than 500 ms later than their TCP copy, the worst by
+                    // 5.2 s, while 5 046 picture chunks crossed that channel.
+                    //
+                    // Past the cap the rest goes to the picture queue, which is served
+                    // on its own channel: the frame leaves on time and the artwork
+                    // follows without holding the frame stream behind it.
                     bool all_sent = true;
+                    uint32_t packed = 0;
                     for (auto& dc : g_active_dcs) {
                         if (!dc || !dc->isOpen()) { all_sent = false; continue; }
+                        if (packed > FRAME_PICTURE_PACK_CAP) {
+                            queue_texture_at(id, 0);
+                            all_sent = false;
+                            continue;
+                        }
                         if (!send_texture_all_chunks_dc(dc, ct, false, true)) all_sent = false;
+                        packed += (uint32_t)ct.rgba.size();
                     }
                     // Recorded, not acted on: flags say whether the picture really went
                     // out (0), was only queued (1), or had no open channel (2).
@@ -3699,6 +3794,7 @@ static bool service_picture_send(const DrawCommand* cmds, uint16_t count,
             // record per draw.
             evlog(event_log::PresentSent, g_sent_seq, (uint32_t)g_frame_cmd_count,
                   (int64_t)frame_packet.size(), 0, 0);
+            if (g_tcp_frames_fd >= 0) tcp_frames_send(frame_packet.data(), frame_packet.size(), g_sent_seq);
 
             static uint64_t last_report_seq = 0;
             if (g_sent_seq - last_report_seq >= 25) {
@@ -4144,6 +4240,7 @@ __attribute__((constructor))
 static void init_interposer() {
     fprintf(stderr, "[INIT] libdf_streamer constructor started!\n"); fflush(stderr);
     start_event_file_writer();
+    start_tcp_frames();
     resolve_symbols();
     const char* p_str = getenv("PORT");
     int port = p_str ? atoi(p_str) : 8484;

@@ -258,6 +258,12 @@ func (c *wsConn) WriteText(payload []byte) error {
 
 // WritePing sends a ping so a browser that went away is noticed even while it
 // has nothing to say.
+// WriteBinary sends a binary frame, which is how the TCP frame probe ships the
+// same bytes the data channel would have carried.
+func (c *wsConn) WriteBinary(payload []byte) error {
+	return c.write(0x2, payload)
+}
+
 func (c *wsConn) WritePing(payload []byte) error {
 	return c.write(wsOpcodePing, payload)
 }

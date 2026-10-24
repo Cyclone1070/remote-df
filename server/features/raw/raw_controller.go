@@ -68,6 +68,9 @@ type RawController struct {
 	holder *FrameHolder
 	sink   InputSink
 
+	// tcpFrames is the TCP probe's fan-out, nil unless the process runs one.
+	tcpFrames *TCPFrameHub
+
 	// statusInterval is a field so tests can watch several status frames
 	// without waiting a second for each one.
 	statusInterval time.Duration
@@ -179,6 +182,9 @@ func (c *RawController) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /raw.mjpg", c.ServeMJPEG)
 	mux.HandleFunc("GET /raw-input", c.ServeInput)
 	mux.HandleFunc("GET /raw-stats", c.ServeStats)
+	if c.tcpFrames != nil {
+		mux.HandleFunc("GET /frames-tcp", c.tcpFrames.ServeWS)
+	}
 }
 
 // ServeStats reports the running byte total as JSON so a bench can sample it
@@ -347,6 +353,9 @@ func (c *RawController) echoStamp(stamp uint8) {
 		c.echoes.Add(1)
 	}
 }
+
+// SetTCPFrameHub attaches the TCP frame probe, when the process runs one.
+func (c *RawController) SetTCPFrameHub(h *TCPFrameHub) { c.tcpFrames = h }
 
 // addInputConn registers a page's input socket so frames that answer its inputs
 // can be announced to it.

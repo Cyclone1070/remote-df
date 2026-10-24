@@ -21,7 +21,11 @@ export class DFRenderer {
             antialias: false,
             depth: false,
             stencil: false,
-            preserveDrawingBuffer: true // Required for pixel parity screenshot capture
+            // Off: keeping the drawing buffer forces a full-frame copy on every
+            // composite and pinned this page at ~24 Hz while a plain <img> on the
+            // same machine ran at 43 Hz. Parity screenshots capture the composited
+            // page, which does not need it.
+            preserveDrawingBuffer: false
         });
 
         this.lastDrawCalls = 0;

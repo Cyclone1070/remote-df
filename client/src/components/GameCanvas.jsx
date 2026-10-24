@@ -260,6 +260,9 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
         // apart from "the stream is still working through a backlog".
         let pictureArrivedSinceRequest = false;
 
+        let msgCostMs = 0;
+        let msgCostN = 0;
+
         function syncAssets() {
             const syncT0 = performance.now();
             try { syncAssetsInner(); } finally {
@@ -525,6 +528,10 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
                 T('sync-total', { ms: Math.round(syncTotalMs), calls: syncCalls, cmds: renderer.commands ? renderer.commands.length : -1 });
                 syncTotalMs = 0; syncCalls = 0;
             }
+            if (msgCostN > 0) {
+                T('msg-cost', { ms: Math.round(msgCostMs), n: msgCostN });
+                msgCostMs = 0; msgCostN = 0;
+            }
             if (lastLoopAt) T('loop-gap', { ms: loopAt - lastLoopAt });
             lastLoopAt = loopAt;
             const paintT0 = performance.now();
@@ -596,6 +603,11 @@ export function GameCanvas({ onStatusChange, onMetricsUpdate, onTransportChange,
                 updateMetrics();
             }
 
+            // How much of the turn was spent working, as opposed to waiting for
+            // the browser to call back. The gap alone cannot tell the two apart,
+            // and one means our code is slow while the other means the loop is
+            // never getting a turn.
+            T('loop-cost', { ms: Math.round(performance.now() - loopAt), drew: didRender });
             animationFrameId = requestAnimationFrame(renderLoop);
         }
         animationFrameId = requestAnimationFrame(renderLoop);
@@ -1021,9 +1033,32 @@ function ingestTextureChunk(chunk) {
                     console.warn('[WebRTC] DataChannel error:', err);
                 };
 
+                // TCP frame probe: the same frames over a plain TCP WebSocket, so
+                // their arrival can be compared with the data channel's. Only opened
+                // when the page is asked for it; it displays nothing.
+                if (new URLSearchParams(location.search).get('tcpprobe') === '1') {
+                    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+                    const probe = new WebSocket(`${proto}://${location.hostname}:8000/frames-tcp`);
+                    probe.binaryType = 'arraybuffer';
+                    probe.onmessage = (ev) => {
+                        if (!(ev.data instanceof ArrayBuffer) || ev.data.byteLength < 4) return;
+                        T('frame-in-tcp', { seq: new DataView(ev.data).getUint32(0), bytes: ev.data.byteLength - 4 });
+                    };
+                }
+
                 dc.onmessage = (event) => {
-                    if (event.data instanceof ArrayBuffer) {
-                        handleFrameBinary(event.data);
+                    // Time spent in the handler, accumulated and reported once a second.
+                    // The loop's own cost is already known to be ~1 ms, so if the frame
+                    // callback is late the work must be here, between turns, and nothing
+                    // else was measuring it.
+                    const msgT0 = performance.now();
+                    try {
+                        if (event.data instanceof ArrayBuffer) {
+                            handleFrameBinary(event.data);
+                        }
+                    } finally {
+                        msgCostMs += performance.now() - msgT0;
+                        msgCostN++;
                     }
                 };
 

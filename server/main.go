@@ -59,6 +59,17 @@ func getEnvBool(key string, fallback bool) bool {
 	return fallback
 }
 
+// tcpFramesAddr is where the TCP frame probe listens. On by default because it is
+// how the data channel's stalls were attributed to the transport rather than to the
+// wire, and a probe that needs configuring is a probe that is not there when the
+// question is asked.
+func tcpFramesAddr() string {
+	if v := os.Getenv("DF_TCP_FRAMES_ADDR"); v != "" {
+		return v
+	}
+	return ":8001"
+}
+
 func main() {
 	port := flag.Int("port", getEnvInt("PORT", 8484), "Public HTTP/WS server port")
 	streamPort := flag.Int("stream-port", getEnvInt("STREAM_PORT", 8485), "Internal game stream port")
@@ -139,7 +150,25 @@ func main() {
 		}
 
 		rawMux := http.NewServeMux()
-		raw.NewRawController(frameHolder, rawLink).RegisterRoutes(rawMux)
+		rawCtrl := raw.NewRawController(frameHolder, rawLink)
+		// The TCP frame probe: the same frames the data channel carries, sent over
+		// plain TCP so the two arrival times can be compared on the client. Started
+		// only when asked for, and it never affects the product path.
+		if addr := tcpFramesAddr(); addr != "" {
+			hub := raw.NewTCPFrameHub()
+			if ln, err := net.Listen("tcp", addr); err != nil {
+				log.Printf("TCP frame probe disabled: %v", err)
+			} else {
+				rawCtrl.SetTCPFrameHub(hub)
+				go func() {
+					if err := hub.ServeTCP(ln); err != nil {
+						log.Printf("TCP frame probe stopped: %v", err)
+					}
+				}()
+				log.Printf("TCP frame probe listening on %s", addr)
+			}
+		}
+		rawCtrl.RegisterRoutes(rawMux)
 		rawServer = &http.Server{
 			Addr:    fmt.Sprintf(":%d", *rawPort),
 			Handler: rawMux,
